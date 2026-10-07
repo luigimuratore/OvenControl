@@ -21,6 +21,8 @@ Per il collaudo senza resistenze usa prima [oven-controller-field-test](../oven-
 
 ## Caricamento e rete
 
+Per vedere e provare questa stessa dashboard **senza ESP**, avvia il [server localhost](../local-preview/README.md): dalla cartella `firmware`, `python3 local-preview/server.py --open`, poi apri `http://localhost:8080/full/`. Dati e comandi sono simulati.
+
 Apri questa cartella in PlatformIO. Dal terminale nella cartella `firmware`:
 
 ```sh
@@ -41,6 +43,8 @@ Il caricamento sostituisce il firmware della scheda collegata. Non serve un uplo
 Il file locale `include/wifi_config.h` è ripreso da `oven-controller-site`. Puoi modificarlo per SSID/password del capannone e server NTP; se manca, copialo da `include/wifi_config.example.h`. La rete diretta resta disponibile. La dashboard mostra anche l'IP sulla rete del capannone. Non ci sono login o accessi cloud: usa una LAN controllata. NTP serve a datare gli eventi e a stimare l'intervallo di interruzione; il controllo termico usa `millis()` e funziona anche senza Internet.
 
 ## Collegamenti
+
+Per il Carlo Gavazzi trifase indicato nelle note come **RGC3A60D30KGE**, vedi la [nota sul modello e sulla configurazione SSR](../docs/carlo-gavazzi.md). La sigla recentemente comunicata `RQC3A60D30KQE` resta da verificare sulla targhetta. Se il componente è il RGC3A60D30KGE, seleziona **SSR** nelle impostazioni di comando; il valore iniziale generico “relè meccanico” non identifica il componente installato.
 
 | Funzione | GPIO |
 |---|---:|

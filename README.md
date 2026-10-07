@@ -12,6 +12,18 @@ Controllo e collaudo di un forno con ESP32-S3, due sonde PT100 su MAX31865, dash
 - [Contesto del progetto](PROJECT_CONTEXT.md), con note e cronologia.
 - `media/`: foto dei componenti e dei collegamenti.
 
+## Dashboard in localhost, senza ESP
+
+Dalla cartella `firmware`:
+
+```sh
+python3 local-preview/server.py --open
+```
+
+Aprire [versione completa](http://localhost:8080/full/) oppure [collaudo](http://localhost:8080/field-test/). Entrambe le dashboard usano dati e uscite simulati; ricette, impostazioni e storico restano in RAM fino al riavvio del server. Su macOS è disponibile anche `firmware/local-preview/Avvia dashboard.command`.
+
+Vedere la [guida localhost](firmware/local-preview/README.md) e la [nota sul Carlo Gavazzi trifase](firmware/docs/carlo-gavazzi.md), con distinzione tra modello base e varianti dotate di monitoraggio.
+
 ## Compilazione
 
 I firmware sono progetti PlatformIO indipendenti. Dalla cartella `firmware`:

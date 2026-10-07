@@ -4,6 +4,8 @@ Progetto **separato** dagli altri firmware, per ESP32-S3 N16R8: test di **due PT
 
 ## Caricare e accedere
 
+Per vedere e provare questa stessa dashboard **senza ESP**, avvia il [server localhost](../local-preview/README.md): dalla cartella `firmware`, `python3 local-preview/server.py --open`, poi apri `http://localhost:8080/field-test/`. Dati e uscite sono simulati. Il [Carlo Gavazzi trifase descritto nelle note](../docs/carlo-gavazzi.md) è un SSR: lo stato “relè” indica soltanto il comando del driver, senza feedback sulle tre fasi.
+
 Apri **questa cartella** in PlatformIO, oppure dal terminale:
 
 ```sh

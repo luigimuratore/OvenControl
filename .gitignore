@@ -1,0 +1,22 @@
+# Build e cache locali
+**/.pio/
+**/.vscode/
+**/__pycache__/
+*.pyc
+.DS_Store
+**/.DS_Store
+
+# Credenziali e configurazione locale
+**/include/wifi_config.h
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Ambiente di sviluppo
+.venv/
+**/.venv/
+node_modules/
+**/node_modules/

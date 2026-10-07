@@ -1,0 +1,23 @@
+[
+  {
+    "id": "prova-50",
+    "name": "Prova a 50 C",
+    "steps": [
+      {
+        "type": "ramp",
+        "target": 50,
+        "rate": 1
+      },
+      {
+        "type": "hold",
+        "target": 50,
+        "duration": 10
+      },
+      {
+        "type": "cooldown",
+        "target": 35,
+        "rate": 1
+      }
+    ]
+  }
+]

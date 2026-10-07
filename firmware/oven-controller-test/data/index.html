@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oven Controller · Test hardware</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">ESP32-S3 · TEST HARDWARE</div>
+      <h1>Oven Controller</h1>
+    </div>
+    <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div>
+  </header>
+
+  <nav class="view-tabs" aria-label="Sezioni">
+    <button id="tabDashboard" class="active" type="button" aria-selected="true">Dashboard</button>
+    <button id="tabLogs" type="button" aria-selected="false">Log</button>
+  </nav>
+
+  <main id="dashboardView" class="layout">
+    <section class="panel dashboard-panel">
+      <div class="panel-title-row">
+        <div><h2>Dashboard</h2><p id="dashboardSubtitle">Lettura delle due PT100 reali</p></div>
+        <div class="clock-box"><span>Tempo acceso</span><strong id="uptime">—</strong></div>
+      </div>
+      <div class="hero-grid">
+        <article class="metric hero"><span>Temperatura media</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
+        <article class="metric hero target"><span>Target fisso</span><strong><span id="targetTemp">35.0</span><small> °C</small></strong></article>
+        <article class="metric"><span>Uscita relè</span><strong id="relayState">SPENTA</strong><small id="relayHint">LED rosso spento</small><small id="pidInfo">PID 0%</small></article>
+        <article class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong><small>Limite 10 °C</small></article>
+      </div>
+      <div class="sensor-grid two">
+        <article class="sensor-card"><span id="sensorLabel1">PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article>
+        <article class="sensor-card"><span id="sensorLabel2">PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><div><h3>Temperature nel tempo</h3><small>Traccia live circa ogni 0,5 s; storico sull'ESP ogni 10 s fino a 6 ore</small></div>
+          <div class="legend"><span><i class="legend-line target-line"></i>Target</span><span><i class="legend-line actual-line"></i>PT100</span><span><i class="legend-line simulated-line"></i>Simulata</span></div>
+          <button id="exportSamples" class="ghost">Esporta CSV</button></div>
+        <canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas>
+        <div class="chart-navigation">
+          <button id="chartBack" type="button">← Indietro</button>
+          <input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Scorri lo storico del grafico">
+          <button id="chartForward" type="button">Avanti →</button>
+          <button id="chartNow" type="button">Adesso</button>
+          <select id="chartSpan" aria-label="Durata visibile nel grafico">
+            <option value="900000">15 min</option><option value="1800000" selected>30 min</option>
+            <option value="3600000">1 ora</option><option value="all">Tutto</option>
+          </select>
+        </div>
+        <p id="chartRangeLabel" class="chart-range-label">Caricamento storico…</p>
+      </div>
+    </section>
+
+    <aside class="panel control-panel">
+      <h2>Test sonde e relè</h2>
+      <p>Target fisso 35 °C. Senza PT100 scegli le sonde simulate; con le PT100 puoi scaldarle con le mani. A 36 °C su una lettura il relè si spegne e si riabilita a 35,5 °C o meno.</p>
+      <label class="field"><span>Origine delle temperature</span>
+        <select id="sensorMode"><option value="real">PT100 reali</option><option value="simulated">Sonde simulate</option></select>
+      </label>
+      <div id="simBanner" class="sim-banner" hidden>SIMULAZIONE ATTIVA · I valori non vengono dalle PT100. Il GPIO4 può attivare il relè: usa soltanto un carico di prova a bassa tensione.</div>
+      <div id="simControls" class="buttons sim-buttons" hidden>
+        <button id="simDownBtn" type="button">−1 °C finto</button><button id="simUpBtn" type="button">+1 °C finto</button>
+      </div>
+      <div class="buttons test-buttons"><button id="startBtn" class="primary">AVVIA TEST</button><button id="stopBtn" class="danger">STOP</button></div>
+      <button id="resetBtn" class="ghost full">Azzera allarme</button>
+      <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div>
+      <div id="messageBox" class="notice hidden"></div>
+      <hr>
+      <h2>Accesso alla dashboard</h2>
+      <div class="network-box">
+        <div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">Verifica connessione…</strong></div>
+        <a id="workshopAddress" class="network-address" href="#" hidden></a>
+        <a id="localAddress" class="network-address" href="#" hidden></a>
+        <p id="workshopHint">Collega telefono o PC alla stessa rete del capannone per aprire l'indirizzo indicato.</p>
+        <div class="network-line"><span>Rete diretta OvenController-Test</span><strong id="apState">Verifica…</strong></div>
+        <span id="apAddress" class="network-address"></span>
+      </div>
+      <hr>
+      <h2>Alimentazione e ripartenza</h2>
+      <div class="recipe-summary power-summary">
+        <div><span>Numero avvii</span><strong id="bootCount">—</strong></div>
+        <div><span>Ultimo reset</span><strong id="resetReason">—</strong></div>
+        <div><span>Test interrotto</span><strong id="interrupted">—</strong></div>
+        <div><span>Ora rete</span><strong id="timeStatus">—</strong></div>
+        <div><span>Temperatura interna ESP</span><strong id="chipTemperature">—</strong></div>
+      </div>
+      <p id="outageInfo" class="hint">Lettura stato…</p>
+      <p class="hint">Con Wi-Fi e NTP: intervallo massimo dall'ultima ora salvata al riavvio. Senza NTP: durata sconosciuta. Il relè resta spento dopo un reset.</p>
+      <p class="hint">La temperatura interna ESP è indicativa: non misura il regolatore 3,3 V né l'aria attorno al modulo.</p>
+      <hr>
+      <h2>Indicatori</h2>
+      <p class="hint">Verde fisso: ESP e server avviati senza allarmi. La dashboard indica se le sonde reali sono disponibili. Rosso acceso: GPIO4 sta comandando il driver del relè. In allarme l'uscita si spegne.</p>
+    </aside>
+  </main>
+
+  <section id="logsView" class="logs-view panel" hidden>
+    <div class="panel-title-row">
+      <div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2>
+        <p>Azioni del relè, calcoli PID, cambi modalità, avvii, arresti e allarmi.</p></div>
+      <div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div>
+    </div>
+    <div id="logSummary" class="log-summary">Connessione al controllore…</div>
+    <p id="logRetention" class="hint">Caricamento eventi…</p>
+    <div id="logList" class="log-list">Caricamento…</div>
+  </section>
+  <footer>Modalità test · Solo carico a bassa tensione · ESP32-S3 + MAX31865</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

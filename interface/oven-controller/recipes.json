@@ -1,0 +1,33 @@
+[
+  {
+    "id": "carbon-standard",
+    "name": "Carbon Standard",
+    "steps": [
+      {
+        "type": "ramp",
+        "target": 80,
+        "rate": 2.0
+      },
+      {
+        "type": "hold",
+        "target": 80,
+        "duration": 30
+      },
+      {
+        "type": "ramp",
+        "target": 150,
+        "rate": 1.5
+      },
+      {
+        "type": "hold",
+        "target": 150,
+        "duration": 60
+      },
+      {
+        "type": "cooldown",
+        "target": 40,
+        "rate": 1.0
+      }
+    ]
+  }
+]

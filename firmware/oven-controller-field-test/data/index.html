@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oven Controller · Test sul campo</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="eyebrow">ESP32-S3 · COLLAUDO SENZA RESISTENZE</div><h1>Oven Controller</h1></div>
+    <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div>
+  </header>
+  <div class="field-banner">TEST SUL CAMPO · Resistenze reali scollegate. Le indicazioni delle uscite sono i comandi GPIO: verifica il circuito con uno strumento.</div>
+  <nav class="view-tabs" aria-label="Sezioni">
+    <button id="tabDashboard" class="active" type="button" aria-selected="true">Dashboard</button>
+    <button id="tabLogs" type="button" aria-selected="false">Log</button>
+  </nav>
+  <main id="dashboardView" class="layout">
+    <section class="panel dashboard-panel">
+      <div class="panel-title-row"><div><h2>PT100 reali e circuito</h2><p>Letture continue · 3 fili · Filtro 50 Hz</p></div><div class="clock-box"><span>Tempo acceso</span><strong id="uptime">—</strong></div></div>
+      <div class="hero-grid">
+        <article class="metric hero"><span>PT100 #1 · CS 14</span><strong><span id="t1">—</span><small> °C</small></strong><small id="sensorState1">In attesa</small></article>
+        <article class="metric hero"><span>PT100 #2 · CS 10</span><strong><span id="t2">—</span><small> °C</small></strong><small id="sensorState2">In attesa</small></article>
+        <article class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong><small>Confronto diagnostico</small></article>
+        <article class="metric"><span>Comando relè · GPIO4</span><strong id="relayState">—</strong><small id="relayHint">Nessun feedback elettrico</small></article>
+      </div>
+      <div class="sensor-grid two">
+        <article class="sensor-card"><span>Diagnostica PT100 #1</span><strong id="ohms1">— Ω</strong><small id="raw1">RAW — · RREF —</small><p id="fault1" class="hint">—</p></article>
+        <article class="sensor-card"><span>Diagnostica PT100 #2</span><strong id="ohms2">— Ω</strong><small id="raw2">RAW — · RREF —</small><p id="fault2" class="hint">—</p></article>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><div><h3>Temperature reali</h3><small>Ultimi 5 minuti · Storico ESP fino a circa 1 ora</small></div><div class="legend"><span><i class="legend-line actual-line"></i>PT100 #1</span><span><i class="legend-line target-line"></i>PT100 #2</span></div><button id="exportSamples" class="ghost" disabled>Esporta CSV completo</button></div>
+        <canvas id="tempChart" width="1200" height="420" aria-label="Grafico delle due temperature reali"></canvas>
+        <p id="chartRangeLabel" class="chart-range-label">In attesa di letture…</p>
+        <p class="hint">Il CSV include temperature, RAW, fault e comandi GPIO campionati ogni circa 1 s. Gli impulsi più brevi sono nel log. Storico e log in RAM si cancellano al riavvio.</p>
+      </div>
+      <hr>
+      <h2>Verifiche sul campo</h2>
+      <p class="hint">Questa lista raccoglie le tue verifiche visive e strumentali. Il firmware non misura alimentazioni, contatti del relè o corrente del carico.</p>
+      <div class="checklist">
+        <label><input type="checkbox"> Alimentazione 3,3 V delle Click e massa comune verificate con multimetro.</label>
+        <label><input type="checkbox"> PT100 #1 reagisce scaldandola con la mano; #2 resta coerente.</label>
+        <label><input type="checkbox"> PT100 #2 reagisce scaldandola con la mano; #1 resta coerente.</label>
+        <label><input type="checkbox"> Verde e rosso identificati con le prove separate.</label>
+        <label><input type="checkbox"> GPIO4, transistor e comando del relè verificati durante un impulso.</label>
+        <label><input type="checkbox"> Uscita realmente inattiva dopo STOP e riavvio della scheda.</label>
+      </div>
+      <p class="hint">Per provare un fault: disalimenta prima il circuito, scollega una sonda, riaccendi e verifica il messaggio. Ricollegala a circuito disalimentato. Per il driver SSR usa le misure adatte al tuo circuito; la continuità da sola non ne verifica il funzionamento.</p>
+    </section>
+    <aside class="panel control-panel">
+      <h2>Comandi di collaudo</h2>
+      <p>Ogni prova è temporizzata. Nessun PID e nessuna ricetta. Puoi testare relè e LED anche con sonde assenti o in fault.</p>
+      <label class="confirm-loads"><input id="loadsDisconnected" type="checkbox"> Le resistenze reali del forno sono fisicamente scollegate.</label>
+      <button id="armBtn" class="primary full" disabled>ABILITA TEST PER 60 s</button>
+      <p id="armState" class="hint">Comandi disabilitati · Solo lettura sonde</p>
+      <button id="stopBtn" class="danger full" disabled>STOP · RELÈ SPENTO</button>
+      <div id="messageBox" class="notice hidden" role="status" aria-live="polite"></div>
+      <div class="test-progress"><strong id="testName">Lettura sonde</strong><span id="testRemaining">—</span></div>
+      <hr>
+      <h2>Test LED</h2>
+      <div class="led-indicators"><span><i id="greenIndicator" class="physical-led"></i>Verde · GPIO7</span><span><i id="redIndicator" class="physical-led"></i>Rosso · GPIO6</span></div>
+      <div class="buttons led-buttons">
+        <button data-action="ledGreen" disabled>Verde · 3 s</button><button data-action="ledRed" disabled>Rosso · 3 s</button>
+        <button data-action="ledBoth" disabled>Entrambi · 3 s</button><button data-action="ledOff" disabled>Spenti · 3 s</button>
+      </div>
+      <button data-action="ledSequence" class="ghost full" disabled>Sequenza LED · 8 s</button>
+      <p class="hint">Sequenza: spenti → verde → rosso → entrambi, 2 s ciascuno. GPIO4 resta spento. A riposo verde acceso = dashboard avviata; rosso segue il relè. Durante il test LED il rosso è indipendente dal relè.</p>
+      <hr>
+      <h2>Test comando relè</h2>
+      <label class="field"><span>Durata impulso</span><select id="pulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select></label>
+      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Invia impulso</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
+      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e disabilita i test. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
+      <hr>
+      <h2>Rete e scheda</h2>
+      <div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta</span><strong>OvenController-FieldTest</strong></div><span id="apAddress" class="network-address">—</span></div>
+      <div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Reset codice</span><strong id="resetReason">—</strong></div><div><span>Chip ESP</span><strong id="chipTemperature">—</strong></div><div><span>RAM libera / minimo</span><strong id="heap">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="rssi">—</strong></div><div><span>Test al reset</span><strong id="interrupted">—</strong></div></div>
+      <p class="hint">La temperatura del chip ESP non è quella del regolatore o dell'aria. Nessuna uscita riparte automaticamente dopo un reset. Nessun login: usa una rete di prova controllata.</p>
+    </aside>
+  </main>
+  <section id="logsView" class="logs-view panel" hidden>
+    <div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del collaudo</h2><p>Avvio, sonde, test, GPIO e arresti · Ultimi 128 eventi di questa accensione</p></div><div class="log-actions"><button id="refreshLogs" class="ghost" disabled>Aggiorna</button><button id="exportLogs" class="ghost" disabled>Esporta JSON</button></div></div>
+    <div id="logList" class="log-list">In attesa del controllore…</div>
+  </section>
+  <footer>Firmware di collaudo · ESP32-S3 N16R8 + 2 MAX31865 · Resistenze del forno scollegate</footer>
+  <script src="/app.js"></script>
+</body>
+</html>

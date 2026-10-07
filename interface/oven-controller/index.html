@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Oven Controller</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">ESP32 OVEN PROTOTYPE</div>
+      <h1>Oven Controller</h1>
+    </div>
+    <div class="status-wrap">
+      <span id="statusDot" class="status-dot idle"></span>
+      <span id="statusText">IDLE</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel dashboard-panel">
+      <div class="panel-title-row">
+        <div>
+          <h2>Dashboard</h2>
+          <p>Monitoraggio simulato del ciclo termico</p>
+        </div>
+        <div class="clock-box">
+          <span>Tempo ciclo</span>
+          <strong id="elapsed">00:00:00</strong>
+        </div>
+      </div>
+
+      <div class="hero-grid">
+        <article class="metric hero">
+          <span>Temperatura media</span>
+          <strong><span id="avgTemp">25.0</span><small> °C</small></strong>
+        </article>
+        <article class="metric hero target">
+          <span>Target</span>
+          <strong><span id="targetTemp">25.0</span><small> °C</small></strong>
+        </article>
+        <article class="metric">
+          <span>Potenza</span>
+          <strong><span id="power">0</span><small> %</small></strong>
+          <div class="bar"><div id="powerBar"></div></div>
+        </article>
+        <article class="metric">
+          <span>ΔT sensori</span>
+          <strong><span id="deltaTemp">0.0</span><small> °C</small></strong>
+          <small id="uniformityText">Uniformità OK</small>
+        </article>
+      </div>
+
+      <div class="sensor-grid">
+        <article class="sensor-card">
+          <span>PT1000 #1 · Alto</span>
+          <strong><span id="t1">25.0</span> °C</strong>
+        </article>
+        <article class="sensor-card">
+          <span>PT1000 #2 · Centro</span>
+          <strong><span id="t2">25.0</span> °C</strong>
+        </article>
+        <article class="sensor-card">
+          <span>PT1000 #3 · Basso</span>
+          <strong><span id="t3">25.0</span> °C</strong>
+        </article>
+      </div>
+
+      <div class="chart-card">
+        <div class="chart-head">
+          <div>
+            <h3>Curva termica</h3>
+            <small>Target e temperatura media</small>
+          </div>
+          <div class="legend">
+            <span><i class="legend-line target-line"></i>Target</span>
+            <span><i class="legend-line actual-line"></i>Reale</span>
+          </div>
+        </div>
+        <canvas id="tempChart" width="1200" height="420"></canvas>
+      </div>
+    </section>
+
+    <aside class="panel control-panel">
+      <h2>Controllo ciclo</h2>
+      <label class="field">
+        <span>Materiale</span>
+        <select id="recipeSelect"></select>
+      </label>
+
+      <div class="recipe-summary">
+        <div>
+          <span>Step</span>
+          <strong id="stepCounter">0 / 0</strong>
+        </div>
+        <div>
+          <span>Fase</span>
+          <strong id="stepName">—</strong>
+        </div>
+        <div>
+          <span>Residuo step</span>
+          <strong id="stepRemaining">—</strong>
+        </div>
+      </div>
+
+      <div class="buttons">
+        <button id="startBtn" class="primary">START</button>
+        <button id="pauseBtn">PAUSA</button>
+        <button id="stopBtn" class="danger">STOP</button>
+      </div>
+
+      <div id="alarmBox" class="alarm hidden">
+        <strong>⚠ Warning</strong>
+        <span id="alarmText"></span>
+      </div>
+
+      <hr />
+
+      <div class="panel-title-row compact">
+        <div>
+          <h2>Materiale</h2>
+          <p>Editor locale</p>
+        </div>
+        <button id="newRecipeBtn" class="ghost">Nuova</button>
+      </div>
+
+      <label class="field">
+        <span>Nome materiale</span>
+        <input id="recipeName" type="text" />
+      </label>
+
+      <div id="stepsEditor" class="steps-editor"></div>
+
+      <button id="addStepBtn" class="ghost full">+ Aggiungi step</button>
+      <p class="hint ramping-hint">
+        Per una fase Ramp o Cooldown imposta i gradi al minuto: il forno seguirà quel ritmo fino al target.
+      </p>
+
+      <div class="buttons secondary">
+        <button id="saveRecipeBtn">Salva</button>
+        <button id="exportBtn">Esporta JSON</button>
+        <label class="import-label">
+          Importa JSON
+          <input id="importInput" type="file" accept=".json,application/json" hidden />
+        </label>
+      </div>
+
+      <hr />
+
+      <h2>Simulazione</h2>
+      <label class="field">
+        <span>Velocità simulazione</span>
+        <select id="speedSelect">
+          <option value="1">1× reale</option>
+          <option value="10">10×</option>
+          <option value="30" selected>30×</option>
+          <option value="60">60×</option>
+        </select>
+      </label>
+      <p class="hint">
+        Il simulatore riproduce inerzia termica, tre sensori e controllo di potenza.
+        Più avanti questi dati verranno sostituiti dalle letture reali dell'ESP32.
+      </p>
+    </aside>
+  </main>
+
+  <footer>
+    Prototype UI · ESP32 + PT1000 + SSR
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

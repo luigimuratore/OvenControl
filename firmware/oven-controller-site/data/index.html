@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Oven Controller · Prova in sede</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar"><div><div class="eyebrow">ESP32-S3 · PROVA IN SEDE</div><h1>Oven Controller</h1></div>
+    <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
+  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabRecipes">Ricette</button><button id="tabLogs">Log</button></nav>
+  <main id="dashboardView" class="layout">
+    <section class="panel dashboard-panel">
+      <div class="panel-title-row"><div><h2>Forno</h2><p id="cycleInfo">In attesa del controllore</p></div><div class="clock-box"><span>ESP acceso da</span><strong id="uptime">—</strong></div></div>
+      <div class="hero-grid">
+        <article class="metric hero"><span>Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
+        <article class="metric hero target"><span>Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
+        <article class="metric"><span>SSR / LED rosso</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
+        <article class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong><small>Arresto oltre 10 °C</small></article>
+      </div>
+      <div class="sensor-grid two"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article></div>
+      <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3><small>Live 0,5 s · storico ESP ogni 10 s, fino a 12 ore</small></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><button id="exportSamples" class="ghost">Esporta CSV</button></div>
+        <canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas>
+        <div class="chart-navigation"><button id="chartBack">← Indietro</button><input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Posizione grafico"><button id="chartForward">Avanti →</button><button id="chartNow">Adesso</button><select id="chartSpan"><option value="900000">15 min</option><option value="1800000" selected>30 min</option><option value="3600000">1 ora</option><option value="all">Tutto</option></select></div>
+        <p id="chartRangeLabel" class="chart-range-label">Caricamento…</p>
+      </div>
+    </section>
+    <aside class="panel control-panel">
+      <h2>Controllo ciclo</h2><p>La rampa avanza in °C/min. Il mantenimento conta solo il tempo con entrambe le PT100 entro ±1 °C. Il cooldown è passivo: SSR spento.</p>
+      <label class="field"><span>Ricetta</span><select id="recipeSelect"></select></label>
+      <div class="recipe-summary"><div><span>Fase</span><strong id="stepPosition">—</strong></div><div><span>Target finale step</span><strong id="finalTarget">—</strong></div><div><span>Rate / mantenimento</span><strong id="rateInfo">—</strong></div></div>
+      <div class="buttons site-buttons"><button id="startBtn" class="primary">AVVIA CICLO</button><button id="pauseBtn">PAUSA</button><button id="resumeBtn">RIPRENDI</button><button id="stopBtn" class="danger">STOP</button></div>
+      <button id="resetBtn" class="ghost full">Riconosci allarme / interruzione</button>
+      <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
+      <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta OvenController-Site</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>
+      <hr><h2>Corrente e ripartenza</h2><div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Ultimo reset</span><strong id="resetReason">—</strong></div><div><span>Ora NTP</span><strong id="timeStatus">—</strong></div><div><span>Temperatura interna ESP</span><strong id="chipTemperature">—</strong></div></div><p id="outageInfo" class="hint">Nessun dato.</p>
+      <p class="hint">Temperatura interna indicativa: non misura il regolatore 3,3 V né l'aria attorno al modulo.</p>
+      <p class="hint">Dopo spegnimento/reset il ciclo non riparte da solo. La durata mostrata è il massimo intervallo dall'ultimo salvataggio al riavvio, non la misura esatta del blackout.</p>
+    </aside>
+  </main>
+  <section id="recipesView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">PROFILI</div><h2>Ricette sul controllore</h2><p>Modifica e salva sull'ESP. Massimo 8 ricette e 12 step ciascuna.</p></div><div class="log-actions"><button id="addRecipe" class="ghost">Nuova ricetta</button><button id="exportRecipes" class="ghost">Esporta JSON</button><label class="import-label">Importa JSON<input id="importRecipes" type="file" accept="application/json,.json" hidden></label></div></div>
+    <label class="field"><span>Ricetta da modificare</span><select id="editRecipeSelect"></select></label><label class="field"><span>Nome</span><input id="recipeName" maxlength="48"></label>
+    <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina ricetta</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
+    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±1 °C. Cooldown: discesa naturale; il rate è il riferimento sul grafico e non viene forzato dal forno.</p><div id="recipeMessage" class="notice hidden"></div>
+    <hr><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
+    <div class="pid-fields"><label class="field"><span>Kp</span><input id="kp" type="number" min="0" max="50" step="0.1"></label><label class="field"><span>Ki</span><input id="ki" type="number" min="0" max="0.5" step="0.001"></label><label class="field"><span>Kd</span><input id="kd" type="number" min="0" max="200" step="0.1"></label></div><button id="savePid" class="ghost full">Salva PID sull'ESP</button>
+  </section>
+  <section id="logsView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2><p>Avvio/fine ciclo, step, PID, allarmi, rete e interruzioni.</p></div><div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div></div><p id="logRetention" class="hint">Caricamento…</p><div id="logList" class="log-list"></div></section>
+  <footer>Prova in sede · Due PT100 reali obbligatorie · Protezioni hardware indipendenti richieste</footer>
+  <script src="/app.js"></script>
+</body></html>

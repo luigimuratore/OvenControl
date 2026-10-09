@@ -9,55 +9,141 @@
 <body>
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
-  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabRecipes">Ricette</button><button id="tabLogs">Log</button></nav>
+  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
-  <button id="globalStop" class="danger global-stop" disabled>STOP · USCITA SPENTA</button>
+  <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
   <main id="dashboardView" class="layout">
     <section class="panel dashboard-panel">
       <div class="panel-title-row"><div><h2>Forno</h2><p id="cycleInfo">In attesa del controllore</p></div><div class="clock-box"><span>ESP acceso da</span><strong id="uptime">—</strong></div></div>
       <div class="hero-grid">
         <article class="metric hero"><span>Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
         <article class="metric hero target"><span>Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
-        <article class="metric"><span>Uscita / LED rosso</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
+        <article class="metric"><span>Comando uscita · GPIO4</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
         <article class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong><small>Arresto oltre 10 °C</small></article>
       </div>
       <div class="sensor-grid two"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article></div>
-      <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3><small>Live 0,5 s · storico ESP ogni 10 s, fino a 12 ore</small></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><button id="exportSamples" class="ghost">Esporta CSV completo</button></div>
-        <canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas>
+      <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><label class="chart-scale">Asse Y<select id="chartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="exportSamples" class="ghost">Scarica CSV + grafico</button></div>
+        <div class="chart-plot"><canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas><div id="chartCursor" class="chart-cursor" hidden></div><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
         <div class="chart-navigation"><button id="chartBack">← Indietro</button><input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Posizione grafico"><button id="chartForward">Avanti →</button><button id="chartNow">Adesso</button><select id="chartSpan"><option value="900000">15 min</option><option value="1800000" selected>30 min</option><option value="3600000">1 ora</option><option value="all">Tutto</option></select></div>
         <p id="chartRangeLabel" class="chart-range-label">Caricamento…</p>
       </div>
+      <div id="reportNotice" class="report-notice" hidden><div><strong>Report di fine ciclo disponibile</strong><p id="reportNoticeText"></p></div><button id="openReport" class="ghost">Apri report</button></div>
     </section>
     <aside class="panel control-panel">
-      <h2>Controllo ciclo</h2><p>La rampa avanza in °C/min. Il mantenimento conta solo il tempo con entrambe le PT100 entro ±1 °C. Il cooldown è passivo: uscita spenta.</p>
-      <label class="field"><span>Ricetta</span><select id="recipeSelect"></select></label>
+      <h2>Controllo ciclo</h2><ul class="control-notes"><li>La rampa avanza in °C/min.</li><li>Il mantenimento conta solo il tempo con entrambe le PT100 entro ±5 °C dal target.</li><li>Il cooldown è passivo: uscita spenta.</li></ul>
+      <label class="field"><span>Programma</span><select id="recipeSelect"></select></label>
       <ol id="recipePreview" class="recipe-preview"></ol>
-      <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> Collaudo hardware concluso e protezioni indipendenti verificate.</label>
+      <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
       <div class="recipe-summary"><div><span>Fase</span><strong id="stepPosition">—</strong></div><div><span>Target finale step</span><strong id="finalTarget">—</strong></div><div><span>Rate / mantenimento</span><strong id="rateInfo">—</strong></div></div>
       <div class="buttons site-buttons"><button id="startBtn" class="primary">AVVIA CICLO</button><button id="pauseBtn">PAUSA</button><button id="resumeBtn">RIPRENDI</button><button id="stopBtn" class="danger">STOP</button></div>
       <button id="resetBtn" class="ghost full">Riconosci allarme / interruzione</button>
-      <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo, incluse pause</span><strong id="cycleDuration">—</strong></div><div><span>Tempo step attivo</span><strong id="stepDuration">—</strong></div></div>
-      <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi. STOP e PAUSA spengono l'uscita. Dopo un reset non c'è ripresa automatica.</p>
+      <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo totale</span><strong id="cycleDuration">—</strong></div><div><span>Tempo rimanente step attivo</span><strong id="stepDuration">—</strong><small id="stepTimeHint" class="hint"></small></div></div>
+      <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>STOP e PAUSA spengono l'uscita.<br>Dopo un reset non c'è ripresa automatica.</p>
       <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
       <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta OvenController-Full</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>
-      <hr><h2>Corrente e ripartenza</h2><div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Ultimo reset</span><strong id="resetReason">—</strong></div><div><span>Ora NTP</span><strong id="timeStatus">—</strong></div><div><span>Temperatura interna ESP</span><strong id="chipTemperature">—</strong></div></div><p id="outageInfo" class="hint">Nessun dato.</p>
-      <p class="hint">Temperatura interna indicativa: non misura il regolatore 3,3 V né l'aria attorno al modulo.</p>
-      <p class="hint">Dopo spegnimento/reset il ciclo non riparte da solo. La durata mostrata è il massimo intervallo dall'ultimo salvataggio al riavvio, non la misura esatta del blackout.</p>
+      <hr><h2>Corrente e ripartenza</h2><div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Ultimo reset</span><strong id="resetReason">—</strong></div><div><span>Ora NTP</span><strong id="timeStatus">—</strong></div><div><span>Temperatura interna ESP</span><strong id="chipTemperature">—</strong></div></div><section class="errors-section" aria-labelledby="errorsTitle"><h3 id="errorsTitle">ERRORI</h3><p id="cycleErrorInfo">In attesa del controllore.</p><p id="outageInfo">In attesa dei dati di interruzione.</p></section>
       <hr><h2>Diagnostica circuito</h2><div class="recipe-summary power-summary"><div><span>Attuatore</span><strong id="actuatorInfo">—</strong></div><div><span>Potenza massima richiesta</span><strong id="powerInfo">—</strong></div><div><span>RAM libera / minimo</span><strong id="heapInfo">—</strong></div><div><span>Età letture</span><strong id="sampleAge">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="rssiInfo">—</strong></div></div>
-      <p class="hint">L'uscita indica il comando GPIO, senza feedback di corrente o dei contatti. Puoi modificare attuatore, finestra e limite potenza nella scheda Ricette.</p>
     </aside>
   </main>
-  <section id="recipesView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">PROFILI</div><h2>Ricette sul controllore</h2><p>Modifica e salva sull'ESP. Massimo 8 ricette e 12 step ciascuna.</p></div><div class="log-actions"><button id="addRecipe" class="ghost">Nuova ricetta</button><button id="exportRecipes" class="ghost">Esporta JSON</button><label class="import-label">Importa JSON<input id="importRecipes" type="file" accept="application/json,.json" hidden></label></div></div>
-    <label class="field"><span>Ricetta da modificare</span><select id="editRecipeSelect"></select></label><label class="field"><span>Nome</span><input id="recipeName" maxlength="48"></label>
-    <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina ricetta</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
-    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±1 °C. Cooldown: discesa naturale; il rate è il riferimento sul grafico e non viene forzato dal forno.</p><div id="recipeMessage" class="notice hidden"></div>
-    <hr><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
+  <section id="recipesView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">PROFILI</div><h2>Programmi sul controllore</h2><p>Modifica e salva sull'ESP. Massimo 8 programmi e 12 step ciascuno.</p></div><div class="log-actions"><button id="addRecipe" class="ghost">Nuovo programma</button><button id="exportRecipes" class="ghost">Esporta JSON</button><label class="import-label">Importa JSON<input id="importRecipes" type="file" accept="application/json,.json" hidden></label></div></div>
+    <label class="field"><span>Programma da modificare</span><select id="editRecipeSelect"></select></label>
+    <div class="program-editor-section"><label class="field"><span>Nome</span><input id="recipeName" maxlength="48"></label>
+    <p class="hint">Target selezionabile da 0 a 400 °C. Arresto per temperatura assoluta a 415 °C sulla sonda più calda.</p>
+    <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina programma</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
+    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: discesa naturale; il rate è il riferimento sul grafico e non viene forzato dal forno.</p><div id="recipeMessage" class="notice hidden"></div>
+    </div>
+    <section class="control-settings-section"><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
     <div class="pid-fields"><label class="field"><span>Kp</span><input id="kp" type="number" min="0" max="50" step="0.1"></label><label class="field"><span>Ki</span><input id="ki" type="number" min="0" max="0.5" step="0.001"></label><label class="field"><span>Kd</span><input id="kd" type="number" min="0" max="200" step="0.1"></label></div><button id="savePid" class="ghost full">Salva PID sull'ESP</button>
     <hr><h2>Attuatore e limite potenza</h2><p>Seleziona l'attuatore realmente installato. Il limite è la percentuale di tempo ON richiesta, senza misura della potenza elettrica.</p>
     <div class="pid-fields"><label class="field"><span>Tipo attuatore</span><select id="actuator"><option value="relay">Relè meccanico</option><option value="ssr">SSR</option></select></label><label class="field"><span>Finestra comando · s</span><input id="windowSec" type="number" min="60" max="300" step="1"></label><label class="field"><span>Limite comando · %</span><input id="maxPower" type="number" min="1" max="100" step="1"></label></div>
     <button id="saveControl" class="ghost full">Salva comando sull'ESP</button><p class="hint">Default: relè meccanico, finestra 60 s, comando massimo 30%. SSR: finestra 1–300 s; relè: 60–300 s. Questi valori iniziali e il PID richiedono taratura sul forno. Il firmware non rileva il tipo di attuatore.</p>
+    </section>
   </section>
   <section id="logsView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2><p>Avvio/fine ciclo, step, PID, allarmi, rete e interruzioni.</p></div><div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div></div><p id="logRetention" class="hint">Caricamento…</p><div id="logList" class="log-list"></div></section>
-  <footer>Controllo completo · Due PT100 reali obbligatorie · Protezioni hardware indipendenti richieste</footer>
+<section id="testView" hidden>
+<div class="field-banner"><span id="testStatusDot" class="status-dot idle"></span> <strong id="testStatusText">Connessione…</strong><br>TEST SUL CAMPO · Resistenze reali scollegate. I test comandano direttamente le uscite, anche con sonde assenti. Esci da TEST prima di avviare un programma.</div>
+  <div id="testDashboardView" class="layout">
+    <section class="panel dashboard-panel">
+      <div class="panel-title-row"><div><h2>PT100 reali e circuito</h2><p>Letture continue · 3 fili · Filtro 50 Hz</p></div><div class="clock-box"><span>Tempo acceso</span><strong id="testUptime">—</strong></div></div>
+      <div class="hero-grid">
+        <article class="metric hero"><span>PT100 #1 · CS 14</span><strong><span id="testT1">—</span><small> °C</small></strong><small id="testSensorState1">In attesa</small></article>
+        <article class="metric hero"><span>PT100 #2 · CS 10</span><strong><span id="testT2">—</span><small> °C</small></strong><small id="testSensorState2">In attesa</small></article>
+        <article class="metric"><span>ΔT sonde</span><strong><span id="testDeltaTemp">—</span><small> °C</small></strong><small>Confronto diagnostico</small></article>
+        <article class="metric"><span>Comando relè · GPIO4</span><strong id="testRelayState">—</strong><small id="testRelayHint">Nessun feedback elettrico</small></article>
+      </div>
+      <div class="sensor-grid two">
+        <article class="sensor-card"><span>Diagnostica PT100 #1</span><strong id="testOhms1">— Ω</strong><small id="testRaw1">RAW — · RREF —</small><p id="testFault1" class="hint">—</p></article>
+        <article class="sensor-card"><span>Diagnostica PT100 #2</span><strong id="testOhms2">— Ω</strong><small id="testRaw2">RAW — · RREF —</small><p id="testFault2" class="hint">—</p></article>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><div><h3>Temperature reali</h3><small id="testHistoryInfo">Ultimi 5 minuti · Storico ESP fino a circa 1 ora</small></div><div class="legend"><span><i class="legend-line actual-line"></i>PT100 #1</span><span><i class="legend-line target-line"></i>PT100 #2</span></div><label class="chart-scale">Asse Y<select id="testChartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="testExportSamples" class="ghost" disabled>Esporta CSV completo</button></div>
+        <div class="chart-plot"><canvas id="testTempChart" width="1200" height="420" aria-label="Grafico delle due temperature reali"></canvas><div id="testChartCursor" class="chart-cursor" hidden></div><div id="testChartTooltip" class="chart-tooltip" hidden></div></div>
+        <div class="chart-navigation"><button id="testChartBack">← Indietro</button><span>Finestra 5 min</span><button id="testChartForward">Avanti →</button><button id="testChartNow">Adesso</button></div>
+        <p id="testChartRangeLabel" class="chart-range-label">In attesa di letture…</p>
+        <p class="hint">Il CSV include temperature, RAW, fault e comandi GPIO campionati ogni circa 1 s. Gli impulsi più brevi sono nel log. Storico e dettagli in RAM si cancellano al riavvio; gli eventi principali restano nel log full.</p>
+      </div>
+      <hr>
+      <h2>Verifiche sul campo</h2>
+      <p class="hint">Questa lista raccoglie le tue verifiche visive e strumentali. Il firmware non misura alimentazioni, contatti del relè o corrente del carico.</p>
+      <div class="checklist">
+        <label><input type="checkbox"> Alimentazione 3,3 V delle Click e massa comune verificate con multimetro.</label>
+        <label><input type="checkbox"> PT100 #1 reagisce scaldandola con la mano; #2 resta coerente.</label>
+        <label><input type="checkbox"> PT100 #2 reagisce scaldandola con la mano; #1 resta coerente.</label>
+        <label><input type="checkbox"> Verde e rosso identificati con le prove separate.</label>
+        <label><input type="checkbox"> GPIO4, transistor e comando del relè verificati durante un impulso.</label>
+        <label><input type="checkbox"> Uscita realmente inattiva dopo STOP e riavvio della scheda.</label>
+      </div>
+      <p class="hint">Per provare un fault: disalimenta prima il circuito, scollega una sonda, riaccendi e verifica il messaggio. Ricollegala a circuito disalimentato. Per il driver SSR usa le misure adatte al tuo circuito; la continuità da sola non ne verifica il funzionamento.</p>
+    </section>
+    <aside class="panel control-panel">
+      <h2>Comandi di collaudo</h2>
+      <div class="buttons"><button id="testEnter" class="test-enter" disabled>Modalità diagnostica</button><button id="testExit" class="test-exit" disabled>Esci da TEST</button></div>
+      <p id="testModeInfo" class="hint">I test si avviano solo a ciclo fermo.</p>
+      <p>Ogni prova è temporizzata. In modalità TEST il PID e i programmi sono esclusi. Puoi testare relè e LED anche con sonde assenti o in fault.</p>
+      <p class="hint">Premi direttamente il pulsante della prova desiderata. Mantieni questa pagina visibile durante il test.</p>
+      <button id="testStopBtn" class="danger full" disabled>STOP · RELÈ SPENTO</button>
+      <div id="testMessageBox" class="notice hidden" role="status" aria-live="polite"></div>
+      <div class="test-progress"><strong id="testTestName">Lettura sonde</strong><span id="testTestRemaining">—</span></div>
+      <hr>
+      <h2>Test LED</h2>
+      <div class="led-indicators"><span><i id="testGreenIndicator" class="physical-led"></i>Verde · GPIO7</span><span><i id="testRedIndicator" class="physical-led"></i>Rosso · GPIO6</span></div>
+      <div class="buttons led-buttons">
+        <button data-action="ledGreen" disabled>Verde · 3 s</button><button data-action="ledRed" disabled>Rosso · 3 s</button>
+        <button data-action="ledBoth" disabled>Entrambi · 3 s</button><button data-action="ledOff" disabled>Spenti · 3 s</button>
+      </div>
+      <button data-action="ledSequence" class="ghost full" disabled>Sequenza LED · 8 s</button>
+      <p class="hint">Sequenza: spenti → verde → rosso → entrambi, 2 s ciascuno. GPIO4 resta spento. A riposo verde acceso = dashboard avviata; rosso segue il relè. Durante il test LED il rosso è indipendente dal relè.</p>
+      <hr>
+      <h2>Test comando relè</h2>
+      <label class="field"><span>Durata accensione relè</span><select id="testPulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option><option value="30000">30 s</option><option value="60000">1 min</option><option value="120000">2 min</option><option value="600000">10 min</option></select></label>
+      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Accendi relè</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
+      <p class="hint">Il relè resta acceso per tutta la durata scelta e poi si spegne automaticamente. STOP è sempre disponibile.</p>
+      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e ferma la prova. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
+      <hr>
+      <h2>Rete e scheda</h2>
+      <div class="network-line"><span>Aggiornamenti Wi-Fi OTA</span><strong id="testOtaState">—</strong></div>
+      <div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="testWorkshopState">—</strong></div><a id="testWorkshopAddress" class="network-address" hidden></a><a id="testLocalAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta</span><strong>OvenController-Full</strong></div><span id="testApAddress" class="network-address">—</span></div>
+      <div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="testBootCount">—</strong></div><div><span>Reset codice</span><strong id="testResetReason">—</strong></div><div><span>Chip ESP</span><strong id="testChipTemperature">—</strong></div><div><span>RAM libera / minimo</span><strong id="testHeap">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="testRssi">—</strong></div><div><span>Test al reset</span><strong id="testInterrupted">—</strong></div></div>
+      <p class="hint">La temperatura del chip ESP non è quella del regolatore o dell'aria. Nessuna uscita riparte automaticamente dopo un reset. Nessun login: usa una rete di prova controllata.</p>
+    </aside>
+  </div>
+  <section id="testLogsView" class="logs-view panel">
+    <div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del collaudo</h2><p>Avvio, sonde, test, GPIO e arresti · Ultimi 128 eventi · Inclusi gli eventi principali salvati</p></div><div class="log-actions"><button id="testRefreshLogs" class="ghost" disabled>Aggiorna</button><button id="testExportLogs" class="ghost" disabled>Esporta JSON</button></div></div>
+    <div id="testLogList" class="log-list">In attesa del controllore…</div>
+  </section>
+
+</section>
+  <section id="reportView" class="logs-view panel" hidden>
+    <div class="panel-title-row"><div><div class="eyebrow">RIEPILOGO E TUNING</div><h2>Report di fine ciclo</h2><p>L'ultimo ciclo terminato, fermato o concluso con un allarme.</p></div><div class="log-actions"><button id="refreshReport" class="ghost" disabled>Aggiorna</button><button id="exportReport" class="ghost" disabled>Scarica report PDF</button><button id="exportReportCsv" class="ghost" disabled>Scarica CSV + grafico</button><button id="exportReportImage" class="ghost" disabled>Scarica grafico PNG</button><button id="exportReportJson" class="ghost" disabled>Esporta JSON</button></div></div>
+    <p id="reportMessage" class="hint" role="status" aria-live="polite">Il report sarà disponibile al termine del primo ciclo con questo firmware.</p>
+    <div id="reportContent" hidden><div class="report-result"><strong id="reportOutcome"></strong><span id="reportReason"></span></div>
+      <div id="reportSummary" class="recipe-summary report-summary"></div>
+      <div class="chart-card report-chart"><div class="chart-head"><h3>Curva del ciclo</h3><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span></div></div><div id="reportPlot" role="img" aria-label="Setpoint e media PT100 durante il ciclo"></div><p id="reportCurveMessage" class="hint" role="status"></p></div>
+      <h3>Dettaglio degli step</h3><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Step</th><th>Target</th><th>Esito</th><th>Tempo attivo</th><th>Pause</th><th>Hold in banda / richiesto</th><th>Errore medio assoluto</th><th>Superamento max</th><th>Ritardo max</th><th>PID medio / al limite</th><th>Escursione PT100 durante hold</th></tr></thead><tbody id="reportSteps"></tbody></table></div>
+      <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la sonda più calda e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. Il tempo in banda richiede entrambe le PT100 entro ±5 °C con letture consecutive fresche. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
+    </div>
+  </section>
+  <script src="/jspdf.umd.min.js"></script>
+  <script src="/report-export.js"></script>
   <script src="/app.js"></script>
 </body></html>

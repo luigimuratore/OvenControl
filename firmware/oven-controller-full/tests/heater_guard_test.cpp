@@ -50,7 +50,7 @@ int main() {
   hold.update(20000, true); assert(hold.elapsedMs == 1500); // Stale interval excluded.
   hold.reset(UINT32_MAX - 250); hold.update(UINT32_MAX - 50, true); hold.update(449, true);
   assert(hold.elapsedMs == 500);
-  assert(profile::inBand(49, 51, 50)); assert(!profile::inBand(48.9, 50, 50));
+  assert(profile::inBand(45, 55, 50)); assert(!profile::inBand(44.9, 50, 50));
   assert(!profile::inBand(50, std::numeric_limits<float>::quiet_NaN(), 50));
   puts("OK: PWM, pause/cooldown/STOP, stale control latch, cycle timeout, invalid plans, hold accounting, timer wrap");
 }

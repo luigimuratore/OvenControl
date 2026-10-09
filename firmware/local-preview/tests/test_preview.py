@@ -13,6 +13,28 @@ spec.loader.exec_module(preview)
 
 
 class DemoTests(unittest.TestCase):
+    def test_full_chart_start_and_backward_test_history(self):
+        self.assertIsNone(self.full.status()["cycleStartedAtMs"])
+        cycle = self.start()
+        self.assertEqual(cycle["cycleStartedAtMs"], int(self.full.now * 1000))
+        self.post(self.full, action="stop")
+        self.assertEqual(self.full.status()["cycleStartedAtMs"], cycle["cycleStartedAtMs"])
+        self.full.advance(700)
+        first = self.post(self.full, "test/command", action="ledGreen")["test"]
+        self.assertEqual(first["runSeq"], 1)
+        tail = self.full.request("GET", "test/history", {"tail": ["1"]})
+        self.assertEqual(tail["samples"][-1][1], first["startedAtMs"])
+        self.assertTrue(tail["moreBefore"])
+        before = tail["samples"][0][0]
+        older = self.full.request("GET", "test/history", {"before": [str(before)]})
+        self.assertTrue(all(row[0] < before for row in older["samples"]))
+        self.assertEqual(len({row[0] for row in older["samples"] + tail["samples"]}), len(older["samples"] + tail["samples"]))
+        self.full.advance(3)
+        self.assertEqual(self.full.status()["test"]["startedAtMs"], first["startedAtMs"])
+        second = self.post(self.full, "test/command", action="ledRed")["test"]
+        self.assertEqual(second["runSeq"], 2)
+        self.assertGreater(second["startedAtMs"], first["startedAtMs"])
+
     def setUp(self):
         self.full = preview.DemoDevice("full", speed=1)
         self.field = preview.DemoDevice("field-test", speed=60)
@@ -104,6 +126,105 @@ class DemoTests(unittest.TestCase):
         self.assertEqual(len(self.full.samples[0]), 8)
         self.assertEqual(len(self.field.samples[0]), 9)
 
+    def test_cycle_report_stop_pause_snapshot_and_previous_retained(self):
+        with self.assertRaises(preview.ApiError):
+            self.full.request("GET", "report")
+        self.start()
+        self.full.advance(10)
+        self.post(self.full, action="pause")
+        self.full.advance(5)
+        self.post(self.full, action="stop")
+        report = self.full.request("GET", "report")
+        self.assertEqual(report["outcome"], "stopped")
+        self.assertEqual(report["durationMs"], 15000)
+        self.assertEqual(report["activeMs"], 10000)
+        self.assertEqual(report["pausedMs"], 5000)
+        self.assertEqual(report["pauseCount"], 1)
+        self.assertEqual(report["completedSteps"], 0)
+        self.assertIsNotNone(report["stats"]["meanAbsoluteErrorC"])
+        self.post(self.full, "pid", kp=5, ki=.02, kd=20)
+        self.post(self.full, "control", actuator="ssr", windowSec=5, maxPower=20)
+        self.assertEqual(self.full.request("GET", "report")["settings"]["kp"], 12)
+        self.assertEqual(self.full.request("GET", "report")["settings"]["windowSec"], 60)
+        key = report["key"]
+        self.start()
+        self.assertEqual(self.full.request("GET", "report")["key"], key)
+        self.full.advance(1)
+        self.post(self.full, "preview-sensor", missing=True)
+        fault = self.full.request("GET", "report")
+        self.assertEqual(fault["outcome"], "fault")
+        self.assertGreater(fault["stats"]["invalidPairs"], 0)
+        self.assertNotEqual(fault["key"], key)
+        self.assertEqual(self.full.status()["reportKey"], fault["key"])
+        self.assertEqual(fault["settings"]["windowSec"], 5)
+
+    def test_complete_report_counts_steps_hold_and_excludes_cooldown(self):
+        recipe = [{"id": "short", "name": "Demo", "steps": [
+            {"type": "ramp", "target": 26, "rate": 60},
+            {"type": "hold", "target": 26, "duration": 1},
+            {"type": "cooldown", "target": 24.5, "rate": 60}]}]
+        self.post(self.full, "recipes", recipes=recipe)
+        self.post(self.full, action="start", recipeId="short", hardwareReady=True)
+        self.full.advance(1500)
+        report = self.full.request("GET", "report")
+        self.assertEqual(report["outcome"], "completed")
+        self.assertEqual(report["completedSteps"], 3)
+        self.assertTrue(all(step["completed"] for step in report["steps"]))
+        self.assertGreaterEqual(report["steps"][1]["holdInBandMs"], 60000)
+        self.assertIsNone(report["steps"][2]["stats"]["meanAbsoluteErrorC"])
+        self.assertEqual(report["durationMs"], sum(step["activeMs"] + step["pausedMs"] for step in report["steps"]))
+        self.assertEqual(report["stats"]["trackingSamples"], sum(step["stats"]["trackingSamples"] for step in report["steps"]))
+        self.assertNotIn("_error", report["stats"])
+
+    def test_full_manual_tests_exclude_cycles_and_allow_missing_probe(self):
+        self.start()
+        for phase in ("running", "paused"):
+            if phase == "paused":
+                self.post(self.full, action="pause")
+            with self.assertRaises(preview.ApiError):
+                self.post(self.full, "test/command", action="ledRed")
+        self.post(self.full, action="stop")
+        self.post(self.full, "preview-sensor", missing=True)
+        state = self.post(self.full, "test/command", action="relayPulse", durationMs=600000)
+        self.assertTrue(state["relay"])
+        token = state["test"]["token"]
+        self.assertFalse(state["ready"])
+        with self.assertRaises(preview.ApiError):
+            self.start()
+        with self.assertRaises(preview.ApiError):
+            self.post(self.full, "test/heartbeat", token=token + 1)
+        for _ in range(5):
+            self.full.advance(1)
+            self.post(self.full, "test/heartbeat", token=token)
+        self.assertTrue(self.full.status()["relay"])
+        self.full.advance(2.5)
+        self.assertFalse(self.full.status()["relay"])
+        self.assertTrue(self.full.status()["test"]["enabled"])
+        self.assertFalse(self.full.status()["test"]["running"])
+        self.post(self.full, "test/command", action="exit")
+        self.post(self.full, "preview-sensor", missing=False)
+        self.assertEqual(self.start()["phase"], "running")
+        # A late test-only STOP from a hidden page must not cancel a recipe.
+        self.post(self.full, "test/command", action="stop")
+        self.assertEqual(self.full.phase, "running")
+
+    def test_full_test_duration_history_and_global_stop(self):
+        for bad in (99, 5001, True, 1.5, 600001):
+            with self.assertRaises(preview.ApiError):
+                self.post(self.full, "test/command", action="relayPulse", durationMs=bad)
+        self.post(self.full, "test/command", action="ledSequence")
+        self.full.advance(1)
+        history = self.full.request("GET", "test/history")
+        self.assertEqual(history["intervalMs"], 1000)
+        self.assertEqual(len(history["samples"][0]), 9)
+        self.assertEqual(history["samples"][0][8] & 4, 0)
+        self.post(self.full, action="stop")
+        self.assertFalse(self.full.status()["relay"])
+        self.assertFalse(self.full.status()["test"]["running"])
+        self.post(self.full, "test/command", action="relayPulse", durationMs=100)
+        self.full.advance(.1)
+        self.assertFalse(self.full.status()["relay"])
+
     def test_field_pulse_duration_lease_and_stop(self):
         token = self.post(self.field, action="arm", loadsDisconnected=True)["token"]
         for bad in (99, 5001, True, 1.5):
@@ -183,6 +304,27 @@ class HttpTests(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertTrue(json.loads(body)["preview"])
         self.assertEqual(self.request("/")[0], 302)
+
+    def test_report_http_after_stop(self):
+        self.assertEqual(self.request("/full/api/report")[0], 404)
+        self.assertEqual(self.request("/full/api/command", body={"action":"start", "recipeId":"prova-50", "hardwareReady":True})[0], 200)
+        self.server.devices["full"].advance(5)
+        self.assertEqual(self.request("/full/api/command", body={"action":"stop"})[0], 200)
+        code, _, body = self.request("/full/api/report")
+        self.assertEqual(code, 200)
+        report = json.loads(body)
+        self.assertEqual(report["outcome"], "stopped")
+        self.assertEqual(report["activeMs"], 50000)
+
+    def test_full_nested_test_api_and_beacon(self):
+        code, _, payload = self.request("/full/api/test/command", body={"action": "relayPulse", "durationMs": 30000})
+        self.assertEqual(code, 200)
+        state = json.loads(payload)
+        self.assertTrue(state["relay"])
+        self.assertEqual(self.request("/full/api/test/heartbeat", body={"token": state["test"]["token"]})[0], 204)
+        self.assertEqual(self.request("/full/api/test/history")[0], 200)
+        self.assertEqual(self.request("/full/api/test/command", raw=b'{"action":"stop"}')[0], 200)
+        self.assertFalse(self.server.devices["full"].status()["relay"])
 
     def test_no_project_files_or_unprefixed_commands(self):
         for path in ("/wifi_config.h", "/full/wifi_config.h", "/full/../include/wifi_config.h",

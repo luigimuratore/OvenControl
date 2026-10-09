@@ -64,6 +64,17 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(elements.get('cycleErrorInfo').textContent.includes('Fault PT100'));
   assert(elements.get('outageInfo').textContent.includes('00:01:30'));
   assert(elements.get('outageInfo').textContent.includes('durata esatta non misurata'));
+  run(`display({...latest, lastInterruption:{recorded:true, resetReason:1, upperBoundSec:0,
+    estimateKnown:true, pending:true, programName:'Programma interrotto'}})`);
+  assert(elements.get('outageInfo').textContent.includes('🚨 BLACKOUT'));
+  assert(elements.get('outageInfo').textContent.includes('00:00:00'));
+  assert(elements.get('outageInfo').textContent.includes('Programma interrotto'));
+  assert(elements.get('outageInfo').textContent.includes('Uscite bloccate'));
+  run(`display({...latest, lastInterruption:{recorded:true, resetReason:3, upperBoundSec:0,
+    estimateKnown:false, pending:true}})`);
+  assert(elements.get('outageInfo').textContent.includes('Riavvio durante'));
+  assert(!elements.get('outageInfo').textContent.includes('BLACKOUT'));
+  assert(elements.get('outageInfo').textContent.includes('Durata sconosciuta'));
   run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120})`);
   assert.equal(elements.get('stepDuration').textContent, '00:02:00');
   assert(elements.get('stepTimeHint').textContent.includes('±5'));

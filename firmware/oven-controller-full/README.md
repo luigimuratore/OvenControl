@@ -21,6 +21,7 @@ La scheda **TEST** integra il collaudo di `oven-controller-field-test`: puoi ver
 - Log JSON e seriale; fino a **40 eventi principali** restano dopo un riavvio, secondo lo spazio NVS disponibile.
 - Rete Wi-Fi diretta più rete del capannone, mDNS, NTP, contatore avvii e rilevazione ciclo interrotto.
 - Diagnostica chip ESP, RAM libera/minima, RSSI e età delle letture.
+- Bot Telegram opzionale: `/status` dalla chat privata autorizzata e notifiche di avvio, pausa/ripresa, STOP, completamento, emergenze, allarmi e riavvio.
 
 ## Anteprima Python locale per i check
 
@@ -54,7 +55,7 @@ Il caricamento sostituisce il firmware della scheda collegata. Non serve un uplo
 | Dashboard diretta | `http://192.168.4.1/` |
 | Nome mDNS sulla LAN, se supportato | `http://oven-full.local/` |
 
-Il file locale `include/wifi_config.h` è ripreso da `oven-controller-site`. Puoi modificarlo per SSID/password del capannone e server NTP; se manca, copialo da `include/wifi_config.example.h`. La rete diretta resta disponibile. La dashboard mostra anche l'IP sulla rete del capannone. Non ci sono login o accessi cloud: usa una LAN controllata. NTP serve a datare gli eventi e a stimare l'intervallo di interruzione; il controllo termico usa `millis()` e funziona anche senza Internet.
+Il file locale `include/wifi_config.h` è ripreso da `oven-controller-site`. Puoi modificarlo per SSID/password del capannone e server NTP; se manca, copialo da `include/wifi_config.example.h`. La rete diretta resta disponibile. La dashboard mostra anche l'IP sulla rete del capannone. La dashboard non ha login: usa una LAN controllata. Telegram è opzionale e richiede accesso a Internet. NTP serve a datare gli eventi e a stimare l'intervallo di interruzione; il controllo termico usa `millis()` e funziona anche senza Internet.
 
 La configurazione Wi-Fi viene applicata in RAM a ogni avvio dalle credenziali incluse nel firmware. Se dopo il passaggio dal field-test compare `NOT_ENOUGH_SPACE` seguito da `softAP(): set AP config failed`, carica questa versione aggiornata normalmente: non serve cancellare tutta la flash. All'avvio, e prima di salvare nuovi log, vengono eliminati i log full più vecchi quando necessario per riservare spazio alle impostazioni e allo stato di sicurezza. Programmi, PID, attuatore e dati degli altri firmware non vengono cancellati. Se lo spazio resta insufficiente, gli eventi restano in RAM e il log seriale lo segnala; il Wi-Fi usa comunque la configurazione in RAM.
 
@@ -90,6 +91,86 @@ Le prove sono disponibili solo a ciclo fermo: anche **PAUSA** blocca TEST. Premi
 Premi **Esci da TEST** prima di avviare un programma o riconoscere un allarme. Le prove manuali comandano direttamente il driver: finestra PID e limite percentuale di comando si applicano ai cicli, non alle accensioni di collaudo. Esegui le prove con resistenze reali scollegate, usando gli strumenti di verifica previsti nel [collaudo sul campo](../oven-controller-field-test/README.md#procedura-per-il-collaudo).
 
 API diagnostiche: `POST /api/test/command` (`enter`, `exit`, `stop` e le azioni LED/relè), `POST /api/test/heartbeat` con `token`, `GET /api/test/history`. `/api/status` include l'oggetto `test`, gli stati `relay`/`red`/`green` e lo stato OTA. STOP inviato all'API dei test non arresta un programma partito da un'altra pagina; `POST /api/command` con `stop` è lo STOP globale.
+
+## Telegram · configurazione e prova
+
+Il bot risponde a **`/status`**, **`/start`** e **`/help`** soltanto nella chat privata configurata, verificando anche il mittente. `/start` mostra l'aiuto, non avvia un programma. Non esegue comandi su uscite, PID, programmi o riconoscimento emergenze. I messaggi usano **🚀** per avvio ciclo, **⏸️** per pausa, **⏯️** per ripresa, **✅** per lo stato regolare e il completamento, **⚠️** per STOP e interruzioni, **🚨** per emergenze e allarmi. `/status` divide i dati aggiornati in blocchi: stato, ciclo/tempi, temperature, uscita, regolazione, eventuali errori registrati e sistema. **Programma, step, target e tempi compaiono soltanto durante un ciclo avviato o in pausa**; a ciclo fermo il programma selezionato in dashboard e i programmi precedenti restano esclusi. Le notifiche di fine ciclo, STOP e allarme possono invece indicare il programma a cui si riferisce l'evento. Sono riportati anche entrambe le PT100/media/differenza, età letture, GPIO/PID, attuatore/limite, uptime, avvio, RAM e RSSI.
+
+**Messaggi semplici:** avvio e STOP riportano soltanto icona/evento, **nome del programma** e **giorno/ora italiana dell'evento**, inclusa l'ora legale. Lo stesso formato breve è usato per pausa, ripresa e completamento. Temperature, PID, uscite e tempi restano disponibili con `/status`; emergenze, allarmi e blackout mantengono invece motivo e stato dettagliato. La data viene fissata alla creazione del messaggio, anche se l'invio avviene dopo; sul firmware senza NTP compare **Orario non sincronizzato**. STOP senza un ciclo attivo non genera una notifica di ciclo fermato.
+
+**Notifiche selettive:** avvio, pausa/ripresa, STOP manuale, completamento, risposte `/status`/aiuto e PDF vengono inviati con `disable_notification=true`: restano nella timeline, ma senza suono. Emergenze, allarmi, **🚨 BLACKOUT**, ciclo interrotto da riavvio e fault sonda recuperati usano la notifica normale (`false`); il PDF allegato allo stesso allarme resta silenzioso, evitando un secondo suono. La priorità dell'evento determina la notifica, non l'emoji o il testo: chiedere `/status` durante un allarme non ripete il suono dell'allarme.
+
+**Lascia attive le notifiche della chat del bot** e abilita quelle di Telegram sul telefono. Il bot non può scavalcare una chat silenziata, le restrizioni del sistema o Non disturbare, né garantire una consegna immediata senza rete. Secondo la [Bot API](https://core.telegram.org/bots/api#sendmessage), l'invio silenzioso può comunque produrre notifiche visive, banner e badge: elimina il suono, non tutti gli avvisi. Per azzerare anche gli avvisi ordinari servono due destinazioni separate: una timeline silenziata e una chat allarmi con notifiche attive.
+
+Al termine di ogni ciclo avviato (**completamento, STOP o allarme/emergenza**) il bot invia anche un **PDF**, senza richiedere la dashboard aperta. Il file contiene riepilogo, grafico vettoriale **target/media PT100**, dettaglio degli step e note. Il nome include l’esito: `Completed_Nome_programma_2026-10-09_16-30-00.pdf` per un ciclo completato, `Stopped_...pdf` per STOP e `Error_...pdf` per allarme/emergenza, con **data/ora italiana di fine ciclo**, inclusa l'ora legale. Un semplice STOP senza un ciclo avviato non genera PDF. Sull'ESP senza NTP il nome usa `senza_orario_avvio-<boot>_<uptime>` e gli orari restano indicati come non sincronizzati.
+
+Il loop copia soltanto uno snapshot del report e della curva in PSRAM; generazione PDF e upload HTTPS multipart sono eseguiti dal task Telegram, separato dal controllo. Un nuovo ciclo non modifica gli allegati accodati. Ci sono al massimo **4 report pendenti** (3 in coda e uno nel task), con buffer PDF limitato a **768 KiB**; i PDF precedono soltanto il polling, mentre allarmi, risposte e notifiche hanno la precedenza. Un nuovo allarme interrompe l'upload al successivo blocco di scrittura; una chiamata di rete già in corso può attendere il suo timeout. Gli allegati vengono ritentati con lo stesso file per un massimo di **24 ore**, rispettando il backoff Telegram. Le code sono in RAM: riavvio, mancanza di PSRAM o coda piena possono impedire l'invio. Il report della dashboard resta scaricabile; un upload ricevuto da Telegram ma senza risposta di conferma può essere duplicato al ritentativo. Al riavvio non si invia automaticamente un vecchio report.
+
+L'anteprima Python riusa **lo stesso generatore jsPDF della dashboard**, tramite `scripts/report_pdf.cjs`: serve Node.js sul Mac (viene rilevato anche il runtime di ChatGPT, se presente). Legge report e curva da localhost con verifica della chiave, evitando invii ripetuti dello stesso report durante la connessione. Senza orari simulati il nome file usa l'ora reale italiana di acquisizione del report. Le notifiche e la didascalia PDF indicano **ANTEPRIMA SIMULATA**. Il firmware genera autonomamente il PDF e non richiede Python, Node.js o un computer acceso.
+
+Le notifiche automatiche includono **avvio del ciclo con nome del programma**, pausa/ripresa, STOP, completamento, arresto per allarme ed **EMERGENZA**. Un `0x04` PT100 recuperato è un avviso distinto dall'arresto. All'avvio si segnala anche un ciclo interrotto o un'emergenza rimasta bloccata. Gli allarmi sono accodati dopo lo spegnimento del comando uscite.
+
+### 1. Associare il bot alla propria chat
+
+**Guida fissata:** `/start` mostra la guida completa e fissa il messaggio nella chat privata, senza suono; `/help` mostra la stessa guida. Il fissaggio viene eseguito dal task Telegram dopo l'invio, con ritentativo separato che riusa l'ID del messaggio già inviato. In questo modo un errore temporaneo durante il fissaggio non duplica la guida. `/start` non avvia il forno. Per modificare il testo condiviso tra firmware e anteprima, cambia `kGuideText` in `src/telegram_policy.h`. La descrizione breve del profilo, visibile quando condividi il bot, è **Monitoraggio forno 🔥**.
+
+Crea un **bot dedicato al forno** con `/newbot` nella chat ufficiale [@BotFather](https://t.me/BotFather), scegliendo uno username che finisca in `bot`. Dalla cartella del firmware full:
+
+```sh
+cd "/Users/gigi/Documents/PROJECTS/Forno oriana/firmware/oven-controller-full"
+python3 scripts/telegram_tool.py --setup
+```
+
+Incolla il token nella richiesta del terminale: non viene visualizzato. Apri il link stampato dallo script e premi **AVVIA** nella tua chat privata col bot. Lo script usa un codice casuale per associare questa chat e crea **`include/telegram_config.h`**, con permessi `0600`, escluso da Git. Token e chat non vengono mostrati nella dashboard/API/log. Il token finisce nel firmware compilato: tratta anche il binario come privato. Il template per una configurazione manuale è `include/telegram_config.example.h`.
+
+Serve Python **3.9 o successivo**, senza pacchetti aggiuntivi. Prima prova di consegna dal Mac:
+
+Lo script mantiene la verifica HTTPS. Se il Python portabile di PlatformIO non trova il suo percorso CA predefinito, usa il bundle di sistema (`/etc/ssl/cert.pem` su macOS), oppure `certifi` se già installato. Un eventuale `SSL_CERT_FILE`/`SSL_CERT_DIR` esplicito viene rispettato. Gli errori distinguono certificati, DNS e timeout, senza stampare il token. Le letture di associazione vengono ritentate per timeout/errori temporanei; un token non valido o un errore di verifica certificato interrompono subito la procedura. Se dopo il salvataggio fallisce il messaggio di conferma, la configurazione rimane valida e puoi verificare la consegna con `--check`.
+
+```sh
+python3 scripts/telegram_tool.py --check
+```
+
+Riceverai **PROVA TELEGRAM DAL MAC**. Questo verifica il bot e la ricezione sul telefono; non verifica l'ESP. Non avviare lo script di associazione o l'anteprima mentre lo stesso bot è già letto da un ESP: Telegram permette un solo lettore `getUpdates`. Un bot con webhook attivo viene rifiutato dall'associazione/anteprima: usane uno dedicato.
+
+### 2. Provare ciclo e allarmi senza ESP
+
+In un terminale avvia la dashboard simulata:
+
+```sh
+python3 ../local-preview/server.py --port 8080
+```
+
+In un secondo terminale, sempre dalla cartella del full:
+
+```sh
+python3 scripts/telegram_tool.py --preview http://localhost:8080/full/
+```
+
+Apri `http://localhost:8080/full/`. Le notifiche di questa prova sono marcate **ANTEPRIMA SIMULATA**; `/status` riporta in fondo **Nessun ESP collegato; nessuna uscita fisica**. Invia `/status` al bot, avvia un programma dalla dashboard e verifica nome/step/temperature; poi prova pausa, ripresa e STOP. Avvia un altro ciclo e premi il fungo emergenza; riconoscilo dalla dashboard. Per provare un errore sonda, avvia un ciclo e premi **Simula fault PT100 #2** nel banner della pagina. Ripristina la sonda e riconosci l'allarme prima di un nuovo avvio. Puoi verificare anche il messaggio di completamento lasciando terminare il programma simulato.
+
+Il collegamento Python legge soltanto le API locali di stato/log, conserva il numero dell'ultimo evento per evitare notifiche ripetute e può rilevare avvio e STOP anche tra due letture. Le notifiche ordinarie sono brevi e datate con l'ora italiana del log dell'evento; solo gli avvisi critici allegano lo stato **al rilevamento**, distinto dall'istante dell'evento. `/status` esegue una nuova lettura e inizia direttamente da **Stato:**, senza intestazione. **💤 IDLE** indica l'attesa senza un ciclo avviato; **⚠️ STOP · CICLO FERMATO** indica un ciclo avviato e poi fermato. Premere STOP senza un ciclo in corso non trasforma IDLE in un ciclo fermato e non genera una nuova notifica di STOP. Il parametro `--preview` accetta soltanto localhost e non si collega a un ESP. **Ctrl+C** termina il collegamento Telegram; premi Ctrl+C anche nell'altro terminale per fermare la dashboard.
+
+### 3. Provare sull'ESP
+
+Chiudi il collegamento Python al bot. Configura rete del capannone e NTP in `include/wifi_config.h`, quindi compila e carica il full:
+
+```sh
+pio run -e esp32-s3-n16r8
+pio run -e esp32-s3-n16r8 -t upload
+```
+
+Oppure usa l'ambiente OTA già configurato, a ciclo fermo. Con Wi-Fi Internet e NTP sincronizzato riceverai **ESP AVVIATO**; invia `/status`. Fai prima le prove di avvio/STOP/emergenza con resistenze scollegate, poi il collaudo termico sorvegliato. Durante queste prove verifica RAM minima, età letture e regolarità del controllo anche togliendo/ripristinando Internet. Non interrompere il cablaggio PT100 sul forno caldo per generare un allarme.
+
+Il controllo non aspetta Telegram. Un task di priorità 1 sul core 0 esegue HTTPS e polling limitato a 2 s; il loop Arduino e il supervisore uscite restano separati. Il client riusa la connessione quando possibile e verifica il certificato con il bundle CA del SDK; non usa connessioni TLS senza verifica. Attende Wi-Fi/NTP e si sospende durante OTA. Code e buffer JSON/risposta sono in PSRAM; se non si possono allocare il bot resta disabilitato, senza fermare il forno. Prima di una richiesta controlla il margine della RAM interna. Le richieste non sono garantite entro un tempo preciso: dipendono da rete e servizio.
+
+Gli allarmi hanno una coda riservata di 4 messaggi, gli eventi ordinari di 6 e `/status` una risposta sostituibile, oltre ai messaggi già presi dal task. Le risposte scadono dopo 10 s; gli eventi ordinari dopo 1 ora; gli allarmi rimangono fino alla consegna o al riavvio. Le richieste vecchie di oltre 120 s e i messaggi estranei vengono scartati. Gli invii falliti vengono ritentati dopo 5/15/30/60 s, rispettando anche `retry_after` di Telegram. Code piene possono perdere messaggi; una risposta di rete persa dopo un invio riuscito può provocare un duplicato. Le code sono in RAM, non vengono salvate ad ogni evento.
+
+`GET /api/status` aggiunge `telegram`: configurazione/task attivi, disponibilità Wi-Fi/NTP, messaggi inviati, tentativi falliti, messaggi scartati, ultimo codice HTTP e uptime dell'ultimo invio. `reportsSent`, `reportsPending` e `reportsDropped` indicano PDF consegnati, pendenti e scartati. `lastHttpCode` negativo indica errore di rete (`-1`) o margine RAM insufficiente (`-2`); `401/403` richiedono verifica di token/chat e blocco del bot, `409` può indicare un secondo lettore o webhook, `429` provoca attesa. I campi `freeHeap` e `minFreeHeap` includono il carico reale della prova sull'ESP: il risultato della compilazione misura solo la RAM statica.
+
+Se ESP o Internet sono spenti, **`/status` non può rispondere** e Telegram non invia automaticamente un avviso di offline. Al ritorno il bot può inviare eventi ancora accodati o segnalare il riavvio/ciclo interrotto, con le limitazioni del registro già descritte. Per rilevare l'assenza mentre è in corso serve un monitor esterno. Le notifiche restano informative e non sostituiscono gli arresti del forno.
+
+Riferimenti: [Telegram Bot API](https://core.telegram.org/bots/api), [creazione del bot](https://core.telegram.org/bots/tutorial#obtain-your-bot-token).
 
 ## Aggiornamenti Wi-Fi OTA
 
@@ -232,7 +313,25 @@ Grafico live circa **0,5 s**, dettaglio locale degli ultimi **2 minuti**, storic
 
 Il log mostra gli ultimi **128 eventi**, compresi cambi uscita e riepiloghi PID; fino a **40 eventi principali** persistono in NVS. Con poco spazio nella NVS condivisa, i log più vecchi vengono eliminati per dare precedenza alle impostazioni e allo stato di sicurezza. Il campo `saved` del JSON indica se la scrittura dell'evento è riuscita, non garantisce che sia ancora conservato dopo la rotazione o la pulizia dei log. I dettagli rapidi dell'uscita non vengono scritti continuamente in flash. Il JSON esportato recupera gli eventi direttamente dall'ESP. Storico e dettagli in RAM si cancellano togliendo corrente o riavviando; esportali prima.
 
-Durante ciclo o pausa, con NTP sincronizzato, viene salvato un checkpoint ogni **30 s**. Al riavvio un ciclo precedentemente attivo è segnalato come **interrotto**, con uscita spenta e riconoscimento manuale richiesto. Quando torna NTP, l'intervallo tra ultimo checkpoint e avvio è mostrato come **limite massimo approssimativo**, non durata esatta del blackout. Senza checkpoint/ora di rete la durata è sconosciuta. Per ripartire devi avviare un **nuovo programma dall'inizio**, dopo aver valutato il materiale.
+### Blackout e riavvio durante un ciclo
+
+Prima di avviare il riscaldamento, il firmware salva in un unico registro NVS lo stato **ciclo attivo**, il nome del programma e il primo checkpoint UTC, se NTP è disponibile. Durante ciclo e pausa aggiorna il checkpoint ogni **30 s**. Se la scrittura iniziale fallisce, il ciclo non parte; un checkpoint successivo fallito genera un allarme Telegram e mantiene il precedente salvataggio.
+
+Al riavvio i GPIO gestiti vengono inizializzati **spenti prima di Wi-Fi e caricamento delle impostazioni**. Un ciclo rimasto attivo genera un **blocco persistente delle uscite**, anche dei TEST: non riprende automaticamente. Il blocco viene salvato prima di cancellare il vecchio flag di attività e **resta dopo ulteriori riavvii**, fino a **Riconosci allarme / interruzione** nella dashboard, con sonde sane e salvataggio riuscito. Anche un registro illeggibile mantiene le uscite bloccate. Il riconoscimento non accende il riscaldamento: per ripartire devi avviare un **nuovo programma dall'inizio**, dopo aver valutato il materiale.
+
+Quando tornano **alimentazione, Wi-Fi/Internet e sincronizzazione NTP**, il bot invia **🚨 BLACKOUT · ALIMENTAZIONE RIPRISTINATA**, con notifica normale, programma interrotto, ultimo checkpoint, intervallo stimato e istruzioni di riconoscimento. Accensione/brownout indicano un'interruzione o calo dell'alimentazione **dell'ESP**: non distinguono un blackout della rete da una riaccensione manuale. Un reset software/watchdog durante il ciclo invia invece **🚨 ALLARME · RIAVVIO CON CICLO INTERROTTO**. Anche un ripristino di alimentazione senza ciclo attivo viene notificato, ma senza stima della durata. La prima accensione senza interruzioni registrate resta una notifica ordinaria.
+
+La durata è il **limite massimo approssimativo tra ultimo checkpoint salvato e riavvio**, calcolato sottraendo l'uptime dall'ora NTP: non comprende il tempo successivo necessario a riconnettersi. Con checkpoint regolari include normalmente fino a circa 30 s precedenti alla perdita di alimentazione; un salvataggio fallito può ampliare lo scarto. Il primo orario di ritorno salvato resta conservato anche dopo un altro reset. Senza checkpoint/ora di rete, o con orologio incoerente, la durata è **SCONOSCIUTA**. Non viene presentata come misura esatta del blackout. Finché l'ESP è senza alimentazione non può inviare nulla: per un avviso durante l'interruzione serve un monitor esterno alimentato indipendentemente.
+
+**Prova sul dispositivo reale, con resistenze scollegate:**
+
+1. Carica il firmware, attendi NTP e verifica il bot; avvia un programma di prova.
+2. Dopo almeno 30 s interrompi l'alimentazione dell'ESP, attendi qualche minuto e ripristinala.
+3. Verifica il comando riscaldamento spento, il ciclo interrotto, il messaggio **🚨 BLACKOUT** con nome e stima e il rifiuto di AVVIA e TEST.
+4. Riavvia nuovamente senza riconoscere: il blocco deve restare e non deve comparire alcuna ripresa automatica.
+5. Riconosci dalla dashboard: il comando resta spento. Solo un nuovo AVVIA manuale può iniziare un programma.
+
+Questa verifica riguarda il comando GPIO. Il comportamento dei contatti e delle uscite durante il boot iniziale richiede il collaudo delle protezioni hardware già previste; non è verificabile con i soli test software.
 
 ```sh
 curl -s http://192.168.4.1/api/status
@@ -277,6 +376,8 @@ c++ -std=c++11 -Wall -Wextra -Werror tests/output_test.cpp -o /tmp/oven-full-out
 /tmp/oven-full-output-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/output_supervisor_test.cpp -o /tmp/oven-full-supervisor-test
 /tmp/oven-full-supervisor-test
+c++ -std=c++11 -Wall -Wextra -Werror tests/power_recovery_test.cpp -o /tmp/oven-full-recovery-test
+/tmp/oven-full-recovery-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/cycle_report_test.cpp -o /tmp/oven-full-report-test
 /tmp/oven-full-report-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/sensor_recovery_test.cpp -o /tmp/oven-full-sensor-test
@@ -285,6 +386,9 @@ c++ -std=c++11 -Wall -Wextra -Werror tests/report_curve_test.cpp -o /tmp/oven-fu
 /tmp/oven-full-curve-test
 node tests/dashboard_test.cjs
 node tests/report_export_test.cjs
+c++ -std=c++17 -Wall -Wextra -Werror tests/telegram_policy_test.cpp -o /tmp/oven-full-telegram-test
+/tmp/oven-full-telegram-test
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_telegram_tool.py' -v
 ```
 
 Coprono report ciclo/step, pause, hold, esclusione cooldown, campioni non validi, STOP/allarme e overflow dei timer; prove LED/relè e durate prolungate, heartbeat, esclusione TEST/PID, blocco OTA, profili, finestre ON/OFF, pausa/cooldown/STOP, blocco per controllo vecchio, durata massima, impostazioni non valide, overflow dei timer, conteggio del mantenimento e pulizia selettiva dei log con NVS piena o errori di accesso. La compilazione e i test del software non verificano hardware e risposta termica: quelli restano il collaudo sul campo e la successiva taratura sul forno reale.

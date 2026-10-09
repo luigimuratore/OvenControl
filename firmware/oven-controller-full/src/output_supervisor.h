@@ -7,11 +7,11 @@ class OutputSupervisor {
  public:
   heater::Guard guard;
   OutputTest test;
-  bool diagnostic = false, updating = false, emergency = false;
+  bool diagnostic = false, updating = false, emergency = false, recoveryBlocked = false;
   bool relay = false, red = false, green = false;
 
   bool enterTest(bool cycleActive) {
-    if (cycleActive || updating || emergency) return false;
+    if (cycleActive || updating || emergency || recoveryBlocked) return false;
     guard.inhibit(); diagnostic = true;
     return true;
   }
@@ -22,7 +22,7 @@ class OutputSupervisor {
     return test.start(mode, now, duration);
   }
   bool publish(const heater::Plan &plan) {
-    if (diagnostic || updating || emergency) { guard.inhibit(); return false; }
+    if (diagnostic || updating || emergency || recoveryBlocked) { guard.inhibit(); return false; }
     guard.publish(plan); return true;
   }
   void stopTest(bool leave = false) {
@@ -34,11 +34,13 @@ class OutputSupervisor {
   }
   void emergencyStop() { emergency = true; stopAll(); diagnostic = false; }
   void acknowledgeEmergency() { stopAll(); emergency = false; }
+  void blockRecovery() { recoveryBlocked = true; stopAll(); diagnostic = false; }
+  void acknowledgeRecovery() { stopAll(); recoveryBlocked = false; }
   void beginUpdate() {
     updating = true; stopAll(); diagnostic = false;
   }
   TestEvent tick(uint32_t now, bool serverReady, bool alarm) {
-    if (updating || emergency) { stopAll(); return TestEvent::None; }
+    if (updating || emergency || recoveryBlocked) { stopAll(); return TestEvent::None; }
     if (diagnostic) {
       guard.inhibit();
       const auto event = test.tick(now, serverReady);

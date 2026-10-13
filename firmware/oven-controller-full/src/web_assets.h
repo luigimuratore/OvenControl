@@ -160,8 +160,8 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
     <div id="reportContent" hidden><div class="report-result"><strong id="reportOutcome"></strong><span id="reportReason"></span></div>
       <div id="reportSummary" class="recipe-summary report-summary"></div>
       <div class="chart-card report-chart"><div class="chart-head"><h3>Curva del ciclo</h3><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span></div></div><div id="reportPlot" role="img" aria-label="Setpoint e media PT100 durante il ciclo"></div><p id="reportCurveMessage" class="hint" role="status"></p></div>
-      <h3>Dettaglio degli step</h3><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Step</th><th>Target</th><th>Esito</th><th>Tempo attivo</th><th>Pause</th><th>Hold in banda / richiesto</th><th>Errore medio assoluto</th><th>Superamento max</th><th>Ritardo max</th><th>PID medio / al limite</th><th>Escursione PT100 durante hold</th></tr></thead><tbody id="reportSteps"></tbody></table></div>
-      <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la sonda più calda e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. Il tempo in banda richiede entrambe le PT100 entro ±5 °C con letture consecutive fresche. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
+      <h3>Dettaglio degli step</h3><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Step</th><th>Target</th><th>Esito</th><th>Tempo attivo</th><th>Pause</th><th>Hold in banda / richiesto</th><th>Errore medio assoluto</th><th id="reportOvershootHeader">Superamento max media</th><th>Ritardo max</th><th>PID medio / al limite</th><th>Escursione PT100 durante hold</th></tr></thead><tbody id="reportSteps"></tbody></table></div>
+      <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la media delle PT100 e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. Il tempo in banda richiede entrambe le PT100 entro ±5 °C con letture consecutive fresche. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
     </div>
   </section>
   <footer id="firmwareInfo" class="firmware-footer">Firmware: in attesa del controllore</footer>
@@ -1314,6 +1314,13 @@ function show(view) {
 }
 
 const reportOutcomes = {completed: "CICLO COMPLETATO", stopped: "CICLO FERMATO", fault: "CICLO IN ALLARME"};
+function reportOvershootLabel(r) {
+  return r.version >= 3 ? "Superamento massimo della media" : "Superamento massimo sonda più calda";
+}
+function reportDefinitions(r, definitions) {
+  return definitions.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`)
+    .replace('Il superamento usa la media delle PT100', r.version >= 3 ? 'Il superamento usa la media delle PT100' : 'Il superamento usa la sonda più calda');
+}
 function reportNumber(value, unit = "", digits = 2) { return Number.isFinite(value) ? `${value.toFixed(digits)}${unit}` : "—"; }
 function reportTime(epoch, uptimeMs, bootCount) {
   return epoch ? new Date(epoch * 1000).toLocaleString("it-IT") : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
@@ -1334,7 +1341,7 @@ function reportSummaryPairs(r) {
     ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
     ...thermal, ["ΔT massimo sonde", reportNumber(stats.maxDeltaC, " °C")],
     ["Errore medio assoluto · rampa + hold", reportNumber(stats.meanAbsoluteErrorC, " °C")],
-    ["Superamento massimo del setpoint", reportNumber(stats.maxOvershootC, " °C")],
+    [reportOvershootLabel(r), reportNumber(stats.maxOvershootC, " °C")],
     ["Ritardo massimo della media", reportNumber(stats.maxLagC, " °C")],
     ["PID medio richiesto", reportNumber(stats.meanCommandPct, "%")],
     ["Campioni al limite di comando", reportNumber(stats.saturationPct, "%")],
@@ -1378,7 +1385,8 @@ async function loadReport(expectedKey = latest?.reportKey) {
     }
     if (r.key !== latest?.reportKey) return;
     lastReport = r;
-    put('reportDefinitions', REPORT_DEFINITIONS.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`));
+    put('reportOvershootHeader', r.version >= 3 ? 'Superamento max media' : 'Superamento max sonda');
+    put('reportDefinitions', reportDefinitions(r, REPORT_DEFINITIONS));
     put("reportNoticeText", `${r.recipeName} · ${reportOutcomes[r.outcome]} · ${clock(r.durationMs / 1000)}`);
     put("reportOutcome", reportOutcomes[r.outcome] || r.outcome);
     $("reportOutcome").className = r.outcome === "fault" ? "log-danger" : r.outcome === "stopped" ? "log-warning" : "sensor-ok";
@@ -2053,7 +2061,7 @@ const OvenExport = (() => {
     if(y+notes.length*3.4+12>275)header('Note di lettura');
     text('COME LEGGERE I DATI',16,y,9,true);y+=6;text(notes,16,y,8);
     header('Dettaglio degli step');
-    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto','Superamento massimo','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
+    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
     for(const row of stepRows) {
       const title=lines(`${row[0]} / Target ${row[1]} / ${row[2]}`,178,11,true);
       const pairs=labels.map((label,i)=>[label,row[i+3]]);

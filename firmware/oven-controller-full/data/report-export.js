@@ -149,7 +149,7 @@ const OvenExport = (() => {
     if(y+notes.length*3.4+12>275)header('Note di lettura');
     text('COME LEGGERE I DATI',16,y,9,true);y+=6;text(notes,16,y,8);
     header('Dettaglio degli step');
-    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto','Superamento massimo','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
+    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
     for(const row of stepRows) {
       const title=lines(`${row[0]} / Target ${row[1]} / ${row[2]}`,178,11,true);
       const pairs=labels.map((label,i)=>[label,row[i+3]]);

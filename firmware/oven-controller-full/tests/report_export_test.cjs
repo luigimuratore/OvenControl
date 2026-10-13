@@ -11,7 +11,7 @@ vm.runInContext(source.slice(source.indexOf('function clock('), source.indexOf('
   source.slice(source.indexOf('const reportOutcomes'), source.indexOf('function updateReportStatus')), context);
 const stats = {samples:300,invalidPairs:1,sensors:[0,1].map(i=>({validSamples:299,startC:30+i*.1,endC:25+i*.1,minC:25,maxC:50+i*.1})),
   maxDeltaC:.5,meanAbsoluteErrorC:.46,maxOvershootC:.29,maxLagC:1.02,meanCommandPct:8.42,saturationPct:0};
-const report = {key:'example-1-2880000',firmware:'full-1.2',bootCount:1,recipeName:'ESEMPIO - curva dimostrativa',outcome:'completed',
+const report = {version:3,key:'example-1-2880000',firmware:'full-1.12',bootCount:1,recipeName:'ESEMPIO - curva dimostrativa',outcome:'completed',
   reason:'Anteprima di impaginazione con dati dimostrativi. Non rappresenta misure del forno.',
   startUtc:1791469158,endUtc:1791472038,startUptimeMs:0,endUptimeMs:2880000,durationMs:2880000,activeMs:2880000,pausedMs:0,pauseCount:0,
   completedSteps:3,stepCount:3,curveIntervalMs:10000,settings:{kp:12,ki:.015,kd:50,actuator:'ssr',windowSec:5,maxPower:30},stats,
@@ -57,12 +57,16 @@ global.jspdf = {jsPDF:class extends jsPDF {
 function generate(r, curve) {
   context.report=r;
   const summary=vm.runInContext('reportSummaryPairs(report)',context), stepRows=vm.runInContext('reportStepRows(report)',context);
-  const explanation=fs.readFileSync(path.join(root,'data/index.html'),'utf8').match(/<p id="reportDefinitions"[^>]*>([^<]+)<\/p>/)[1];
+  context.definitions=fs.readFileSync(path.join(root,'data/index.html'),'utf8').match(/<p id="reportDefinitions"[^>]*>([^<]+)<\/p>/)[1];
+  const explanation=vm.runInContext('reportDefinitions(report, definitions)',context);
   return Export.pdf({report:r,points:curve,summary,stepRows,explanation,
     curveMessage:curve.length?'Curva dimostrativa - 289 campioni, circa 10 s.':'Curva non disponibile dopo riavvio; riepilogo conservato.'});
 }
 module.exports = {report,points};
 if (require.main === module) (async()=>{
+  assert.equal(vm.runInContext('reportOvershootLabel({version:3})',context),'Superamento massimo della media');
+  for(const version of [1,2])
+    assert.equal(vm.runInContext(`reportOvershootLabel({version:${version}})`,context),'Superamento massimo sonda più calda');
   const pdf=generate(report,points);
   assert.equal(Buffer.from(pdf).subarray(0,4).toString(),'%PDF');
   const longReport={...report,recipeName:'Ricetta di collaudo prolungata con carico completo',reason:'PT100/MAX31865 in errore: uscita spenta · PT100 #2 Fault 0x4, RAW 8303 · #2: Sovra/sottotensione sugli ingressi RTD;',
@@ -71,6 +75,13 @@ if (require.main === module) (async()=>{
   generate({...report,startUtc:null,endUtc:null},[]);
   assert(measurements.every(m=>m.bottom<=289 && m.y>=10 && m.right<=195),JSON.stringify(measurements.filter(m=>m.bottom>289 || m.y<10 || m.right>195)));
   assert(measurements.some(m=>m.value.includes('max-min')));
+  assert(measurements.some(m=>m.value==='Superamento massimo della media'));
+  assert(measurements.some(m=>m.value==='Superamento massimo media'));
+  const legacyStart=measurements.length;
+  generate({...report,version:2},points);
+  assert(measurements.slice(legacyStart).some(m=>m.value==='Superamento massimo sonda più calda'));
+  assert(measurements.slice(legacyStart).some(m=>m.value==='Superamento massimo sonda'));
+  assert(measurements.slice(legacyStart).some(m=>m.value.includes('Il superamento usa la sonda')));
   assert(measurements.every(m=>!m.value.includes('−')));
   const zip=Export.zip([{name:'curva.csv',data:csv},{name:'curva.svg',data:Export.svg(points)}]);
   assert.equal(Buffer.from(await zip.arrayBuffer()).readUInt32LE(0),0x04034b50);

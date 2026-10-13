@@ -800,7 +800,7 @@ void loadCycleReport() {
   reports::Snapshot candidate;
   if (!prefsReady || prefs.getBytesLength("report") != sizeof(candidate) ||
       prefs.getBytes("report", &candidate, sizeof(candidate)) != sizeof(candidate)) return;
-  if ((candidate.version != 1 && candidate.version != reports::kVersion) || !candidate.stepCount || candidate.stepCount > reports::kMaxSteps ||
+  if (!reports::supportedVersion(candidate.version) || !candidate.stepCount || candidate.stepCount > reports::kMaxSteps ||
       candidate.completedSteps > candidate.stepCount || candidate.outcome == reports::Outcome::None ||
       static_cast<unsigned>(candidate.outcome) > static_cast<unsigned>(reports::Outcome::Fault)) return;
   candidate.recipeId[sizeof(candidate.recipeId) - 1] = 0;

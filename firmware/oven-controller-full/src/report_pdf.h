@@ -168,7 +168,7 @@ inline void value(float n, char *out, size_t size, const char *unit = "°C") {
   if (std::isfinite(n)) snprintf(out, size, "%.2f %s", double(n), unit);
   else snprintf(out, size, "Non disponibile");
 }
-inline void statsPairs(Writer &w, const reports::Stats &s, float y) {
+inline void statsPairs(Writer &w, const reports::Stats &s, float y, bool meanOvershoot) {
   char a[100], b[100];
   for (unsigned i = 0; i < 2; ++i) {
     snprintf(a, sizeof(a), "PT100 #%u / iniziale > finale", i + 1);
@@ -189,7 +189,7 @@ inline void statsPairs(Writer &w, const reports::Stats &s, float y) {
   y += 43;
   value(s.trackingSamples ? s.absoluteErrorSum / s.trackingSamples : NAN, a, sizeof(a));
   w.pair(44, y, "Errore medio assoluto", a);
-  value(s.trackingSamples ? s.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y, "Superamento massimo target", a);
+  value(s.trackingSamples ? s.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y, meanOvershoot ? "Superamento massimo media" : "Superamento massimo sonda", a);
   y += 43; value(s.trackingSamples ? s.maxLag : NAN, a, sizeof(a)); w.pair(44, y, "Ritardo massimo media", a);
   value(s.trackingSamples ? s.dutySum / s.trackingSamples : NAN, a, sizeof(a), "%");
   w.pair(308, y, "PID medio richiesto", a);
@@ -246,9 +246,11 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
   duration(r.pausedMs, b, sizeof(b)); snprintf(a, sizeof(a), "%u / %s", unsigned(r.pauseCount), b); w.pair(308, 135, "Pause / durata", a);
   snprintf(a, sizeof(a), "Kp %.3f / Ki %.4f / Kd %.2f", double(r.kp), double(r.ki), double(r.kd)); w.pair(44, 178, "PID usato", a);
   snprintf(a, sizeof(a), "%s / %u s / limite %.1f%%", r.ssr ? "SSR" : "Relè", unsigned(r.windowMs / 1000), double(r.maxPower)); w.pair(308, 178, "Comando usato", a);
-  statsPairs(w, r.stats, 230);
+  statsPairs(w, r.stats, 230, r.version >= 3);
   w.text(44, 531, "COME LEGGERE I DATI", 10, true);
-  w.wrap(44, 554, "Temperature: campioni del ciclo e delle pause. Errore e PID: soli campioni validi di rampa e mantenimento attivi, escluse pause e cooldown. Superamento: sonda più calda rispetto al target istantaneo. Ritardo ed errore medio: media delle due sonde.", 96, 9);
+  w.wrap(44, 554, r.version >= 3 ?
+    "Temperature: campioni del ciclo e delle pause. Errore e PID: soli campioni validi di rampa e mantenimento attivi, escluse pause e cooldown. Superamento, ritardo ed errore medio: media delle due PT100 rispetto al target istantaneo." :
+    "Temperature: campioni del ciclo e delle pause. Errore e PID: soli campioni validi di rampa e mantenimento attivi, escluse pause e cooldown. Superamento: sonda più calda rispetto al target istantaneo. Ritardo ed errore medio: media delle due sonde.", 96, 9);
   snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C, con letture fresche consecutive. Il comando GPIO/PID non misura la potenza elettrica. La curva può avere interruzioni per letture non valide.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
   w.wrap(44, 624, a, 96, 9);
   w.wrap(44, 694, "Escursione durante il mantenimento: massimo - minimo di ciascuna sonda, incluse le pause. Gli orari e il nome file usano il fuso italiano; in assenza di NTP l'orario resta non disponibile.", 96, 9);
@@ -271,7 +273,7 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
       w.pair(308, y + 81, "Escursione PT100 in hold", a);
     } else { w.pair(44, y + 81, "Hold in banda / richiesto", "Non applicabile"); w.pair(308, y + 81, "Escursione PT100 in hold", "Non applicabile"); }
     value(s.stats.trackingSamples ? s.stats.absoluteErrorSum / s.stats.trackingSamples : NAN, a, sizeof(a)); w.pair(44, y + 119, "Errore medio assoluto", a);
-    value(s.stats.trackingSamples ? s.stats.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y + 119, "Superamento massimo", a);
+    value(s.stats.trackingSamples ? s.stats.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y + 119, r.version >= 3 ? "Superamento massimo media" : "Superamento massimo sonda", a);
     value(s.stats.trackingSamples ? s.stats.maxLag : NAN, a, sizeof(a)); w.pair(44, y + 157, "Ritardo massimo", a);
     if (s.stats.trackingSamples) snprintf(a, sizeof(a), "%.2f%% / %.2f%%", s.stats.dutySum / s.stats.trackingSamples, 100.0 * s.stats.saturatedSamples / s.stats.trackingSamples);
     else snprintf(a, sizeof(a), "Non disponibile");

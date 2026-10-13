@@ -31,6 +31,8 @@ int main(int argc, char **argv) {
   const std::string pdf(buffer.data(), size);
   assert(pdf.find("/Count 6 /Kids") != std::string::npos);
   assert(pdf.find("CICLO IN ALLARME") != std::string::npos);
+  assert(pdf.find("Superamento massimo media") != std::string::npos);
+  assert(pdf.find("Superamento massimo sonda") == std::string::npos);
   assert(pdf.find("nan") == std::string::npos && pdf.find("inf") == std::string::npos);
   assert(!reportpdf::generate(buffer.data(), 1024, report, curve.data(), curve.size(), false));
   // Clock wrap, unsafe filename characters, and DST transition boundaries.
@@ -53,4 +55,12 @@ int main(int argc, char **argv) {
   assert(strstr(filename, "senza_orario_avvio-3_"));
   assert(strncmp(filename, "Error_", 6) == 0);
   assert(reportpdf::generate(buffer.data(), buffer.size(), report, nullptr, 0, true));
+  for (unsigned version : {1u, 2u}) {
+    report.version = version;
+    const size_t legacySize = reportpdf::generate(buffer.data(), buffer.size(), report, nullptr, 0, true);
+    assert(legacySize);
+    const std::string legacy(buffer.data(), legacySize);
+    assert(legacy.find("Superamento massimo sonda") != std::string::npos);
+    assert(legacy.find("Superamento massimo media") == std::string::npos);
+  }
 }

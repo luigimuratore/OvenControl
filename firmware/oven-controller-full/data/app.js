@@ -670,6 +670,13 @@ function show(view) {
 }
 
 const reportOutcomes = {completed: "CICLO COMPLETATO", stopped: "CICLO FERMATO", fault: "CICLO IN ALLARME"};
+function reportOvershootLabel(r) {
+  return r.version >= 3 ? "Superamento massimo della media" : "Superamento massimo sonda più calda";
+}
+function reportDefinitions(r, definitions) {
+  return definitions.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`)
+    .replace('Il superamento usa la media delle PT100', r.version >= 3 ? 'Il superamento usa la media delle PT100' : 'Il superamento usa la sonda più calda');
+}
 function reportNumber(value, unit = "", digits = 2) { return Number.isFinite(value) ? `${value.toFixed(digits)}${unit}` : "—"; }
 function reportTime(epoch, uptimeMs, bootCount) {
   return epoch ? new Date(epoch * 1000).toLocaleString("it-IT") : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
@@ -690,7 +697,7 @@ function reportSummaryPairs(r) {
     ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
     ...thermal, ["ΔT massimo sonde", reportNumber(stats.maxDeltaC, " °C")],
     ["Errore medio assoluto · rampa + hold", reportNumber(stats.meanAbsoluteErrorC, " °C")],
-    ["Superamento massimo del setpoint", reportNumber(stats.maxOvershootC, " °C")],
+    [reportOvershootLabel(r), reportNumber(stats.maxOvershootC, " °C")],
     ["Ritardo massimo della media", reportNumber(stats.maxLagC, " °C")],
     ["PID medio richiesto", reportNumber(stats.meanCommandPct, "%")],
     ["Campioni al limite di comando", reportNumber(stats.saturationPct, "%")],
@@ -734,7 +741,8 @@ async function loadReport(expectedKey = latest?.reportKey) {
     }
     if (r.key !== latest?.reportKey) return;
     lastReport = r;
-    put('reportDefinitions', REPORT_DEFINITIONS.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`));
+    put('reportOvershootHeader', r.version >= 3 ? 'Superamento max media' : 'Superamento max sonda');
+    put('reportDefinitions', reportDefinitions(r, REPORT_DEFINITIONS));
     put("reportNoticeText", `${r.recipeName} · ${reportOutcomes[r.outcome]} · ${clock(r.durationMs / 1000)}`);
     put("reportOutcome", reportOutcomes[r.outcome] || r.outcome);
     $("reportOutcome").className = r.outcome === "fault" ? "log-danger" : r.outcome === "stopped" ? "log-warning" : "sensor-ok";

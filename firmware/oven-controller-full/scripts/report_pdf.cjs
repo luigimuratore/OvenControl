@@ -14,8 +14,8 @@ function generate(report, points) {
   const summary = vm.runInContext('reportSummaryPairs(report)', context);
   const stepRows = vm.runInContext('reportStepRows(report)', context);
   const html = fs.readFileSync(path.join(root, 'data/index.html'), 'utf8');
-  const explanation = html.match(/<p id="reportDefinitions"[^>]*>([^<]+)<\/p>/)[1]
-    .replace('±5 °C', `±${report.holdBandC ?? (report.version >= 2 ? 5 : 1)} °C`);
+  context.definitions = html.match(/<p id="reportDefinitions"[^>]*>([^<]+)<\/p>/)[1];
+  const explanation = vm.runInContext('reportDefinitions(report, definitions)', context);
   return Buffer.from(Export.pdf({report,points,summary,stepRows,explanation,
     curveMessage:!points.length ? 'Curva non disponibile; riepilogo conservato.' :
       `${points.length} campioni. ${report.curvePartial ? 'Curva parziale.' : 'Curva acquisita durante ciclo e pause.'}`}));

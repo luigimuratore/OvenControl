@@ -5,7 +5,8 @@
 #include "profile.h"
 
 namespace reports {
-constexpr uint32_t kVersion = 2; // Same storage layout; v2 hold band is ±5 °C, v1 was ±1 °C.
+constexpr uint32_t kVersion = 3; // Same layout: v3 overshoot uses mean PT100; v2 used hottest, v1 hold band was ±1 °C.
+constexpr bool supportedVersion(uint32_t version) { return version >= 1 && version <= kVersion; }
 constexpr size_t kMaxSteps = 12;
 enum class Outcome : uint8_t { None, Completed, Stopped, Fault };
 struct Stats {
@@ -31,7 +32,7 @@ struct Stats {
     ++trackingSamples;
     const float mean = (first + second) * 0.5f;
     absoluteErrorSum += fabsf(mean - reference); dutySum += duty;
-    maxOvershoot = fmaxf(maxOvershoot, fmaxf(first, second) - reference);
+    maxOvershoot = fmaxf(maxOvershoot, mean - reference);
     maxLag = fmaxf(maxLag, reference - mean);
     if (duty >= limit - 0.001f) ++saturatedSamples;
   }

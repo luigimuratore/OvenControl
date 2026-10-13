@@ -154,7 +154,7 @@ class DemoDevice:
             sensors=[dict(validSamples=0, startC=None, endC=None, minC=None, maxC=None) for _ in range(2)])
 
     def begin_report(self):
-        self.report_work = dict(version=2, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
+        self.report_work = dict(version=3, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
             key="", recipeId=self.active["id"], recipeName=self.active["name"], outcome="", reason="",
             startUptimeMs=int(self.now * 1000), endUptimeMs=None, startUtc=None, endUtc=None,
             durationMs=0, activeMs=0, pausedMs=0, pauseCount=0, completedSteps=0, stepCount=len(self.active["steps"]),
@@ -201,7 +201,7 @@ class DemoDevice:
             stats["_error"] += abs(mean - self.target)
             stats["_duty"] += self.duty
             stats["_saturated"] += int(self.duty >= self.control["maxPower"] - .001)
-            stats["maxOvershootC"] = max(stats["maxOvershootC"] or 0, max(a["c"], b["c"]) - self.target)
+            stats["maxOvershootC"] = max(stats["maxOvershootC"] or 0, mean - self.target)
             stats["maxLagC"] = max(stats["maxLagC"] or 0, self.target - mean)
 
     def finish_report(self, outcome, reason):

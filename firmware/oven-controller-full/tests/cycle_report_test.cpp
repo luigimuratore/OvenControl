@@ -24,7 +24,8 @@ int main() {
   assert(d.steps[1].activeMs == 2000 && d.steps[1].holdInBandMs == 500);
   assert(d.stats.samples == 6 && d.stats.invalidPairs == 1 && d.stats.trackingSamples == 3);
   assert(d.stats.valid[0] == 6 && d.stats.valid[1] == 5);
-  assert(d.stats.maxOvershoot == 3 && d.stats.maxLag == 4);
+  assert(d.stats.maxOvershoot == 2 && d.stats.maxLag == 4);
+  assert(d.steps[0].stats.maxOvershoot == 2 && d.steps[1].stats.maxOvershoot == 0);
   assert(d.stats.maxDelta == 2 && d.stats.saturatedSamples == 1);
   assert(d.stats.absoluteErrorSum == 6 && d.stats.dutySum == 60);
   assert(d.stats.high[0] == 100 && d.steps[2].stats.trackingSamples == 0);
@@ -42,8 +43,19 @@ int main() {
   r.begin(UINT32_MAX - 99, steps, 3); r.data.maxPower = 30;
   r.observe(0, 206, 200, true, true, 190, 30);
   assert(r.finish(100, reports::Outcome::Fault, 0));
-  assert(r.data.activeMs == 200 && r.data.stats.maxOvershoot == 16 && r.data.completedSteps == 0);
+  assert(r.data.activeMs == 200 && r.data.stats.maxOvershoot == 13 && r.data.completedSteps == 0);
   assert(!r.data.steps[1].started);
   reports::Recorder reboot; assert(!reboot.active && reboot.data.outcome == reports::Outcome::None);
+  assert(reports::kVersion == 3);
+  assert(!reports::supportedVersion(0) && !reports::supportedVersion(4));
+  for (unsigned version = 1; version <= 3; ++version) assert(reports::supportedVersion(version));
+  // A single hot probe must not inflate the overshoot of the regulated mean.
+  reports::Stats asymmetric;
+  asymmetric.observe(179.22f, 170.78f, true, true, true, 175, 20, 60);
+  assert(asymmetric.maxOvershoot == 0);
+  asymmetric.observe(179.22f, 174.78f, true, true, true, 175, 20, 60);
+  assert(asymmetric.maxOvershoot == 2);
+  asymmetric.observe(190, NAN, true, false, true, 175, 20, 60);
+  assert(asymmetric.maxOvershoot == 2 && asymmetric.invalidPairs == 1);
   std::cout << "OK: cycle/step times, pauses, hold, invalid probes, PID metrics, cooldown exclusion, STOP/fault, wrap, reset\n";
 }

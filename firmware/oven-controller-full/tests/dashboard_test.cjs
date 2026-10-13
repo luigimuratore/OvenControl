@@ -64,6 +64,14 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run(`validateRecipes(${JSON.stringify(highRecipe(400))})`);
   assert.throws(() => run(`validateRecipes(${JSON.stringify(highRecipe(400.1))})`), /0–400/);
   assert.equal(elements.get('avgTemp').textContent, '30.1');
+  assert.equal(elements.get('targetDeltaTemp').textContent, '-0.9');
+  for (const [mean, expected] of [[32, '+1.0'], [31, '0.0'], [30.99, '0.0'], [29, '-2.0']]) {
+    run(`display({...latest,target:31,sensors:[${mean},${mean}].map((c,i)=>({...latest.sensors[i],c,valid:true}))})`);
+    assert.equal(elements.get('targetDeltaTemp').textContent, expected);
+  }
+  run('display({...latest,target:null})'); assert.equal(elements.get('targetDeltaTemp').textContent, '—');
+  assert(!html.slice(html.indexOf('class="hero-grid"'), html.indexOf('class="sensor-grid probes-row"')).includes('id="deltaCard"'));
+  assert(html.indexOf('id="deltaCard"') > html.indexOf('id="fault2"'));
   const deltaCard = elements.get('deltaCard').classList;
   for (const [delta, warning, danger] of [[2.2,false,false],[10,false,false],[10.1,true,false],
       [20,true,false],[20.1,false,true],[40,false,true],[5,false,false]]) {
@@ -73,6 +81,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   }
   run(`display({...latest,sensors:[100,140].map((c,i)=>({...latest.sensors[i],c,valid:i===0}))})`);
   assert.equal(elements.get('deltaTemp').textContent, '—');
+  assert.equal(elements.get('targetDeltaTemp').textContent, '—');
   assert(!deltaCard.contains('delta-warning') && !deltaCard.contains('delta-danger'));
   run(`display(${JSON.stringify(status)})`);
   run(`display({...latest,firmware:'full-1.6',firmwareModifiedOn:'2026-10-13'})`);
@@ -111,6 +120,13 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120})`);
   assert.equal(elements.get('stepDuration').textContent, '00:02:00');
   assert(elements.get('stepTimeHint').textContent.includes('pausa'));
+  run(`display({...latest,phase:'paused',pauseMaintainsTemperature:true,pauseTargetC:174.2,target:174.2,duty:8,relay:true})`);
+  assert.equal(elements.get('targetLabel').textContent, 'Target di pausa');
+  assert.equal(elements.get('statusText').textContent, 'PAUSA · MANTENIMENTO');
+  assert(elements.get('stepTimeHint').textContent.includes('PID mantiene 174.2 °C'));
+  assert.equal(elements.get('relayState').textContent, 'ACCESO');
+  assert(elements.get('startBtn').disabled && elements.get('pauseBtn').disabled);
+  assert(!elements.get('resumeBtn').disabled);
   run(`display({...latest, phase:'running', stepType:'ramp', stepFinalTarget:175, stepRate:10,
     stepRemainingSec:6, stepWaitingForTemperature:true, stepTransitionToHold:true, stepCompletionBandC:5})`);
   assert(elements.get('stepTimeHint').textContent.includes('entro ±5 °C per iniziare il mantenimento'));
@@ -149,6 +165,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!elements.get('globalStop').disabled);
   now += 4000; run('connectionLost()');
   assert.equal(elements.get('avgTemp').textContent, '—');
+  assert.equal(elements.get('targetDeltaTemp').textContent, '—');
   assert(!deltaCard.contains('delta-warning') && !deltaCard.contains('delta-danger'));
   assert.equal(elements.get('statusText').textContent, 'ESP NON RAGGIUNGIBILE');
   run('display(latest)');

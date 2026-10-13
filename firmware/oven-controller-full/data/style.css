@@ -170,6 +170,7 @@ p { color: var(--muted); margin: 0; }
 .metric strong small { font-size: 15px; color: var(--muted); }
 .metric.hero strong { font-size: 38px; }
 .metric.target { border-color: rgba(75,163,255,.45); }
+.target-delta-card { border-color: var(--chart-difference-border); background: var(--chart-difference-bg); }
 
 .bar {
   height: 7px; width: 100%;
@@ -184,6 +185,8 @@ p { color: var(--muted); margin: 0; }
   margin-top: 12px;
 }
 .sensor-grid.two { grid-template-columns: repeat(2, 1fr); }
+.sensor-grid.probes-row { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(140px, .55fr); }
+.probe-delta { min-height: 0; padding: 14px 16px; border-radius: 14px; }
 .sensor-card {
   background: rgba(255,255,255,.025);
   border: 1px solid var(--border);
@@ -412,6 +415,7 @@ footer {
   .test-buttons { grid-template-columns: 2fr 1fr; }
   .sim-buttons { grid-template-columns: repeat(2, 1fr); }
   .sensor-grid.two { grid-template-columns: 1fr; }
+  .sensor-grid.probes-row { grid-template-columns: 1fr; }
   .power-summary { grid-template-columns: 1fr; }
   .log-row { grid-template-columns: 1fr; gap: 3px; }
   .recipe-summary { grid-template-columns: 1fr; }

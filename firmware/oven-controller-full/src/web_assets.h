@@ -24,9 +24,9 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
         <article class="metric hero"><span>Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
         <article class="metric hero target"><span id="targetLabel">Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
         <article class="metric"><span>Comando uscita · GPIO4</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
-        <article id="deltaCard" class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong></article>
+        <article class="metric target-delta-card"><span>ΔT media PT100 − target</span><strong><span id="targetDeltaTemp">—</span><small> °C</small></strong><small>− sotto target · + sopra target</small></article>
       </div>
-      <div class="sensor-grid two"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article></div>
+      <div class="sensor-grid probes-row"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article><article id="deltaCard" class="metric probe-delta"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong></article></div>
       <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo / manuale</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><label class="chart-scale">Asse Y<select id="chartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="exportSamples" class="ghost">Scarica CSV + grafico</button></div>
         <div class="chart-plot"><canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas><div id="chartCursor" class="chart-cursor" hidden></div><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
         <div class="chart-navigation"><button id="chartBack">← Indietro</button><input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Posizione grafico"><button id="chartForward">Avanti →</button><button id="chartNow">Adesso</button><select id="chartSpan"><option value="900000">15 min</option><option value="1800000" selected>30 min</option><option value="3600000">1 ora</option><option value="all">Tutto</option></select></div>
@@ -44,7 +44,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
       <div class="buttons site-buttons"><button id="startBtn" class="primary">AVVIA CICLO</button><button id="pauseBtn">PAUSA</button><button id="resumeBtn">RIPRENDI</button><button id="stopBtn" class="danger">STOP</button></div>
       <button id="resetBtn" class="ghost full">Riconosci allarme / interruzione</button>
       <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo totale</span><strong id="cycleDuration">—</strong></div><div><span>Tempo rimanente step attivo</span><strong id="stepDuration">—</strong><small id="stepTimeHint" class="hint"></small></div></div>
-      <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>STOP e PAUSA spengono l'uscita.<br>Dopo un reset non c'è ripresa automatica.</p>
+      <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>PAUSA mantiene la temperatura attuale e sospende lo step; RIPRENDI continua da lì.<br>STOP spegne l’uscita e termina il ciclo.<br>Dopo un reset non c'è ripresa automatica.</p>
       <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
       </div>
       <section id="manualControl" class="manual-control" aria-labelledby="manualTitle" hidden>
@@ -343,6 +343,7 @@ p { color: var(--muted); margin: 0; }
 .metric strong small { font-size: 15px; color: var(--muted); }
 .metric.hero strong { font-size: 38px; }
 .metric.target { border-color: rgba(75,163,255,.45); }
+.target-delta-card { border-color: var(--chart-difference-border); background: var(--chart-difference-bg); }
 
 .bar {
   height: 7px; width: 100%;
@@ -357,6 +358,8 @@ p { color: var(--muted); margin: 0; }
   margin-top: 12px;
 }
 .sensor-grid.two { grid-template-columns: repeat(2, 1fr); }
+.sensor-grid.probes-row { grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(140px, .55fr); }
+.probe-delta { min-height: 0; padding: 14px 16px; border-radius: 14px; }
 .sensor-card {
   background: rgba(255,255,255,.025);
   border: 1px solid var(--border);
@@ -585,6 +588,7 @@ footer {
   .test-buttons { grid-template-columns: 2fr 1fr; }
   .sim-buttons { grid-template-columns: repeat(2, 1fr); }
   .sensor-grid.two { grid-template-columns: 1fr; }
+  .sensor-grid.probes-row { grid-template-columns: 1fr; }
   .power-summary { grid-template-columns: 1fr; }
   .log-row { grid-template-columns: 1fr; gap: 3px; }
   .recipe-summary { grid-template-columns: 1fr; }
@@ -700,6 +704,11 @@ function clock(sec) {
   return [Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60].map(x => String(x).padStart(2, "0")).join(":");
 }
 function temp(value) { return Number.isFinite(value) ? value.toFixed(1) : "—"; }
+function signedDelta(value) {
+  if (!Number.isFinite(value)) return '—';
+  const rounded = Number(value.toFixed(1));
+  return `${rounded > 0 ? '+' : ''}${temp(rounded)}`;
+}
 function remainingStepSeconds(s) {
   if (!['running', 'paused'].includes(s.phase)) return 0;
   if ('stepRemainingSec' in s) return Number.isFinite(s.stepRemainingSec) ? s.stepRemainingSec : null;
@@ -783,10 +792,10 @@ function createChartInspector(canvas, tooltip, cursor) {
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
     if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
-      const difference = Number((point.actual - point.target).toFixed(1));
+      const difference = point.actual - point.target;
       const highlight = document.createElement('div');
       highlight.className = 'chart-tooltip-difference';
-      highlight.textContent = `ΔT (media PT100 − target): ${difference > 0 ? '+' : ''}${temp(difference)} °C`;
+      highlight.textContent = `ΔT (media PT100 − target): ${signedDelta(difference)} °C`;
       tooltip.append(highlight);
     }
     tooltip.hidden = cursor.hidden = false;
@@ -833,8 +842,10 @@ function display(s) {
   const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1 + t2) / 2 : NaN;
   const target = s.target === null ? NaN : Number(s.target);
   put("avgTemp", temp(avg)); put("targetTemp", temp(target));
+  put('targetDeltaTemp', signedDelta(avg - target));
   const manual = s.manual || {}, manualActive = !!manual.active;
-  put('targetLabel', selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
+  put('targetLabel', s.phase === 'paused' && s.pauseMaintainsTemperature ? 'Target di pausa' :
+    selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
   const manualLabel = manual.mode === 'cooldown' ? 'COOLDOWN · uscita spenta' :
     manual.coolingToTarget ? 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
     Math.abs(manual.setpointC - manual.targetC) > .01 ? 'MANUALE · RAMPA' : 'MANUALE · MANTENIMENTO PID';
@@ -877,7 +888,8 @@ function display(s) {
   put("cycleDuration", clock(s.cycleElapsedSec));
   const remaining = remainingStepSeconds(s), activeStep = ['running', 'paused'].includes(s.phase);
   put("stepDuration", remaining === null ? '—' : clock(remaining));
-  put("stepTimeHint", activeStep ? s.phase === 'paused' ? 'Conteggio sospeso durante la pausa' :
+  put("stepTimeHint", activeStep ? s.phase === 'paused' ? s.pauseMaintainsTemperature ?
+    `Step sospeso; PID mantiene ${temp(s.pauseTargetC)} °C` : 'Conteggio sospeso durante la pausa' :
     s.stepType === 'ramp' && s.stepWaitingForTemperature ? s.stepTransitionToHold ?
     `Riferimento al target: attendo entrambe le PT100 entro ±${s.stepCompletionBandC} °C per iniziare il mantenimento` :
     `Riferimento al target: attendo la sonda più fredda ad almeno ${temp(s.stepFinalTarget - (s.stepCompletionBandC || 1))} °C` :
@@ -911,7 +923,8 @@ function display(s) {
   put("apAddress", s.apIp ? `http://${s.apIp}/` : "");
   const bad = s.phase === "fault" || s.phase === "interrupted";
   $("statusDot").className = `status-dot ${bad ? "fault" : s.test?.running ? "paused" : s.phase === "running" ? "running" : s.phase === "paused" ? "paused" : "idle"}`;
-  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : manualActive ? manualLabel : labels[s.phase] || s.phase);
+  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : manualActive ? manualLabel :
+    s.phase === 'paused' && s.pauseMaintainsTemperature ? 'PAUSA · MANTENIMENTO' : labels[s.phase] || s.phase);
   $("alarmBox").classList.toggle("hidden", !bad);
   put("alarmText", s.fault || (s.phase === "interrupted" ? "Il ciclo precedente si è interrotto. uscita spenta. Valuta il materiale prima di iniziare un nuovo ciclo." : ""));
   put('cycleErrorInfo', s.emergency ? `Emergenza attiva: ${s.fault || 'uscite bloccate fino al riconoscimento.'}` :
@@ -1075,7 +1088,7 @@ async function command(action) {
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
+    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -1250,7 +1263,7 @@ function connectionLost() {
   connected = false; renderFailed = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false; testOffline(stale);
   put("statusText", stale ? `AGGIORNAMENTO IN RITARDO · ${Math.ceil(age / 1000)} s` : "ESP NON RAGGIUNGIBILE");
   $("statusDot").className = `status-dot ${stale ? 'paused' : 'fault'}`;
-  if (!stale) for (const id of ["avgTemp", "targetTemp", "deltaTemp", "t1", "t2", "cycleDuration", "stepDuration"]) put(id, "—");
+  if (!stale) for (const id of ["avgTemp", "targetTemp", "deltaTemp", "targetDeltaTemp", "t1", "t2", "cycleDuration", "stepDuration"]) put(id, "—");
   if (!stale) updateDeltaIndicator(NaN);
   put("sampleAge", Number.isFinite(age) ? `Non aggiornate da ${Math.ceil(age / 1000)} s` : 'Non disponibili');
   put("relayState", "SCONOSCIUTO"); put("pidInfo", "Comando attuale non verificato");
@@ -1288,7 +1301,8 @@ function show(view) {
   $('programControls').hidden = view === 'Manual';
   $('manualControl').hidden = view !== 'Manual';
   put('ovenTitle', view === 'Manual' ? 'Forno · Manuale' : 'Forno');
-  put('targetLabel', view === 'Manual' || latest?.manual?.active ? 'Setpoint manuale' : 'Setpoint di rampa');
+  put('targetLabel', latest?.phase === 'paused' && latest?.pauseMaintainsTemperature ? 'Target di pausa' :
+    view === 'Manual' || latest?.manual?.active ? 'Setpoint manuale' : 'Setpoint di rampa');
   if (view !== "Test") cancelTestOwnership(true);
   if (view === "Report" && latest?.reportAvailable) loadReport();
   if (view === "Logs") refreshLogs();

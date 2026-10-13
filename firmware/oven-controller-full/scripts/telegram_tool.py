@@ -443,7 +443,7 @@ def status_style(status):
     if len(valid) != 2 or max(valid) >= 415 or status.get("sampleAgeMs", 0) >= 3000:
         return "⚠️", "SONDE NON PRONTE"
     if phase == "paused":
-        return "⏸️", "CICLO IN PAUSA"
+        return "⏸️", "CICLO IN PAUSA · MANTENIMENTO" if status.get("pauseMaintainsTemperature") else "CICLO IN PAUSA"
     if phase == "running":
         manual = status.get("manual", {})
         if manual.get("active"):
@@ -509,6 +509,8 @@ def format_status(status, mode="sintetica"):
         lines += ["Target istantaneo: " + temperature(status.get("target")), "", "⏱ TEMPI",
                   "Tempo ciclo totale: " + duration(status.get("cycleElapsedSec")),
                   "Rimanente step" + (" (stima)" if status.get("stepRemainingEstimated") else "") + ": " + duration(status.get("stepRemainingSec"))]
+        if status.get("phase") == "paused" and status.get("pauseMaintainsTemperature"):
+            lines += ["PID mantiene " + temperature(status.get("pauseTargetC")) + "; avanzamento e tempo dello step sospesi."]
     lines += ["", "🌡 TEMPERATURE"]
     valid = []
     for i, sensor in enumerate(status.get("sensors", []), 1):

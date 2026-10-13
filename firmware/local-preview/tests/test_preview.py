@@ -56,7 +56,9 @@ class DemoTests(unittest.TestCase):
         self.full.advance(20)
         self.assertEqual(self.full.target, target)
         self.assertEqual(self.full.step_elapsed, elapsed)
-        self.assertFalse(self.full.relay)
+        self.assertTrue(self.full.status()["pauseMaintainsTemperature"])
+        self.assertGreater(self.full.duty, 0)
+        self.assertEqual(self.full.status()["pauseTargetC"], target)
         self.assertEqual(self.full.status()["cycleElapsedSec"], 30)
         with self.assertRaises(preview.ApiError):
             self.post(self.full, "control", actuator="ssr", windowSec=10, maxPower=30)

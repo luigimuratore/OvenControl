@@ -71,6 +71,7 @@ class DemoDevice:
     def __init__(self, mode, speed=10):
         self.mode, self.speed, self.now = mode, speed if mode == "full" else 1, 600.0
         self.phase, self.fault, self.temperature, self.missing = "idle", "", 24.0, False
+        self.pause_target = None
         self.control = {"actuator": "relay", "windowSec": 60, "maxPower": 30}
         self.pid = {"kp": 12, "ki": .015, "kd": 50}
         self.emergency, self.last_cycle_error = False, ""
@@ -338,10 +339,20 @@ class DemoDevice:
             self.phase, self.fault = "fault", "Durata massima simulata: 12 ore"
             self.log("ALLARME", self.fault)
             self.record(marker=128)
+        if self.phase == "paused":
+            if self.temperature + .2 >= 415 or self.temperature + .2 >= self.target + 8:
+                self.finish_report("fault", "Sovratemperatura durante pausa simulata")
+                self.phase, self.fault, self.target = "fault", "Sovratemperatura durante pausa simulata", None
+                self.record(marker=128)
+                self.log("ALLARME", self.fault)
+                return
+            self.duty = min(self.control["maxPower"], max(0, (self.target - self.temperature) * self.pid["kp"]))
+            self.relay = self.duty > 0 and (self.now - self.cycle_at) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
+            self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
+            self.observe_report()
+            return
         if self.phase != "running":
             self.temperature += (24 - self.temperature) / 1800 * dt
-            if self.phase == "paused":
-                self.observe_report()
             return
         self.step_elapsed += dt
         step = self.active["steps"][self.step_index]
@@ -403,7 +414,8 @@ class DemoDevice:
                     if a["valid"] and b["valid"]:
                         distance = step["target"] - 1 - min(a["c"], b["c"]) if ramp else max(a["c"], b["c"]) - step["target"] - 1
                         remaining = math.ceil(max(0, reference, distance) * 60 / step["rate"])
-            base.update(stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
+            base.update(pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
+                        stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
                         emergency=self.emergency, lastCycleError=self.last_cycle_error)
             base.update(self.control)
             manual_active = self.manual_mode != "idle" and self.phase == "running"
@@ -557,11 +569,17 @@ class DemoDevice:
         elif action == "pause":
             require(self.manual_mode == "idle", "Nel manuale usa COOLDOWN o STOP", 409)
             require(self.phase == "running", "Nessun ciclo in corso", 409)
+            require(not self.missing and self.temperature + .2 < 415, "Sonde non pronte", 409)
+            pair = self.sensors()
+            self.pause_target = min(400, max(0, (pair[0]["c"] + pair[1]["c"]) / 2))
+            self.target = self.pause_target
             if self.report_work:
                 self.report_work["pauseCount"] += 1
             self.phase, self.duty, self.relay, self.was_in_band = "paused", 0.0, False, False
         elif action == "resume":
             require(self.phase == "paused" and not self.missing, "Nessun ciclo in pausa o sonda non valida", 409)
+            step = self.active["steps"][self.step_index]
+            self.target = step["target"] if step["type"] == "hold" else min(step["target"], self.pause_target) if step["type"] == "ramp" else max(step["target"], self.pause_target)
             self.phase = "running"
         else:
             raise ApiError(400, "Azione sconosciuta")

@@ -60,6 +60,11 @@ function clock(sec) {
   return [Math.floor(n / 3600), Math.floor(n / 60) % 60, n % 60].map(x => String(x).padStart(2, "0")).join(":");
 }
 function temp(value) { return Number.isFinite(value) ? value.toFixed(1) : "—"; }
+function signedDelta(value) {
+  if (!Number.isFinite(value)) return '—';
+  const rounded = Number(value.toFixed(1));
+  return `${rounded > 0 ? '+' : ''}${temp(rounded)}`;
+}
 function remainingStepSeconds(s) {
   if (!['running', 'paused'].includes(s.phase)) return 0;
   if ('stepRemainingSec' in s) return Number.isFinite(s.stepRemainingSec) ? s.stepRemainingSec : null;
@@ -143,10 +148,10 @@ function createChartInspector(canvas, tooltip, cursor) {
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
     if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
-      const difference = Number((point.actual - point.target).toFixed(1));
+      const difference = point.actual - point.target;
       const highlight = document.createElement('div');
       highlight.className = 'chart-tooltip-difference';
-      highlight.textContent = `ΔT (media PT100 − target): ${difference > 0 ? '+' : ''}${temp(difference)} °C`;
+      highlight.textContent = `ΔT (media PT100 − target): ${signedDelta(difference)} °C`;
       tooltip.append(highlight);
     }
     tooltip.hidden = cursor.hidden = false;
@@ -193,8 +198,10 @@ function display(s) {
   const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1 + t2) / 2 : NaN;
   const target = s.target === null ? NaN : Number(s.target);
   put("avgTemp", temp(avg)); put("targetTemp", temp(target));
+  put('targetDeltaTemp', signedDelta(avg - target));
   const manual = s.manual || {}, manualActive = !!manual.active;
-  put('targetLabel', selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
+  put('targetLabel', s.phase === 'paused' && s.pauseMaintainsTemperature ? 'Target di pausa' :
+    selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
   const manualLabel = manual.mode === 'cooldown' ? 'COOLDOWN · uscita spenta' :
     manual.coolingToTarget ? 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
     Math.abs(manual.setpointC - manual.targetC) > .01 ? 'MANUALE · RAMPA' : 'MANUALE · MANTENIMENTO PID';
@@ -237,7 +244,8 @@ function display(s) {
   put("cycleDuration", clock(s.cycleElapsedSec));
   const remaining = remainingStepSeconds(s), activeStep = ['running', 'paused'].includes(s.phase);
   put("stepDuration", remaining === null ? '—' : clock(remaining));
-  put("stepTimeHint", activeStep ? s.phase === 'paused' ? 'Conteggio sospeso durante la pausa' :
+  put("stepTimeHint", activeStep ? s.phase === 'paused' ? s.pauseMaintainsTemperature ?
+    `Step sospeso; PID mantiene ${temp(s.pauseTargetC)} °C` : 'Conteggio sospeso durante la pausa' :
     s.stepType === 'ramp' && s.stepWaitingForTemperature ? s.stepTransitionToHold ?
     `Riferimento al target: attendo entrambe le PT100 entro ±${s.stepCompletionBandC} °C per iniziare il mantenimento` :
     `Riferimento al target: attendo la sonda più fredda ad almeno ${temp(s.stepFinalTarget - (s.stepCompletionBandC || 1))} °C` :
@@ -271,7 +279,8 @@ function display(s) {
   put("apAddress", s.apIp ? `http://${s.apIp}/` : "");
   const bad = s.phase === "fault" || s.phase === "interrupted";
   $("statusDot").className = `status-dot ${bad ? "fault" : s.test?.running ? "paused" : s.phase === "running" ? "running" : s.phase === "paused" ? "paused" : "idle"}`;
-  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : manualActive ? manualLabel : labels[s.phase] || s.phase);
+  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : manualActive ? manualLabel :
+    s.phase === 'paused' && s.pauseMaintainsTemperature ? 'PAUSA · MANTENIMENTO' : labels[s.phase] || s.phase);
   $("alarmBox").classList.toggle("hidden", !bad);
   put("alarmText", s.fault || (s.phase === "interrupted" ? "Il ciclo precedente si è interrotto. uscita spenta. Valuta il materiale prima di iniziare un nuovo ciclo." : ""));
   put('cycleErrorInfo', s.emergency ? `Emergenza attiva: ${s.fault || 'uscite bloccate fino al riconoscimento.'}` :
@@ -435,7 +444,7 @@ async function command(action) {
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
+    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -610,7 +619,7 @@ function connectionLost() {
   connected = false; renderFailed = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false; testOffline(stale);
   put("statusText", stale ? `AGGIORNAMENTO IN RITARDO · ${Math.ceil(age / 1000)} s` : "ESP NON RAGGIUNGIBILE");
   $("statusDot").className = `status-dot ${stale ? 'paused' : 'fault'}`;
-  if (!stale) for (const id of ["avgTemp", "targetTemp", "deltaTemp", "t1", "t2", "cycleDuration", "stepDuration"]) put(id, "—");
+  if (!stale) for (const id of ["avgTemp", "targetTemp", "deltaTemp", "targetDeltaTemp", "t1", "t2", "cycleDuration", "stepDuration"]) put(id, "—");
   if (!stale) updateDeltaIndicator(NaN);
   put("sampleAge", Number.isFinite(age) ? `Non aggiornate da ${Math.ceil(age / 1000)} s` : 'Non disponibili');
   put("relayState", "SCONOSCIUTO"); put("pidInfo", "Comando attuale non verificato");
@@ -648,7 +657,8 @@ function show(view) {
   $('programControls').hidden = view === 'Manual';
   $('manualControl').hidden = view !== 'Manual';
   put('ovenTitle', view === 'Manual' ? 'Forno · Manuale' : 'Forno');
-  put('targetLabel', view === 'Manual' || latest?.manual?.active ? 'Setpoint manuale' : 'Setpoint di rampa');
+  put('targetLabel', latest?.phase === 'paused' && latest?.pauseMaintainsTemperature ? 'Target di pausa' :
+    view === 'Manual' || latest?.manual?.active ? 'Setpoint manuale' : 'Setpoint di rampa');
   if (view !== "Test") cancelTestOwnership(true);
   if (view === "Report" && latest?.reportAvailable) loadReport();
   if (view === "Logs") refreshLogs();

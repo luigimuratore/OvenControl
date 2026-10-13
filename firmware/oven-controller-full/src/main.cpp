@@ -15,6 +15,7 @@
 #include <atomic>
 #include "profile.h"
 #include "pid_control.h"
+#include "pause_control.h"
 #include "manual_control.h"
 #include "cycle_report.h"
 #include "report_curve.h"
@@ -141,12 +142,14 @@ String stationIp, faultText, resetReason, lastCycleError;
 String interruptedProgram;
 float setpointC = NAN, duty = 0;
 regulation::Pid pidController;
+regulation::ProgramPause pauseHold;
 manual::Session manualSession;
 bool manualOperation = false;
 float kp = 12.0f, ki = 0.015f, kd = 50.0f;
 float stepStartC = NAN;
 uint8_t stepIndex = 0;
 uint32_t stepStarted = 0, cycleStarted = 0, pausedAt = 0, holdInBandMs = 0;
+uint32_t stepElapsedBefore = 0;
 uint32_t windowStarted = 0, lastSampleAt = 0, lastHistoryAt = 0;
 uint32_t lastNetworkCheck = 0, lastPidLog = 0, lastLagLog = 0, checkpointAt = 0;
 uint32_t sampleAtMs = 0, bootCount = 0, eventSeq = 0, persistedSeq = 0;
@@ -221,6 +224,8 @@ heater::Fault heaterFault() { return outputSnapshot().guard.fault; }
 bool diagnosticMode() { return outputSnapshot().diagnostic; }
 bool cycleActive() { return phase == Phase::Running || phase == Phase::Paused; }
 bool heatingOperation() {
+  if (phase == Phase::Paused) return !manualOperation && pauseHold.active &&
+    std::isfinite(pauseHold.targetC) && stepIndex < activeRecipe.count;
   if (phase != Phase::Running || !std::isfinite(setpointC)) return false;
   if (manualOperation) return manualSession.heatingAllowed();
   return stepIndex < activeRecipe.count && activeRecipe.steps[stepIndex].type != profile::Type::Cooldown;
@@ -317,6 +322,7 @@ String telegramStatus();
 void telegramNotice(const String &title, const String &reason = "", bool critical = false);
 void stopCycle(Phase next, const String &reason) {
   const float finalReference = setpointC;
+  pauseHold.clear();
   resetPid();
   if (next == Phase::Fault) faultText = reason;
   if (manualOperation && cycleActive()) {
@@ -503,7 +509,7 @@ String telegramStatus() {
   else if (!sensorsHealthy() || uint32_t(now - sampleAtMs) >= heater::Guard::kStaleMs) {
     icon = "⚠️"; state = "SONDE NON PRONTE";
   }
-  else if (phase == Phase::Paused) { icon = "⏸️"; state = "CICLO IN PAUSA"; }
+  else if (phase == Phase::Paused) { icon = "⏸️"; state = "CICLO IN PAUSA · MANTENIMENTO"; }
   else if (phase == Phase::Running && manualOperation) {
     icon = manualSession.mode == manual::Mode::Cooldown || manualSession.coolingToTarget ? "❄️" : "✅";
     state = manualSession.mode == manual::Mode::Cooldown ? "MANUALE · COOLDOWN PASSIVO" :
@@ -544,14 +550,16 @@ String telegramStatus() {
         "\nTarget finale: " + String(step.target, 1) + " °C\n";
       if (step.type != profile::Type::Hold) text += "Rate: " + String(step.rate, 2) + " °C/min\n";
       else text += "Hold ±5 °C: " + telegramTime(holdInBandMs / 1000) + " / " + telegramTime(uint32_t(step.minutes) * 60) + "\n";
-      const auto elapsed = uint32_t((phase == Phase::Paused ? pausedAt : now) - stepStarted);
-      const float remaining = profile::remainingSec(step, stepStartC, elapsed, holdInBandMs,
+      const auto elapsed = phase == Phase::Paused ? 0 : uint32_t(now - stepStarted);
+      const float origin = phase == Phase::Paused ? pauseHold.targetC : stepStartC;
+      const float remaining = profile::remainingSec(step, origin, elapsed, holdInBandMs,
         sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
         sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
       if (std::isfinite(remaining)) remainingText = telegramTime(uint32_t(remaining));
       estimated = step.type != profile::Type::Hold;
     }
     text += "Target istantaneo: " + (std::isfinite(setpointC) ? String(setpointC, 2) + " °C" : String("non disponibile")) + "\n";
+    if (phase == Phase::Paused) text += "PID mantiene la temperatura di pausa; avanzamento e tempo dello step sospesi.\n";
     text += "\n⏱ TEMPI\nTempo ciclo totale: " + telegramTime(uint32_t(now - cycleStarted) / 1000) + "\n";
     text += "Rimanente step" + String(estimated ? " (stima): " : ": ") + remainingText + "\n";
   }
@@ -625,6 +633,7 @@ void beginStep(bool preservePid = false) {
     stopCycle(Phase::Complete, "Ciclo finito: tutti gli step completati"); return;
   }
   stepStarted = millis();
+  stepElapsedBefore = 0; pauseHold.clear();
   const auto &step = activeRecipe.steps[stepIndex];
   stepStartC = profile::startTemperature(step, meanC(), stepIndex > 0 ? setpointC : NAN);
   holdInBandMs = 0;
@@ -689,6 +698,17 @@ void sampleAndControl() {
   }
   if (!manualOperation && (phase == Phase::Running || phase == Phase::Paused) && uint32_t(now - cycleStarted) >= MAX_CYCLE_MS) {
     trip("Tempo massimo ciclo 12 ore, incluse pause, superato"); return;
+  }
+  if (phase == Phase::Paused) {
+    holdTimer.update(now, false, false);
+    if (!pauseHold.active || !thermal::validTarget(pauseHold.targetC)) {
+      trip("Target di pausa non valido: uscita spenta"); return;
+    }
+    setpointC = pauseHold.targetC;
+    if (hottestC() >= setpointC + MAX_TARGET_OVERSHOOT) {
+      trip("Sovratemperatura rispetto al target di pausa (+8 °C): uscita spenta"); return;
+    }
+    controlPid(meanC(), now); return;
   }
   if (phase != Phase::Running) { holdTimer.update(now, false, false); inhibitHeater(); return; }
   if (manualOperation) {
@@ -969,6 +989,9 @@ void statusApi(uint32_t testToken = 0) {
   doc["mode"] = "FULL"; doc["firmware"] = firmwareinfo::kVersion;
   doc["firmwareModifiedOn"] = firmwareinfo::kModifiedOn;
   doc["phase"] = phaseName(); doc["relay"] = heaterOn();
+  doc["pauseMaintainsTemperature"] = phase == Phase::Paused && pauseHold.active;
+  if (phase == Phase::Paused && pauseHold.active) doc["pauseTargetC"] = pauseHold.targetC;
+  else doc["pauseTargetC"] = nullptr;
   doc["operation"] = manualOperation ? "manual" : "program";
   JsonObject manualState = doc["manual"].to<JsonObject>();
   manualState["active"] = manualOperation && cycleActive() && manualSession.active();
@@ -992,8 +1015,8 @@ void statusApi(uint32_t testToken = 0) {
   doc["stepRemainingEstimated"] = false;
   if (manualOperation && manualSession.active()) doc["cycleStartedAtMs"] = manualSession.startedAt;
   else if (activeRecipe.count) doc["cycleStartedAtMs"] = cycleStarted; else doc["cycleStartedAtMs"] = nullptr;
-  doc["stepElapsedSec"] = manualOperation ? 0 : phase == Phase::Running ? uint32_t(millis() - stepStarted) / 1000 :
-                           phase == Phase::Paused ? uint32_t(pausedAt - stepStarted) / 1000 : 0;
+  doc["stepElapsedSec"] = manualOperation || !cycleActive() ? 0 :
+    (stepElapsedBefore + uint32_t((phase == Phase::Paused ? pausedAt : millis()) - stepStarted)) / 1000;
   doc["freeHeap"] = ESP.getFreeHeap(); doc["minFreeHeap"] = ESP.getMinFreeHeap();
   telegramBot.status(doc["telegram"].to<JsonObject>());
   doc["rssi"] = stationReady ? WiFi.RSSI() : 0;
@@ -1021,15 +1044,16 @@ void statusApi(uint32_t testToken = 0) {
     doc["stepCompletionBandC"] = step.type == profile::Type::Hold || toHold ? profile::kHoldBand : profile::kBand;
     doc["stepCompletionTarget"] = toHold ? followingStep()->target : step.target;
     if (cycleActive()) {
-      const uint32_t elapsed = uint32_t((phase == Phase::Paused ? pausedAt : millis()) - stepStarted);
-      const float remaining = profile::remainingSec(step, stepStartC, elapsed, holdInBandMs,
+      const uint32_t elapsed = phase == Phase::Paused ? 0 : uint32_t(millis() - stepStarted);
+      const float origin = phase == Phase::Paused ? pauseHold.targetC : stepStartC;
+      const float remaining = profile::remainingSec(step, origin, elapsed, holdInBandMs,
         sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
         sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
       if (std::isfinite(remaining)) doc["stepRemainingSec"] = remaining;
       doc["stepRemainingEstimated"] = step.type != profile::Type::Hold;
       doc["stepWaitingForTemperature"] = step.type == profile::Type::Ramp &&
-        profile::setpoint(step, stepStartC, elapsed) >= step.target - 0.001f &&
-        !profile::rampDone(step, stepStartC, elapsed,
+        profile::setpoint(step, origin, elapsed) >= step.target - 0.001f &&
+        !profile::rampDone(step, origin, elapsed,
           sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
           sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
     }
@@ -1171,23 +1195,38 @@ void commandApi() {
   if (action == "pause") {
     if (manualOperation && cycleActive()) { error(409, "Nel manuale usa COOLDOWN o STOP"); return; }
     if (phase != Phase::Running) { error(409, "Nessun ciclo da mettere in pausa"); return; }
-    phase = Phase::Paused; pausedAt = millis(); cycleReport.setPaused(pausedAt, true); inhibitHeater(); duty = 0;
+    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+    if (!sensorsHealthy() || heaterFault() != heater::Fault::None) {
+      error(409, "Sonde/controllo fuori limite: pausa non attivata"); return;
+    }
+    const uint32_t now = millis();
+    if (stepIndex >= activeRecipe.count || !pauseHold.begin(meanC(), now, stepStarted, stepElapsedBefore)) {
+      error(409, "Temperatura o step non validi per il mantenimento in pausa"); return;
+    }
+    phase = Phase::Paused; pausedAt = now; cycleReport.setPaused(pausedAt, true); inhibitHeater(); duty = 0;
     holdTimer.update(pausedAt, false, false);
-    applyWindow();
-    logEvent("CICLO", "Ciclo in pausa: uscita spenta");
-    telegramNotice("CICLO IN PAUSA", "Comando riscaldamento spento."); statusApi(); return;
+    sampleAndControl();
+    if (phase == Phase::Paused) {
+      logEvent("CICLO", "Ciclo in pausa: PID mantiene " + String(pauseHold.targetC, 1) + " °C; step sospeso");
+      telegramNotice("CICLO IN PAUSA", "PID mantiene " + String(pauseHold.targetC, 1) + " °C; tempo dello step sospeso.");
+      recordHistory(true);
+    }
+    statusApi(); return;
   }
   if (action == "resume") {
     if (phase != Phase::Paused) { error(409, "Nessun ciclo in pausa"); return; }
     readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
     if (!sensorsHealthy() || heaterFault() != heater::Fault::None) { error(409, "Sonde/controllo fuori limite: riconosci l'allarme"); return; }
     if (uint32_t(millis() - cycleStarted) >= MAX_CYCLE_MS) { trip("Tempo massimo ciclo 12 ore superato"); statusApi(); return; }
-    uint32_t pausedMs = uint32_t(millis() - pausedAt);
-    stepStarted += pausedMs;
-    cycleReport.setPaused(millis(), false);
-    phase = Phase::Running; resetPid();
-    logEvent("CICLO", "Ciclo ripreso dalla pausa; stesso step");
-    telegramNotice("CICLO RIPRESO", "Ripresa dello stesso step."); sampleAndControl(); statusApi(); return;
+    const uint32_t now = millis();
+    if (stepIndex >= activeRecipe.count || !pauseHold.resume(activeRecipe.steps[stepIndex], now,
+        stepStartC, stepStarted, stepElapsedBefore)) { error(409, "Stato di pausa non valido"); return; }
+    cycleReport.setPaused(now, false);
+    phase = Phase::Running;
+    if (activeRecipe.steps[stepIndex].type == profile::Type::Cooldown) resetPid();
+    setpointC = profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, 0);
+    logEvent("CICLO", "Ciclo ripreso dalla temperatura di pausa; stesso step e rate del programma");
+    telegramNotice("CICLO RIPRESO", "Ripresa dello stesso step dalla temperatura di pausa."); sampleAndControl(); statusApi(); return;
   }
   if (action == "start") {
     if (phase == Phase::Running || phase == Phase::Paused) { error(409, "Ciclo gia in corso"); return; }

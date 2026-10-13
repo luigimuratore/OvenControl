@@ -202,8 +202,9 @@ function display(s) {
   const manual = s.manual || {}, manualActive = !!manual.active;
   put('targetLabel', s.phase === 'paused' && s.pauseMaintainsTemperature ? 'Target di pausa' :
     selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
-  const manualLabel = manual.mode === 'cooldown' ? 'COOLDOWN · uscita spenta' :
-    manual.coolingToTarget ? 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
+  const manualLabel = manual.mode === 'cooldown' ? manual.cooldownComplete ? 'COOLDOWN COMPLETATO · uscita spenta' :
+    s.cooldownRegulated ? 'COOLDOWN · DISCESA REGOLATA' : 'COOLDOWN · uscita spenta' :
+    manual.coolingToTarget ? s.cooldownRegulated ? 'DISCESA VERSO TARGET · PID' : 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
     Math.abs(manual.setpointC - manual.targetC) > .01 ? 'MANUALE · RAMPA' : 'MANUALE · MANTENIMENTO PID';
   put('manualState', manualActive ? manualLabel : !s.manual ? 'Disponibile dopo aggiornamento del firmware' :
     ['fault','interrupted'].includes(s.phase) || s.emergency ? 'Bloccato: riconosci prima allarme/interruzione' :
@@ -218,10 +219,13 @@ function display(s) {
     if (Number.isFinite(manual.rateCMin)) $('manualRate').value = manual.rateCMin;
   }
   put('manualHint', manualActive ? manual.mode === 'cooldown' ?
+    manual.cooldownComplete ? 'Target cooldown raggiunto: uscita spenta. STOP chiude il manuale; APPLICA TARGET avvia una nuova regolazione.' :
+    s.cooldownRegulated ? 'Il PID dà calore se la media scende sotto la curva. Sopra il setpoint raffredda naturalmente. STOP spegne il riscaldamento.' :
     'Raffreddamento passivo. APPLICA TARGET riattiva la regolazione; STOP chiude il manuale.' : manual.coolingToTarget ?
+    s.cooldownRegulated ? 'Discesa al rate scelto: calore solo sotto la curva, raffreddamento naturale sopra. Poi mantiene il nuovo target.' :
     'Il target è sotto la temperatura attuale: il riscaldamento resta spento fino al raffreddamento, poi riprende il PID.' :
     'Rampa al rate scelto, poi mantenimento senza durata. APPLICA TARGET cambia target/rate; COOLDOWN spegne il riscaldamento.' :
-    'COOLDOWN spegne il riscaldamento e mantiene il monitoraggio. STOP chiude il manuale. Dopo un reset non riparte da solo.');
+    'COOLDOWN segue la discesa con il PID; STOP spegne il riscaldamento e chiude il manuale. Dopo un reset non riparte da solo.');
   updateDeltaIndicator(Math.abs(t1 - t2));
   put("t1", Number.isFinite(t1) ? `${temp(t1)} °C` : "Non valida");
   put("t2", Number.isFinite(t2) ? `${temp(t2)} °C` : "Non valida");
@@ -480,7 +484,7 @@ async function manualCommand(action) {
     display(result);
     if (action === 'start') { chartAtEnd = true; drawSoon(); }
     const text = result.phase === 'fault' || result.phase === 'interrupted' ? result.fault || 'Controllo manuale bloccato.' :
-      action === 'cooldown' ? 'Cooldown manuale: uscita spenta, monitoraggio attivo.' :
+      action === 'cooldown' ? result.cooldownRegulated ? 'Cooldown manuale: discesa regolata dal PID.' : 'Cooldown manuale: uscita spenta, monitoraggio attivo.' :
       `Target manuale ${temp(result.manual?.targetC)} °C applicato.`;
     note('manualMessage', text, result.phase === 'fault' || result.phase === 'interrupted');
     note('globalMessage', text, result.phase === 'fault' || result.phase === 'interrupted');

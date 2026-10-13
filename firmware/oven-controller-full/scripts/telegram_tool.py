@@ -448,9 +448,10 @@ def status_style(status):
         manual = status.get("manual", {})
         if manual.get("active"):
             if manual.get("mode") == "cooldown":
-                return "❄️", "MANUALE · COOLDOWN PASSIVO"
+                return "❄️", "MANUALE · COOLDOWN COMPLETATO" if manual.get("cooldownComplete") else \
+                    "MANUALE · COOLDOWN REGOLATO" if status.get("cooldownRegulated") else "MANUALE · COOLDOWN PASSIVO"
             if manual.get("coolingToTarget"):
-                return "❄️", "MANUALE · RAFFREDDAMENTO VERSO TARGET"
+                return "❄️", "MANUALE · DISCESA REGOLATA" if status.get("cooldownRegulated") else "MANUALE · RAFFREDDAMENTO VERSO TARGET"
             return "✅", "MANUALE · REGOLAZIONE"
         return "✅", "CICLO IN CORSO"
     if phase == "complete":
@@ -490,16 +491,19 @@ def format_status(status, mode="sintetica"):
         lines += ["", "🎛 CONTROLLO MANUALE"]
         lines.append("Target finale: " + temperature(manual.get("targetC")))
         if manual.get("mode") == "cooldown":
-            lines.append("Cooldown passivo: riscaldamento SPENTO.")
+            lines.append("Target cooldown raggiunto: riscaldamento SPENTO, monitoraggio attivo." if manual.get("cooldownComplete") else
+                         "Cooldown regolato: PID sotto il setpoint; raffreddamento naturale sopra." if status.get("cooldownRegulated") else
+                         "Cooldown passivo: riscaldamento SPENTO.")
         else:
-            lines += ["Riscaldamento spento: raffreddamento verso il nuovo target." if manual.get("coolingToTarget")
+            lines += [("Discesa regolata: calore solo sotto il setpoint." if status.get("cooldownRegulated") else
+                       "Riscaldamento spento: raffreddamento verso il nuovo target.") if manual.get("coolingToTarget")
                       else "Regolazione PID fino al comando dell'operatore."]
         lines.append("Setpoint: " + temperature(manual.get("setpointC")) + f" · rate {manual.get('rateCMin')} °C/min")
         lines.append("Tempo manuale: " + duration(manual.get("elapsedSec")))
     elif status.get("phase") in ("running", "paused"):
         lines += ["", "📋 CICLO ATTIVO", "Programma: " + (status.get("recipeName") or "non disponibile")]
         if status.get("stepIndex", 0) < status.get("stepCount", 0):
-            kind = {"ramp": "Rampa", "hold": "Mantenimento", "cooldown": "Cooldown passivo"}.get(status.get("stepType"), "non disponibile")
+            kind = {"ramp": "Rampa", "hold": "Mantenimento", "cooldown": "Cooldown regolato" if status.get("cooldownRegulated") else "Cooldown passivo"}.get(status.get("stepType"), "non disponibile")
             lines += [f"Step: {status.get('stepIndex', 0) + 1}/{status.get('stepCount')} · {kind}",
                       "Target finale: " + temperature(status.get("stepFinalTarget"))]
             if status.get("stepType") == "hold":

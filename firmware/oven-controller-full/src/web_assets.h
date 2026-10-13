@@ -36,7 +36,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
     </section>
     <aside class="panel control-panel">
       <div id="programControls">
-      <h2>Controllo ciclo</h2><ul class="control-notes"><li>La rampa avanza in °C/min. Quando è seguita da un mantenimento, passa allo step successivo dopo che il riferimento ha raggiunto il target e entrambe le PT100 sono entro ±5 °C.</li><li>Il mantenimento conta solo il tempo con entrambe le PT100 entro ±5 °C dal target.</li><li>Il cooldown è passivo: uscita spenta.</li></ul>
+      <h2>Controllo ciclo</h2><ul class="control-notes"><li>La rampa avanza in °C/min. Quando è seguita da un mantenimento, passa allo step successivo dopo che il riferimento ha raggiunto il target e entrambe le PT100 sono entro ±5 °C.</li><li>Il mantenimento conta solo il tempo con entrambe le PT100 entro ±5 °C dal target.</li><li>Il cooldown segue la discesa del target: il PID dà calore sotto la curva; sopra la curva raffredda naturalmente.</li></ul>
       <label class="field"><span>Programma</span><select id="recipeSelect"></select></label>
       <ol id="recipePreview" class="recipe-preview"></ol>
       <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
@@ -57,7 +57,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
         <label class="hardware-ready"><input id="manualHardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
         <div class="buttons manual-buttons"><button id="manualStart" class="primary">AVVIA MANUALE</button><button id="manualApply">APPLICA TARGET</button><button id="manualCooldown" class="manual-cooldown">COOLDOWN</button><button id="manualStop" class="danger">STOP MANUALE</button></div>
         <div class="recipe-summary manual-summary"><div><span>Target applicato</span><strong id="manualAppliedTarget">—</strong></div><div><span>Rate applicato</span><strong id="manualAppliedRate">—</strong></div><div><span>Tempo manuale totale</span><strong id="manualDuration">00:00:00</strong></div></div>
-        <p id="manualHint" class="hint">COOLDOWN spegne il riscaldamento e mantiene il monitoraggio. STOP chiude il manuale. Dopo un reset non riparte da solo.</p>
+        <p id="manualHint" class="hint">COOLDOWN segue la discesa con il PID. STOP spegne il riscaldamento e chiude il manuale. Dopo un reset non riparte da solo.</p>
         <button id="manualReset" class="ghost full">Riconosci allarme / interruzione</button>
         <div id="manualMessage" class="notice hidden" role="status"></div>
       </section>
@@ -71,7 +71,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
     <div class="program-editor-section"><label class="field"><span>Nome</span><input id="recipeName" maxlength="48"></label>
     <p class="hint">Target selezionabile da 0 a 400 °C. Arresto per temperatura assoluta a 415 °C sulla sonda più calda.</p>
     <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina programma</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
-    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: discesa naturale; il rate è il riferimento sul grafico e non viene forzato dal forno.</p><div id="recipeMessage" class="notice hidden"></div>
+    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: il PID frena il raffreddamento sotto il setpoint; sopra la curva raffredda naturalmente. Non può raffreddare più velocemente del forno.</p><div id="recipeMessage" class="notice hidden"></div>
     </div>
     <section class="control-settings-section"><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
     <div class="pid-fields"><label class="field"><span>Kp</span><input id="kp" type="number" min="0" max="50" step="0.1"></label><label class="field"><span>Ki</span><input id="ki" type="number" min="0" max="0.5" step="0.001"></label><label class="field"><span>Kd</span><input id="kd" type="number" min="0" max="200" step="0.1"></label></div><button id="savePid" class="ghost full">Salva PID sull'ESP</button>
@@ -846,8 +846,9 @@ function display(s) {
   const manual = s.manual || {}, manualActive = !!manual.active;
   put('targetLabel', s.phase === 'paused' && s.pauseMaintainsTemperature ? 'Target di pausa' :
     selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
-  const manualLabel = manual.mode === 'cooldown' ? 'COOLDOWN · uscita spenta' :
-    manual.coolingToTarget ? 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
+  const manualLabel = manual.mode === 'cooldown' ? manual.cooldownComplete ? 'COOLDOWN COMPLETATO · uscita spenta' :
+    s.cooldownRegulated ? 'COOLDOWN · DISCESA REGOLATA' : 'COOLDOWN · uscita spenta' :
+    manual.coolingToTarget ? s.cooldownRegulated ? 'DISCESA VERSO TARGET · PID' : 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
     Math.abs(manual.setpointC - manual.targetC) > .01 ? 'MANUALE · RAMPA' : 'MANUALE · MANTENIMENTO PID';
   put('manualState', manualActive ? manualLabel : !s.manual ? 'Disponibile dopo aggiornamento del firmware' :
     ['fault','interrupted'].includes(s.phase) || s.emergency ? 'Bloccato: riconosci prima allarme/interruzione' :
@@ -862,10 +863,13 @@ function display(s) {
     if (Number.isFinite(manual.rateCMin)) $('manualRate').value = manual.rateCMin;
   }
   put('manualHint', manualActive ? manual.mode === 'cooldown' ?
+    manual.cooldownComplete ? 'Target cooldown raggiunto: uscita spenta. STOP chiude il manuale; APPLICA TARGET avvia una nuova regolazione.' :
+    s.cooldownRegulated ? 'Il PID dà calore se la media scende sotto la curva. Sopra il setpoint raffredda naturalmente. STOP spegne il riscaldamento.' :
     'Raffreddamento passivo. APPLICA TARGET riattiva la regolazione; STOP chiude il manuale.' : manual.coolingToTarget ?
+    s.cooldownRegulated ? 'Discesa al rate scelto: calore solo sotto la curva, raffreddamento naturale sopra. Poi mantiene il nuovo target.' :
     'Il target è sotto la temperatura attuale: il riscaldamento resta spento fino al raffreddamento, poi riprende il PID.' :
     'Rampa al rate scelto, poi mantenimento senza durata. APPLICA TARGET cambia target/rate; COOLDOWN spegne il riscaldamento.' :
-    'COOLDOWN spegne il riscaldamento e mantiene il monitoraggio. STOP chiude il manuale. Dopo un reset non riparte da solo.');
+    'COOLDOWN segue la discesa con il PID; STOP spegne il riscaldamento e chiude il manuale. Dopo un reset non riparte da solo.');
   updateDeltaIndicator(Math.abs(t1 - t2));
   put("t1", Number.isFinite(t1) ? `${temp(t1)} °C` : "Non valida");
   put("t2", Number.isFinite(t2) ? `${temp(t2)} °C` : "Non valida");
@@ -1124,7 +1128,7 @@ async function manualCommand(action) {
     display(result);
     if (action === 'start') { chartAtEnd = true; drawSoon(); }
     const text = result.phase === 'fault' || result.phase === 'interrupted' ? result.fault || 'Controllo manuale bloccato.' :
-      action === 'cooldown' ? 'Cooldown manuale: uscita spenta, monitoraggio attivo.' :
+      action === 'cooldown' ? result.cooldownRegulated ? 'Cooldown manuale: discesa regolata dal PID.' : 'Cooldown manuale: uscita spenta, monitoraggio attivo.' :
       `Target manuale ${temp(result.manual?.targetC)} °C applicato.`;
     note('manualMessage', text, result.phase === 'fault' || result.phase === 'interrupted');
     note('globalMessage', text, result.phase === 'fault' || result.phase === 'interrupted');

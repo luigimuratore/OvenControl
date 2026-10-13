@@ -80,6 +80,7 @@ class DemoDevice:
         self.active, self.step_index = None, 0
         self.operation, self.manual_mode, self.manual_target = "program", "idle", None
         self.manual_cooling = False
+        self.manual_cooldown_complete = False
         self.manual_rate = 1.0
         self.manual_started = self.manual_ended = 0.0
         self.cycle_at = self.step_at = self.now
@@ -288,10 +289,11 @@ class DemoDevice:
             require(active, "Nessun controllo manuale attivo", 409)
             require(target <= self.target, "Target cooldown superiore al setpoint")
             self.manual_mode, self.manual_cooling = "cooldown", False
+            self.manual_cooldown_complete = False
             self.manual_target, self.manual_rate = target, rate
             self.duty, self.relay = 0.0, False
             self.record()
-            self.log("MANUALE", "Cooldown manuale: uscita spenta, raffreddamento passivo")
+            self.log("MANUALE", "Cooldown manuale: discesa regolata dal PID")
             return self.status()
         require(not self.missing and self.temperature + .2 < 415, "Sonde non pronte", 409)
         if action == "start":
@@ -307,6 +309,7 @@ class DemoDevice:
         if self.manual_mode == "cooldown" or self.manual_cooling:
             self.target = self.temperature + .1
         self.manual_mode, self.manual_target, self.manual_rate = "regulating", target, rate
+        self.manual_cooldown_complete = False
         self.manual_cooling = self.temperature + .2 > target + 1 or self.target > target + 1
         self.duty, self.relay = 0.0, False
         self.record(marker=16 if action == "start" else 0)
@@ -318,13 +321,17 @@ class DemoDevice:
             self.duty, self.relay = 0.0, False
             movement = self.manual_rate * dt / 60
             self.target = min(self.manual_target, self.target + movement) if self.target < self.manual_target else max(self.manual_target, self.target - movement)
-            if self.manual_mode == "regulating":
-                if self.manual_cooling and self.temperature + .2 <= self.manual_target + 1 and self.target == self.manual_target:
-                    self.manual_cooling = False
-                if not self.manual_cooling:
-                    self.duty = min(self.control["maxPower"], max(0, (self.target - self.temperature) * self.pid["kp"]))
-                    self.relay = self.duty > 0 and (self.now - self.manual_started) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
-            if self.temperature + .2 >= 415 or (self.manual_mode == "regulating" and not self.manual_cooling and self.temperature + .2 >= self.target + 8):
+            if self.manual_mode == "regulating" and self.manual_cooling and self.temperature + .2 <= self.manual_target + 1 and self.target == self.manual_target:
+                self.manual_cooling = False
+            if self.manual_mode == "cooldown" and self.target == self.manual_target and self.temperature + .2 <= self.manual_target + 1:
+                self.manual_cooldown_complete = True
+            descending = self.manual_mode == "cooldown" or self.manual_cooling
+            if not self.manual_cooldown_complete:
+                pair = self.sensors()
+                actual = (pair[0]["c"] + pair[1]["c"]) / 2 if descending else self.temperature
+                self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
+                self.relay = self.duty > 0 and (self.now - self.manual_started) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
+            if self.temperature + .2 >= 415 or ((not descending or self.duty > 0) and self.temperature + .2 >= self.target + 8):
                 self.fault = "Sovratemperatura manuale simulata"
                 self.end_manual("fault")
                 self.log("ALLARME", self.fault)
@@ -360,10 +367,20 @@ class DemoDevice:
             self.target = min(step["target"], self.target + step["rate"] * dt / 60)
         elif step["type"] == "cooldown":
             self.target = max(step["target"], self.target - step["rate"] * dt / 60)
-        if step["type"] != "cooldown":
-            # Illustrative response: the ESP's actual PID is not reproduced here.
-            self.duty = min(self.control["maxPower"], max(0, (self.target - self.temperature) * self.pid["kp"]))
+        # Illustrative response: the ESP's actual PID is tested separately.
+        pair = self.sensors()
+        actual = (pair[0]["c"] + pair[1]["c"]) / 2 if step["type"] == "cooldown" else self.temperature
+        cooldown_finished = step["type"] == "cooldown" and self.target <= step["target"] and self.temperature + .2 <= step["target"] + 1
+        if not cooldown_finished:
+            self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
             self.relay = self.duty > 0 and (self.now - self.cycle_at) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
+        if self.temperature + .2 >= 415 or ((step["type"] != "cooldown" or self.duty > 0) and self.temperature + .2 >= self.target + 8):
+            self.finish_report("fault", "Sovratemperatura simulata")
+            self.phase, self.fault, self.target = "fault", "Sovratemperatura simulata", None
+            self.duty, self.relay = 0.0, False
+            self.record(marker=128)
+            self.log("ALLARME", self.fault)
+            return
         self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
         self.observe_report()
         in_band = abs(self.temperature - step["target"]) <= 5 and abs(self.temperature + .2 - step["target"]) <= 5
@@ -414,13 +431,13 @@ class DemoDevice:
                     if a["valid"] and b["valid"]:
                         distance = step["target"] - 1 - min(a["c"], b["c"]) if ramp else max(a["c"], b["c"]) - step["target"] - 1
                         remaining = math.ceil(max(0, reference, distance) * 60 / step["rate"])
-            base.update(pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
+            base.update(cooldownRegulated=True, pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
                         stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
                         emergency=self.emergency, lastCycleError=self.last_cycle_error)
             base.update(self.control)
             manual_active = self.manual_mode != "idle" and self.phase == "running"
             base.update(operation=self.operation, manual=dict(active=manual_active, mode=self.manual_mode,
-                targetC=self.manual_target, rateCMin=self.manual_rate, setpointC=self.target, coolingToTarget=self.manual_cooling,
+                targetC=self.manual_target, cooldownComplete=self.manual_cooldown_complete, rateCMin=self.manual_rate, setpointC=self.target, coolingToTarget=self.manual_cooling,
                 elapsedSec=max(0, int((self.now if manual_active else self.manual_ended) - self.manual_started)),
                 startedAtMs=int(self.manual_started * 1000)))
             base.update(mode="FULL", phase=self.phase, fault=self.fault, relay=self.relay, duty=self.duty,

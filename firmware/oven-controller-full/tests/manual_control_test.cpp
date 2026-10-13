@@ -24,12 +24,12 @@ int main() {
   assert(s.startedAt == 100 && s.elapsedMs(10100) == 10000 && s.heatingAllowed());
   assert(!s.changeTarget(NAN, 60, 174, 174, 11100) && s.target == 180);
   assert(s.changeTarget(150, 60, 176, 176, 20100));
-  assert(s.coolingToTarget && !s.heatingAllowed());
-  s.tick(160, 30100); assert(!s.heatingAllowed());
-  s.tick(151, 40100); assert(!s.heatingAllowed()); // Reference has not reached the new target yet.
+  assert(s.coolingToTarget && s.heatingAllowed() && s.descending());
+  s.tick(160, 30100); assert(s.heatingAllowed() && s.descending());
+  s.tick(151, 40100); assert(s.heatingAllowed() && s.descending());
   s.tick(150, 50100); assert(s.heatingAllowed() && !s.coolingToTarget);
-  assert(s.cooldown(25, 60, 50100)); assert(s.active() && !s.heatingAllowed());
-  s.tick(30, 60100); assert(s.mode == manual::Mode::Cooldown && !s.heatingAllowed());
+  assert(s.cooldown(25, 60, 50100)); assert(s.active() && s.heatingAllowed() && s.descending());
+  s.tick(30, 60100); assert(s.mode == manual::Mode::Cooldown && s.heatingAllowed());
   assert(s.changeTarget(160, 60, 30, 30, 70100) && s.heatingAllowed());
   s.stop(80100); assert(!s.active() && !s.heatingAllowed() && s.elapsedMs(90100) == 80000);
 
@@ -42,19 +42,19 @@ int main() {
   ramp.tick(26, 120000); assert(ramp.reference == 26);
   ramp.tick(60, 720000); assert(ramp.reference == 60 && ramp.heatingAllowed());
   ramp.tick(60, 43200000); assert(ramp.active() && ramp.reference == 60);
-  assert(ramp.cooldown(25, 2, 43200000) && ramp.reference == 60 && !ramp.heatingAllowed());
-  ramp.tick(55, 43260000); assert(ramp.reference == 58 && !ramp.heatingAllowed());
-  ramp.tick(20, 45000000); assert(ramp.reference == 25 && !ramp.heatingAllowed());
+  assert(ramp.cooldown(25, 2, 43200000) && ramp.reference == 60 && ramp.heatingAllowed());
+  ramp.tick(55, 43260000); assert(ramp.reference == 58 && ramp.heatingAllowed() && !ramp.cooldownComplete);
+  ramp.tick(20, 45000000); assert(ramp.reference == 25 && !ramp.heatingAllowed() && ramp.cooldownComplete);
   assert(ramp.changeTarget(100, 2, 20, 20, 45000000));
   assert(ramp.reference == 20 && ramp.heatingAllowed());
   ramp.tick(22, 45060000); assert(ramp.reference == 22);
 
-  // Lowering a target while its old reference is ahead of the oven never reheats
-  // towards that old reference. Both reference and actual must reach the new band.
+  // Lowering a target preserves the reference and permits regulated heating
+  // below its descending curve; PID separately gates heat at/above the curve.
   manual::Session down; assert(down.start(100, 60, 20, 20, 0));
   down.tick(70, 80000); assert(down.reference == 100);
-  assert(down.changeTarget(80, 1, 70, 70, 80000) && !down.heatingAllowed());
-  down.tick(70, 140000); assert(down.reference == 99 && !down.heatingAllowed());
+  assert(down.changeTarget(80, 1, 70, 70, 80000) && down.heatingAllowed() && down.descending());
+  down.tick(70, 140000); assert(down.reference == 99 && down.heatingAllowed() && down.descending());
   down.tick(70, 1280000); assert(down.reference == 80 && down.heatingAllowed());
   manual::Session precise; assert(precise.start(400, .1f, 398, 398, 0));
   for (uint32_t second = 1; second <= 500; ++second) precise.tick(398, second * 1000);
@@ -98,5 +98,5 @@ int main() {
   assert(reboot.data.pending && !reboot.data.active);
   manual::Session afterBoot; assert(!afterBoot.active() && !afterBoot.heatingAllowed());
   store.fail = true; assert(!reboot.acknowledge(store) && reboot.data.pending);
-  puts("Manual: targets, passive lowering/cooldown, indefinite hold, timers, STOP, faults, emergency and blackout latch passed");
+  puts("Manual: targets, regulated lowering/cooldown, indefinite hold, timers, STOP, faults, emergency and blackout latch passed");
 }

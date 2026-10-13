@@ -294,6 +294,14 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(elements.get('manualState').textContent.includes('COOLDOWN'));
   assert(elements.get('manualCooldown').disabled);
   assert(!elements.get('manualApply').disabled && !elements.get('manualStop').disabled);
+  run(`display({...latest,cooldownRegulated:true,target:174,duty:7,relay:true,
+    manual:{...latest.manual,active:true,mode:'cooldown',targetC:25,setpointC:174,cooldownComplete:false}})`);
+  assert(elements.get('manualState').textContent.includes('DISCESA REGOLATA'));
+  assert(elements.get('manualHint').textContent.includes('Il PID dà calore'));
+  assert.equal(elements.get('relayState').textContent, 'ACCESO');
+  run(`display({...latest,duty:0,relay:false,manual:{...latest.manual,cooldownComplete:true}})`);
+  assert(elements.get('manualState').textContent.includes('COMPLETATO · uscita spenta'));
+  assert(elements.get('manualHint').textContent.includes('Target cooldown raggiunto'));
   const point = run('historyPoint([1,1000,30,31,50,10,19,255])');
   assert.equal(point.step, null); assert.equal(point.operation, 'manual');
   run('connectionLost()');

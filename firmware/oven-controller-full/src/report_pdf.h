@@ -255,7 +255,7 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
   for (unsigned i = 0; i < r.stepCount; ++i) {
     if (!(i % 3)) w.page("Dettaglio degli step", r, pages);
     const auto &s = r.steps[i]; const float y = 140 + (i % 3) * 213;
-    const char *kind = s.requested.type == profile::Type::Ramp ? "Rampa" : s.requested.type == profile::Type::Hold ? "Mantenimento" : "Cooldown passivo";
+    const char *kind = s.requested.type == profile::Type::Ramp ? "Rampa" : s.requested.type == profile::Type::Hold ? "Mantenimento" : "Cooldown";
     snprintf(a, sizeof(a), "%u / %s / Target %.1f °C", i + 1, kind, double(s.requested.target)); w.text(44, y, a, 11, true);
     const char *state = s.completed ? "Completato" : s.started ? "Interrotto" : "Non iniziato";
     if (s.requested.type == profile::Type::Hold) snprintf(a, sizeof(a), "%s / richiesto %u min", state, unsigned(s.requested.minutes));

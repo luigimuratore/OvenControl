@@ -223,12 +223,14 @@ bool heaterOn() { return outputSnapshot().relay; }
 heater::Fault heaterFault() { return outputSnapshot().guard.fault; }
 bool diagnosticMode() { return outputSnapshot().diagnostic; }
 bool cycleActive() { return phase == Phase::Running || phase == Phase::Paused; }
+float meanC();
 bool heatingOperation() {
   if (phase == Phase::Paused) return !manualOperation && pauseHold.active &&
     std::isfinite(pauseHold.targetC) && stepIndex < activeRecipe.count;
   if (phase != Phase::Running || !std::isfinite(setpointC)) return false;
-  if (manualOperation) return manualSession.heatingAllowed();
-  return stepIndex < activeRecipe.count && activeRecipe.steps[stepIndex].type != profile::Type::Cooldown;
+  if (manualOperation) return manualSession.heatingAllowed() && (!manualSession.descending() || meanC() < setpointC);
+  return stepIndex < activeRecipe.count &&
+    (activeRecipe.steps[stepIndex].type != profile::Type::Cooldown || meanC() < setpointC);
 }
 const profile::Step *followingStep() {
   return stepIndex + 1 < activeRecipe.count ? &activeRecipe.steps[stepIndex + 1] : nullptr;
@@ -512,8 +514,8 @@ String telegramStatus() {
   else if (phase == Phase::Paused) { icon = "⏸️"; state = "CICLO IN PAUSA · MANTENIMENTO"; }
   else if (phase == Phase::Running && manualOperation) {
     icon = manualSession.mode == manual::Mode::Cooldown || manualSession.coolingToTarget ? "❄️" : "✅";
-    state = manualSession.mode == manual::Mode::Cooldown ? "MANUALE · COOLDOWN PASSIVO" :
-      manualSession.coolingToTarget ? "MANUALE · RAFFREDDAMENTO VERSO TARGET" : "MANUALE · REGOLAZIONE";
+    state = manualSession.mode == manual::Mode::Cooldown ? (manualSession.cooldownComplete ? "MANUALE · COOLDOWN COMPLETATO" : "MANUALE · COOLDOWN REGOLATO") :
+      manualSession.coolingToTarget ? "MANUALE · DISCESA REGOLATA" : "MANUALE · REGOLAZIONE";
   }
   else if (phase == Phase::Running) { icon = "✅"; state = "CICLO IN CORSO"; }
   else if (phase == Phase::Complete) { icon = "✅✅✅"; state = "CICLO COMPLETATO"; }
@@ -533,11 +535,11 @@ String telegramStatus() {
   // Selection and historical reports do not represent a currently active cycle.
   if (cycleActive() && manualOperation) {
     text += "\n🎛 CONTROLLO MANUALE\n";
-    if (manualSession.mode == manual::Mode::Cooldown) text += "Cooldown passivo: riscaldamento SPENTO.\n";
+    if (manualSession.mode == manual::Mode::Cooldown) text += manualSession.cooldownComplete ? "Target cooldown raggiunto: riscaldamento SPENTO, monitoraggio attivo.\n" : "Cooldown regolato: PID sotto il setpoint; raffreddamento naturale sopra il setpoint.\n";
     text += "Target finale: " + String(manualSession.target, 1) + " °C\n";
     text += "Setpoint: " + String(manualSession.reference, 1) + " °C · rate " + String(manualSession.rateCMin, 2) + " °C/min\n";
     if (manualSession.mode != manual::Mode::Cooldown) text +=
-      String(manualSession.coolingToTarget ? "Riscaldamento spento: raffreddamento verso il nuovo target.\n" : "Regolazione PID fino al comando dell'operatore.\n");
+      String(manualSession.coolingToTarget ? "Discesa regolata: calore solo sotto il setpoint.\n" : "Regolazione PID fino al comando dell'operatore.\n");
     text += "Tempo manuale: " + telegramTime(uint32_t(manualSession.elapsedMs(now) / 1000)) + "\n";
   } else if (cycleActive()) {
     text += "\n📋 CICLO ATTIVO\nProgramma: " + activeRecipe.name + "\n";
@@ -545,7 +547,7 @@ String telegramStatus() {
     bool estimated = false;
     if (stepIndex < activeRecipe.count) {
       const auto &step = activeRecipe.steps[stepIndex];
-      const char *kind = step.type == profile::Type::Ramp ? "Rampa" : step.type == profile::Type::Hold ? "Mantenimento" : "Cooldown passivo";
+      const char *kind = step.type == profile::Type::Ramp ? "Rampa" : step.type == profile::Type::Hold ? "Mantenimento" : "Cooldown regolato";
       text += "Step: " + String(stepIndex + 1) + "/" + String(activeRecipe.count) + " · " + kind +
         "\nTarget finale: " + String(step.target, 1) + " °C\n";
       if (step.type != profile::Type::Hold) text += "Rate: " + String(step.rate, 2) + " °C/min\n";
@@ -647,7 +649,7 @@ void beginStep(bool preservePid = false) {
 }
 void advanceStep() {
   const bool preservePid = stepIndex + 1 < activeRecipe.count &&
-    regulation::continuousHold(activeRecipe.steps[stepIndex], activeRecipe.steps[stepIndex + 1]);
+    regulation::continuousControl(activeRecipe.steps[stepIndex], activeRecipe.steps[stepIndex + 1]);
   cycleReport.advance(millis(), holdInBandMs); ++stepIndex; beginStep(preservePid);
 }
 void applyWindow() {
@@ -660,8 +662,11 @@ void applyWindow() {
   plan.windowMs = controlSettings.windowMs; plan.duty = duty;
   portENTER_CRITICAL(&heaterMux); outputs.publish(plan); portEXIT_CRITICAL(&heaterMux);
 }
-void controlPid(float actual, uint32_t now) {
-  duty = pidController.update(setpointC, actual, kp, ki, kd, controlSettings.maxPower, now);
+void controlPid(float actual, uint32_t now, bool descending = false) {
+  duty = pidController.update(setpointC, actual, kp, ki, kd, controlSettings.maxPower, now, descending);
+  if (descending && duty > 0 && hottestC() >= setpointC + MAX_TARGET_OVERSHOOT) {
+    trip("Sovratemperatura della PT100 più calda (+8 °C) durante correzione cooldown: uscita spenta"); return;
+  }
   applyWindow();
   if (uint32_t(now - lastPidLog) >= 30000) {
     lastPidLog = now;
@@ -715,10 +720,10 @@ void sampleAndControl() {
     manualSession.tick(hottestC(), now);
     setpointC = manualSession.reference;
     if (!manualSession.heatingAllowed()) { duty = 0; inhibitHeater(); return; }
-    if (hottestC() >= setpointC + MAX_TARGET_OVERSHOOT) {
+    if (!manualSession.descending() && hottestC() >= setpointC + MAX_TARGET_OVERSHOOT) {
       trip("Sovratemperatura rispetto al target manuale (+8 °C): uscita spenta"); return;
     }
-    controlPid(meanC(), now); return;
+    controlPid(meanC(), now, manualSession.descending()); return;
   }
   const auto &step = activeRecipe.steps[stepIndex];
   float actual = meanC();
@@ -728,8 +733,8 @@ void sampleAndControl() {
     trip("Sovratemperatura rispetto al setpoint (+8 °C): uscita spenta"); return;
   }
   if (step.type == profile::Type::Cooldown) {
-    duty = 0; inhibitHeater();
-    if (profile::cooldownDone(step, stepStartC, elapsed, hottestC())) advanceStep();
+    if (profile::cooldownDone(step, stepStartC, elapsed, hottestC())) { advanceStep(); return; }
+    controlPid(actual, now, true);
     return;
   }
   controlPid(actual, now);
@@ -989,6 +994,7 @@ void statusApi(uint32_t testToken = 0) {
   doc["mode"] = "FULL"; doc["firmware"] = firmwareinfo::kVersion;
   doc["firmwareModifiedOn"] = firmwareinfo::kModifiedOn;
   doc["phase"] = phaseName(); doc["relay"] = heaterOn();
+  doc["cooldownRegulated"] = true;
   doc["pauseMaintainsTemperature"] = phase == Phase::Paused && pauseHold.active;
   if (phase == Phase::Paused && pauseHold.active) doc["pauseTargetC"] = pauseHold.targetC;
   else doc["pauseTargetC"] = nullptr;
@@ -997,6 +1003,7 @@ void statusApi(uint32_t testToken = 0) {
   manualState["active"] = manualOperation && cycleActive() && manualSession.active();
   manualState["mode"] = manual::modeName(manualSession.mode);
   manualState["coolingToTarget"] = manualSession.coolingToTarget;
+  manualState["cooldownComplete"] = manualSession.cooldownComplete;
   if (std::isfinite(manualSession.target)) manualState["targetC"] = manualSession.target; else manualState["targetC"] = nullptr;
   manualState["elapsedSec"] = manualSession.elapsedMs(millis()) / 1000;
   manualState["startedAtMs"] = manualSession.startedAt;
@@ -1223,7 +1230,6 @@ void commandApi() {
         stepStartC, stepStarted, stepElapsedBefore)) { error(409, "Stato di pausa non valido"); return; }
     cycleReport.setPaused(now, false);
     phase = Phase::Running;
-    if (activeRecipe.steps[stepIndex].type == profile::Type::Cooldown) resetPid();
     setpointC = profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, 0);
     logEvent("CICLO", "Ciclo ripreso dalla temperatura di pausa; stesso step e rate del programma");
     telegramNotice("CICLO RIPRESO", "Ripresa dello stesso step dalla temperatura di pausa."); sampleAndControl(); statusApi(); return;
@@ -1299,9 +1305,12 @@ void manualApi() {
     if (!manualSession.cooldown(target, rate, millis())) {
       error(400, "Cooldown: target da 0 a 400 °C non superiore al setpoint e rate minimo 0,1 °C/min"); return;
     }
-    resetPid(); setpointC = manualSession.reference;
-    logEvent("MANUALE", "Cooldown manuale: verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; uscita spenta"); recordHistory(true);
-    telegramNotice("MANUALE · COOLDOWN", "Verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; riscaldamento spento.");
+    inhibitHeater(); duty = 0; setpointC = manualSession.reference;
+    sampleAndControl();
+    if (phase == Phase::Running) {
+      logEvent("MANUALE", "Cooldown manuale: verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; regolazione PID"); recordHistory(true);
+      telegramNotice("MANUALE · COOLDOWN", "Verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; PID segue la discesa.");
+    }
     statusApi(); return;
   }
   if (action != "start" && action != "target") { error(400, "Azione manuale sconosciuta"); return; }

@@ -55,12 +55,13 @@ int main() {
   assert(pause.resume(maintenance, 360000, origin, segmentAt, before));
   assert(profile::setpoint(maintenance, origin, 0) == 175);
 
-  // Cooldown resumes a descending passive reference, without raising it to the old reference.
+  // Cooldown resumes a descending reference, without raising it to the old reference.
   profile::Step cooldown{profile::Type::Cooldown, 25, 1, 0};
   assert(pause.begin(90, 370000, segmentAt, before));
   assert(pause.resume(cooldown, 390000, origin, segmentAt, before));
   assert(origin == 90 && profile::setpoint(cooldown, origin, 60000) == 89);
-  plan.heatingAllowed = false; OutputSupervisor passive; passive.publish(plan);
+  plan.heatingAllowed = false; plan.duty = pid.update(origin, origin + 1, 12, .02f, 50, 60, 65000, true);
+  assert(plan.duty == 0); OutputSupervisor passive; passive.publish(plan);
   passive.tick(65000, true, false); assert(!passive.relay);
 
   // Bounds, wrap, STOP, restart and the 12-hour safety timeout remain effective.

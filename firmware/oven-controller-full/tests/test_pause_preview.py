@@ -68,7 +68,7 @@ class PausePreviewTest(unittest.TestCase):
         self.device.advance(1)
         self.assertEqual(self.device.hold, earned + 1)
 
-    def test_cooldown_pause_regulates_then_resumes_passively_from_held_temperature(self):
+    def test_cooldown_pause_regulates_then_resumes_from_held_temperature(self):
         self.start(kind="cooldown", target=25, rate=1, actual=175)
         self.device.advance(10)
         self.post("pause")
@@ -78,6 +78,8 @@ class PausePreviewTest(unittest.TestCase):
         self.post("resume")
         self.device.advance(30)
         self.assertAlmostEqual(self.device.target, held - .5)
+        self.device.temperature = self.device.target + 2
+        self.device.advance_full(0)
         self.assertEqual(self.device.duty, 0)
         self.assertFalse(self.device.relay)
 

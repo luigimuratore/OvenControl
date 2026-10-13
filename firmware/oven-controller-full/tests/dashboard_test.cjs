@@ -187,17 +187,17 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!tooltip.hidden);
   assert(tooltip.textContent.includes('Media PT100: 22.0 °C'));
   assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
-  assert(tooltip.textContent.includes('Target − media PT100: +1.0 °C'));
-  for (const [actual, label] of [[24, '-1.0'], [23, '0.0'], [23.01, '0.0']]) {
+  assert(tooltip.textContent.includes('ΔT (media PT100 − target): -1.0 °C'));
+  for (const [actual, label] of [[24, '+1.0'], [23, '0.0'], [23.01, '0.0'], [22.99, '0.0']]) {
     run(`history[1].actual=${actual}; drawChart()`);
-    assert(tooltip.textContent.includes(`Target − media PT100: ${label} °C`));
+    assert(tooltip.textContent.includes(`ΔT (media PT100 − target): ${label} °C`));
   }
   run('history[1].target=NaN; drawChart()');
   assert(tooltip.textContent.includes('Media PT100: 23.0 °C'));
-  assert(!tooltip.textContent.includes('Target − media PT100'));
+  assert(!tooltip.textContent.includes('ΔT (media PT100 − target)'));
   run('history[1].target=23; history[1].actual=NaN; drawChart()');
   assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
-  assert(!tooltip.textContent.includes('Target − media PT100'));
+  assert(!tooltip.textContent.includes('ΔT (media PT100 − target)'));
   assert.equal(requestCount, requestsBeforeHover);
   assert(parseFloat(tooltip.style.left) >= 0 && parseFloat(tooltip.style.left) + tooltip.offsetWidth <= 600);
   chart.listeners.pointermove({clientX: 400, clientY: 150}); flushFrames();
@@ -218,7 +218,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   elements.get('testTempChart').listeners.pointermove({clientX: 100 + (48 + 9000 / 300000 * 1140) / 2, clientY:150}); flushFrames();
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #1: 32.0 °C'));
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #2: 33.0 °C'));
-  assert(!elements.get('testChartTooltip').textContent.includes('Target − media PT100'));
+  assert(!elements.get('testChartTooltip').textContent.includes('ΔT (media PT100 − target)'));
   assert.equal(requestCount, testRequests);
   run(`show('Dashboard')`);
 

@@ -143,10 +143,10 @@ function createChartInspector(canvas, tooltip, cursor) {
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
     if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
-      const difference = Number((point.target - point.actual).toFixed(1));
+      const difference = Number((point.actual - point.target).toFixed(1));
       const highlight = document.createElement('div');
       highlight.className = 'chart-tooltip-difference';
-      highlight.textContent = `Target − media PT100: ${difference > 0 ? '+' : ''}${temp(difference)} °C`;
+      highlight.textContent = `ΔT (media PT100 − target): ${difference > 0 ? '+' : ''}${temp(difference)} °C`;
       tooltip.append(highlight);
     }
     tooltip.hidden = cursor.hidden = false;

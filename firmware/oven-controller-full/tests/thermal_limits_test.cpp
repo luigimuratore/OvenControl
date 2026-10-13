@@ -24,6 +24,25 @@ int main() {
   assert(!thermal::belowHardLimit(415.0f));
   assert(!thermal::belowHardLimit(NAN));
 
+  // Difference is diagnostic only: it cannot invalidate healthy probes or
+  // create an InvalidPlan latch, including above both UI warning thresholds.
+  heater::Plan different;
+  different.cycleActive = different.heatingAllowed = true;
+  different.windowMs = 5000; different.duty = 30;
+  for (float delta : {10.0f, 10.1f, 20.0f, 20.1f, 70.0f}) {
+    assert(thermal::healthyPair(100, true, 100 + delta, true));
+    heater::Guard deltaGuard;
+    different.healthy = thermal::healthyPair(100, true, 100 + delta, true);
+    deltaGuard.publish(different);
+    assert(deltaGuard.tick(0) && deltaGuard.fault == heater::Fault::None);
+  }
+  assert(!thermal::healthyPair(100, false, 120, true));
+  assert(!thermal::healthyPair(100, true, 120, false));
+  assert(!thermal::healthyPair(100, true, 415, true));
+  assert(!thermal::healthyPair(415, true, 100, true));
+  assert(!thermal::healthyPair(NAN, true, 100, true));
+  assert(!thermal::healthyPair(100, true, NAN, true));
+
   const profile::Step ramp{profile::Type::Ramp, 400.0f, 10.0f, 0};
   assert(profile::setpoint(ramp, 20.0f, 38 * 60000UL) == 400.0f);
   assert(profile::setpoint(ramp, 20.0f, 40 * 60000UL) == 400.0f);
@@ -40,5 +59,5 @@ int main() {
   guard.publish(plan); assert(!guard.tick(0));
   assert(guard.fault == heater::Fault::InvalidPlan);
   plan.healthy = true; guard.publish(plan); assert(!guard.tick(0));
-  puts("OK: targets through 400 C, high-temperature profile, reading boundaries and absolute cutoff latch");
+  puts("OK: targets through 400 C, diagnostic delta, invalid probes, reading boundaries and absolute cutoff latch");
 }

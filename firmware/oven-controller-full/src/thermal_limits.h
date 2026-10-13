@@ -16,4 +16,9 @@ inline bool validReading(float c, bool diagnostic) {
 inline bool belowHardLimit(float c) {
   return std::isfinite(c) && c < kHardLimit;
 }
+inline bool healthyPair(float first, bool firstValid, float second, bool secondValid) {
+  // Probe difference is diagnostic only; each probe must still be valid and
+  // below the absolute cutoff. Check both explicitly, including nonfinite data.
+  return firstValid && secondValid && belowHardLimit(first) && belowHardLimit(second);
+}
 } // namespace thermal

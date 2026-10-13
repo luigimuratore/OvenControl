@@ -7,9 +7,15 @@ const root = path.resolve(__dirname, '..');
 const html = fs.readFileSync(path.join(root, 'data/index.html'), 'utf8');
 const elements = new Map(), strokes = [], texts = [], frames = [], preferences = new Map();
 function element() {
+  const classes = new Set();
   return {textContent: '', value: '', hidden: false, disabled: false, checked: false,
     style: {}, listeners: {}, offsetWidth: 180, offsetHeight: 70,
-    classList: {add() {}, remove() {}, toggle() {}}, addEventListener(name, handler) { this.listeners[name] = handler; }, append() {}, replaceChildren() {},
+    classList: {add(...names) { names.forEach(name => classes.add(name)); },
+      remove(...names) { names.forEach(name => classes.delete(name)); }, contains(name) { return classes.has(name); },
+      toggle(name, force) { const on = force === undefined ? !classes.has(name) : force;
+        if (on) classes.add(name); else classes.delete(name); return on; }},
+    addEventListener(name, handler) { this.listeners[name] = handler; },
+    append(...nodes) { this.textContent += nodes.map(node => typeof node === 'string' ? node : node.textContent).join(''); }, replaceChildren() {},
     getBoundingClientRect: () => ({left: 100, top: 100, width: 600, height: 210}),
     width: 1200, height: 420, clientWidth: 1200, clientHeight: 420,
     getContext() { return new Proxy({}, {get(target, key) {
@@ -21,6 +27,7 @@ function element() {
 }
 for (const match of html.matchAll(/<[^>]+\bid="([^"]+)"[^>]*>/g)) {
   const el = element(); el.id = match[1]; el.hidden = /\bhidden\b/.test(match[0]); elements.set(match[1], el);
+  const initial = match[0].match(/\bvalue="([^"]*)"/); if (initial) el.value = initial[1];
 }
 elements.get('chartSpan').value = '1800000';
 let now = 10000, fetchImpl, requestCount = 0;
@@ -57,6 +64,32 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run(`validateRecipes(${JSON.stringify(highRecipe(400))})`);
   assert.throws(() => run(`validateRecipes(${JSON.stringify(highRecipe(400.1))})`), /0–400/);
   assert.equal(elements.get('avgTemp').textContent, '30.1');
+  const deltaCard = elements.get('deltaCard').classList;
+  for (const [delta, warning, danger] of [[2.2,false,false],[10,false,false],[10.1,true,false],
+      [20,true,false],[20.1,false,true],[40,false,true],[5,false,false]]) {
+    run(`display({...latest,sensors:[100,${100 + delta}].map((c,i)=>({...latest.sensors[i],c,valid:true}))})`);
+    assert.equal(deltaCard.contains('delta-warning'), warning, `yellow at ${delta}`);
+    assert.equal(deltaCard.contains('delta-danger'), danger, `red at ${delta}`);
+  }
+  run(`display({...latest,sensors:[100,140].map((c,i)=>({...latest.sensors[i],c,valid:i===0}))})`);
+  assert.equal(elements.get('deltaTemp').textContent, '—');
+  assert(!deltaCard.contains('delta-warning') && !deltaCard.contains('delta-danger'));
+  run(`display(${JSON.stringify(status)})`);
+  run(`display({...latest,firmware:'full-1.6',firmwareModifiedOn:'2026-10-13'})`);
+  assert.equal(elements.get('firmwareInfo').textContent, 'Firmware full-1.6 · Ultima modifica: 13/10/2026');
+  run(`display({...latest,firmware:'LOCAL-PREVIEW',firmwareVersion:'full-1.6',preview:true})`);
+  assert.equal(elements.get('firmwareInfo').textContent, 'Anteprima locale · Firmware full-1.6 · Ultima modifica: 13/10/2026');
+  run(`display(${JSON.stringify(status)})`);
+  assert.equal(elements.get('firmwareInfo').textContent, 'Firmware — · Ultima modifica: non disponibile');
+  run(`display({...latest, workshopConfigured:true, workshopConnected:false, stationMac:'AA:BB:CC:DD:EE:FF',
+    wifi:{recoveryRunning:true, recoveryPaused:false, retryCount:2, retryInSec:30, statusCode:4,
+      lastDisconnectReason:202, lastDisconnectMessage:'Autenticazione rifiutata'}})`);
+  assert(elements.get('wifiDiagnostics').textContent.includes('202: Autenticazione rifiutata'));
+  assert(elements.get('wifiDiagnostics').textContent.includes('30 s'));
+  assert(elements.get('wifiDiagnostics').textContent.includes('AA:BB:CC:DD:EE:FF'));
+  run(`display({...latest, workshopConfigured:true, workshopConnected:true, stationMac:'AA:BB:CC:DD:EE:FF',
+    wifi:{recoveryRunning:true, retryCount:2, lastDisconnectReason:202, lastDisconnectMessage:'Autenticazione rifiutata'}})`);
+  assert(!elements.get('wifiDiagnostics').textContent.includes('Ultimo errore'));
   run(`display({...latest, stepRemainingSec:180, stepRemainingEstimated:true, lastCycleError:'Fault PT100',
     lastInterruption:{recorded:true, resetReason:9, upperBoundSec:90}})`);
   assert.equal(elements.get('stepDuration').textContent, '00:03:00');
@@ -77,7 +110,17 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(elements.get('outageInfo').textContent.includes('Durata sconosciuta'));
   run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120})`);
   assert.equal(elements.get('stepDuration').textContent, '00:02:00');
-  assert(elements.get('stepTimeHint').textContent.includes('±5'));
+  assert(elements.get('stepTimeHint').textContent.includes('pausa'));
+  run(`display({...latest, phase:'running', stepType:'ramp', stepFinalTarget:175, stepRate:10,
+    stepRemainingSec:6, stepWaitingForTemperature:true, stepTransitionToHold:true, stepCompletionBandC:5})`);
+  assert(elements.get('stepTimeHint').textContent.includes('entro ±5 °C per iniziare il mantenimento'));
+  assert.equal(elements.get('stepDuration').textContent, '00:00:06');
+  assert.equal(run(`remainingStepSeconds({phase:'running',stepType:'ramp',target:175,stepFinalTarget:175,
+    stepRate:10,stepTransitionToHold:true,stepCompletionBandC:5,sensors:[173.759,174.7651].map(c=>({c,valid:true}))})`), 0);
+  assert.equal(run(`remainingStepSeconds({phase:'running',stepType:'ramp',target:175,stepFinalTarget:175,
+    stepRate:10,stepTransitionToHold:true,stepCompletionBandC:5,sensors:[175,181].map(c=>({c,valid:true}))})`), 6);
+  run(`display({...latest, phase:'running', stepType:'hold', stepRemainingSec:120})`);
+  assert(elements.get('stepTimeHint').textContent.includes('banda ±5'));
   run(`display(${JSON.stringify(status)})`);
   // The new cycle begins at the left margin despite preceding measurements.
   run(`history = [{seq:1, ms:0, actual:24, target:NaN}, {seq:2, ms:600000, actual:30, target:30, marker:16}]; drawChart();`);
@@ -96,7 +139,9 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert.equal(run('chartStart'), 2600000);
 
   // Brief failures retain visibly stale temperatures; relay state becomes unknown immediately.
+  run('updateDeltaIndicator(25)');
   now += 2500; run('connectionLost()');
+  assert(deltaCard.contains('delta-danger'));
   assert.equal(elements.get('avgTemp').textContent, '30.1');
   assert(elements.get('statusText').textContent.includes('RITARDO'));
   assert.equal(elements.get('relayState').textContent, 'SCONOSCIUTO');
@@ -104,6 +149,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!elements.get('globalStop').disabled);
   now += 4000; run('connectionLost()');
   assert.equal(elements.get('avgTemp').textContent, '—');
+  assert(!deltaCard.contains('delta-warning') && !deltaCard.contains('delta-danger'));
   assert.equal(elements.get('statusText').textContent, 'ESP NON RAGGIUNGIBILE');
   run('display(latest)');
   assert.equal(elements.get('avgTemp').textContent, '30.1');
@@ -141,6 +187,17 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!tooltip.hidden);
   assert(tooltip.textContent.includes('Media PT100: 22.0 °C'));
   assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
+  assert(tooltip.textContent.includes('Target − media PT100: +1.0 °C'));
+  for (const [actual, label] of [[24, '-1.0'], [23, '0.0'], [23.01, '0.0']]) {
+    run(`history[1].actual=${actual}; drawChart()`);
+    assert(tooltip.textContent.includes(`Target − media PT100: ${label} °C`));
+  }
+  run('history[1].target=NaN; drawChart()');
+  assert(tooltip.textContent.includes('Media PT100: 23.0 °C'));
+  assert(!tooltip.textContent.includes('Target − media PT100'));
+  run('history[1].target=23; history[1].actual=NaN; drawChart()');
+  assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
+  assert(!tooltip.textContent.includes('Target − media PT100'));
   assert.equal(requestCount, requestsBeforeHover);
   assert(parseFloat(tooltip.style.left) >= 0 && parseFloat(tooltip.style.left) + tooltip.offsetWidth <= 600);
   chart.listeners.pointermove({clientX: 400, clientY: 150}); flushFrames();
@@ -161,8 +218,88 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   elements.get('testTempChart').listeners.pointermove({clientX: 100 + (48 + 9000 / 300000 * 1140) / 2, clientY:150}); flushFrames();
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #1: 32.0 °C'));
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #2: 33.0 °C'));
+  assert(!elements.get('testChartTooltip').textContent.includes('Target − media PT100'));
   assert.equal(requestCount, testRequests);
   run(`show('Dashboard')`);
+
+  // Manual has its own tab while sharing live measurements/history with the dashboard.
+  run("show('Manual')");
+  assert(!elements.get('manualControl').hidden && elements.get('programControls').hidden);
+  assert(!elements.get('dashboardView').hidden);
+  assert(elements.get('tabManual').classList.contains('active'));
+  run("show('Dashboard')");
+  assert(elements.get('manualControl').hidden && !elements.get('programControls').hidden);
+  run("show('Manual')");
+  // Manual regulation owns no program/steps; changing target keeps the same graph/session.
+  run(`display({...latest,phase:'idle',ready:true,cycleStartedAtMs:null,manual:{active:false,mode:'idle',targetC:null,elapsedSec:0}})`);
+  assert(elements.get('manualStart').disabled); // Operator confirmation is mandatory.
+  elements.get('manualHardwareReady').checked = true;
+  elements.get('manualTarget').value = '100'; run('updateControls()');
+  assert(!elements.get('manualStart').disabled);
+  for (const value of ['', '401', '-1', 'not-a-number']) {
+    elements.get('manualTarget').value = value; run('updateControls()');
+    assert(elements.get('manualStart').disabled);
+  }
+  elements.get('manualTarget').value = '100'; run('updateControls()');
+  for (const value of ['', '0', '.09', 'not-a-number']) {
+    elements.get('manualRate').value = value; run('updateControls()');
+    assert(elements.get('manualStart').disabled);
+  }
+  elements.get('manualRate').value = '2'; run('updateControls()');
+  const manualPosts = [];
+  fetchImpl = async (url, opts) => {
+    if (opts.method !== 'POST') return response({bootCount:1,events:[],samples:[],recipes:[]});
+    const body = JSON.parse(opts.body); manualPosts.push([url, body]);
+    const cooldown = body.action === 'cooldown';
+    return response({...status, phase: 'running',ready:true,stepCount:0,recipeName:'',
+      cycleStartedAtMs:620000, target:body.targetC,
+      manual:{active:true,mode:cooldown?'cooldown':'regulating',targetC:body.targetC,rateCMin:body.rateCMin,setpointC:body.targetC,elapsedSec:30,startedAtMs:620000}});
+  };
+  await run("manualCommand('start')");
+  assert.deepEqual(manualPosts[0], ['/api/manual', {action:'start',hardwareReady:true,targetC:100,rateCMin:2}]);
+  assert(elements.get('programControls').hidden);
+  assert.equal(elements.get('targetLabel').textContent, 'Setpoint manuale');
+  assert(elements.get('statusText').textContent.includes('MANUALE'));
+  assert.equal(elements.get('manualDuration').textContent, '00:00:30');
+  assert(!elements.get('manualApply').disabled && !elements.get('manualCooldown').disabled && !elements.get('manualStop').disabled);
+  assert(elements.get('savePid').disabled && elements.get('startBtn').disabled);
+  const manualAnchor = run('cycleAnchor');
+  elements.get('manualTarget').value = '150'; elements.get('manualTarget').oninput();
+  run('display(latest)'); assert.equal(elements.get('manualTarget').value, '150'); // Polling preserves a draft.
+  await run("manualCommand('target')");
+  assert.equal(manualPosts[1][1].targetC, 150);
+  assert.equal(manualPosts[1][1].rateCMin, 2);
+  assert.equal(run('cycleAnchor'), manualAnchor);
+  await run("manualCommand('cooldown')");
+  assert.equal(manualPosts[2][1].targetC, 25);
+  assert.equal(manualPosts[2][1].rateCMin, 2);
+  assert.equal(elements.get('manualAppliedTarget').textContent, '25.0 °C');
+  assert(elements.get('manualState').textContent.includes('COOLDOWN'));
+  assert(elements.get('manualCooldown').disabled);
+  assert(!elements.get('manualApply').disabled && !elements.get('manualStop').disabled);
+  const point = run('historyPoint([1,1000,30,31,50,10,19,255])');
+  assert.equal(point.step, null); assert.equal(point.operation, 'manual');
+  run('connectionLost()');
+  assert(elements.get('manualStart').disabled && elements.get('manualApply').disabled);
+  assert(!elements.get('globalStop').disabled);
+  // An emergency overtakes an in-flight manual start. Its late reply triggers a compensating STOP.
+  let finishManual;
+  const safetyPosts = [];
+  fetchImpl = (url, opts) => {
+    if (opts.method !== 'POST') return Promise.resolve(response(url === '/api/status' ?
+      {...status,phase:'fault',emergency:true,manual:{active:false,mode:'idle'}} : {events:[],samples:[],bootCount:1}));
+    const body = JSON.parse(opts.body); safetyPosts.push([url,body.action]);
+    if (url === '/api/manual') return new Promise(resolve => { finishManual = resolve; });
+    return Promise.resolve(response({...status,phase:'fault',emergency:true,manual:{active:false,mode:'idle'}}));
+  };
+  run('display({...latest,phase:"idle",ready:true,emergency:false,manual:{active:false,mode:"idle"}})');
+  const pendingManual = run("manualCommand('start')");
+  await run("command('emergency')");
+  finishManual(response({...status,manual:{active:true,mode:'regulating'}}));
+  await pendingManual; await flush();
+  assert(safetyPosts.some(([url,action])=>url === '/api/command' && action === 'emergency'));
+  assert(safetyPosts.some(([url,action])=>url === '/api/command' && action === 'stop'));
+  assert.equal(run('latest.emergency'), true);
 
   // Reads are serialized, status jumps ahead of history, and STOP bypasses reads.
   await flush();

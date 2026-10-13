@@ -1,4 +1,5 @@
 import copy
+from collections import deque
 import importlib.util
 import io
 import json
@@ -58,10 +59,21 @@ class CommandsTest(unittest.TestCase):
         with self.assertRaises(tool.TelegramError):
             guide.send(api, 42)
         guide.send(api, 42)
-        api.send.assert_called_once_with(42, tool.GUIDE_TEXT + "\n\nANTEPRIMA SIMULATA")
+        api.send.assert_called_once_with(42, tool.guide_text("sintetica"), reply_markup=tool.mode_keyboard())
         self.assertEqual(api.call.call_count, 2)
         api.call.assert_called_with("pinChatMessage", chat_id=42, message_id=123, disable_notification=True)
-        self.assertLess(len((tool.GUIDE_TEXT + "\n\nANTEPRIMA SIMULATA").encode()), 2399)
+        self.assertLess(len(tool.guide_text("dettagliata").encode()), 2399)
+
+    def test_modes_and_buttons_require_the_same_private_fresh_authorization(self):
+        commands = tool.Commands(42)
+        texts = ["/modalita", "/essenziale", "/sintetica", "/dettagliata", *tool.MODE_BUTTONS]
+        valid = [update(i + 1, text) for i, text in enumerate(texts)]
+        expected = [tool.MODE_BUTTONS.get(text, text) for text in texts]
+        self.assertEqual(commands.consume(valid, 100), expected)
+        invalid = [update(20, "/essenziale", chat=43), update(21, "/dettagliata", sender=43),
+                   update(22, "/sintetica", kind="group"), update(23, "/essenziale", date=1),
+                   update(24, "/essenziale extra")]
+        self.assertEqual(commands.consume(invalid, 220), [])
 
     def test_pairing_requires_nonce_and_new_private_message(self):
         self.assertEqual(tool.pairing_chat(update(1, "/start secret")["message"], "secret", 100), 42)
@@ -212,6 +224,138 @@ class ConfigAndApiTest(unittest.TestCase):
                               ("huge.pdf", b"%PDF-" + b"x" * 1048576)]:
             with self.assertRaises(ValueError):
                 tool.TelegramApi(TOKEN).send_document(42, filename, pdf)
+
+
+class DocumentDeliveryTest(unittest.TestCase):
+    def document(self):
+        return (-1, 0, dict(filename="Stopped_Prova.pdf", pdf=b"%PDF-1.4\nreport", caption="report"), False)
+
+    def test_accepted_upload_with_lost_reply_is_not_sent_nine_times(self):
+        item = self.document()
+        alarm = (2, 1, "🚨 EMERGENZA", True)
+        pending = deque([item, alarm])
+        api = tool.TelegramApi(TOKEN)
+        # The HTTP request succeeded, but reading its confirmation timed out.
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.side_effect = TimeoutError()
+        with patch.object(tool, "urlopen", return_value=response) as upload:
+            warning = tool.deliver_pending(api, 42, pending, item)
+            for _ in range(9):
+                if item in pending:
+                    tool.deliver_pending(api, 42, pending, item)
+        upload.assert_called_once()
+        self.assertIn("non verrà reinviato", warning)
+        self.assertEqual(list(pending), [alarm])
+
+    def test_confirmed_document_is_removed_once_and_next_cycle_still_sends(self):
+        api = tool.TelegramApi(TOKEN)
+        first = self.document()
+        second = (-1, 1, dict(first[2], filename="Completed_Altro.pdf"), False)
+        pending = deque([first, second])
+        with patch.object(tool, "urlopen", side_effect=lambda *a, **k: io.BytesIO(b'{"ok":true,"result":{"message_id":91}}')) as upload:
+            self.assertIsNone(tool.deliver_pending(api, 42, pending, first))
+            self.assertIsNone(tool.deliver_pending(api, 42, pending, second))
+        self.assertEqual(upload.call_count, 2)
+        self.assertFalse(pending)
+
+    def test_explicit_rate_limit_retries_same_pdf_then_consumes_it(self):
+        api = tool.TelegramApi(TOKEN)
+        item = self.document(); pending = deque([item])
+        rejected = HTTPError("https://redacted/sendDocument", 429, "Limited", {},
+                             io.BytesIO(b'{"ok":false,"parameters":{"retry_after":90}}'))
+        with patch.object(tool, "urlopen", side_effect=[rejected, io.BytesIO(b'{"ok":true,"result":{"message_id":92}}')]) as upload:
+            with self.assertRaises(tool.TelegramError) as captured:
+                tool.deliver_pending(api, 42, pending, item)
+            self.assertEqual(captured.exception.retry_after, 90)
+            self.assertFalse(captured.exception.delivery_uncertain)
+            self.assertEqual(list(pending), [item])
+            self.assertIsNone(tool.deliver_pending(api, 42, pending, item))
+        self.assertEqual(upload.call_count, 2)
+        self.assertFalse(pending)
+
+    def test_permanent_or_ambiguous_errors_cannot_loop_the_document(self):
+        for code in (400, 401, 403, 500, 503):
+            with self.subTest(code=code):
+                api = tool.TelegramApi(TOKEN)
+                item = self.document(); pending = deque([item])
+                error = HTTPError("https://redacted/sendDocument", code, "Rejected", {}, io.BytesIO(b'{"ok":false}'))
+                with patch.object(tool, "urlopen", side_effect=error) as upload:
+                    warning = tool.deliver_pending(api, 42, pending, item)
+                upload.assert_called_once()
+                self.assertFalse(pending)
+                self.assertIn("non verrà reinviato" if code >= 500 else "rifiutato", warning)
+
+    def test_invalid_or_missing_confirmation_is_uncertain_not_retryable(self):
+        for raw in (b'{"ok":true', b'{"ok":true,"result":{}}', b'{"ok":true,"result":{"message_id":0}}'):
+            with self.subTest(raw=raw), patch.object(tool, "urlopen", return_value=io.BytesIO(raw)):
+                with self.assertRaises(tool.TelegramError) as captured:
+                    tool.TelegramApi(TOKEN).send_document(42, **self.document()[2])
+            self.assertTrue(captured.exception.delivery_uncertain)
+            self.assertFalse(captured.exception.retryable)
+
+
+class NotificationModeTest(unittest.TestCase):
+    def test_mode_persists_privately_and_failed_write_keeps_previous_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            settings = tool.NotificationSettings(42, path)
+            self.assertEqual(settings.mode, "sintetica")
+            self.assertTrue(settings.select("essenziale"))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(tool.NotificationSettings(42, path).mode, "essenziale")
+            self.assertEqual(tool.NotificationSettings(43, path).mode, "sintetica")
+            with patch.object(tool.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    settings.select("dettagliata")
+            self.assertEqual(settings.mode, "essenziale")
+            self.assertEqual(tool.NotificationSettings(42, path).mode, "essenziale")
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+            self.assertFalse(settings.select("essenziale"))
+            self.assertTrue(settings.select("sintetica"))
+            self.assertEqual(tool.NotificationSettings(42, path).mode, "sintetica")
+            with self.assertRaises(ValueError):
+                settings.select("off")
+
+    def test_modes_filter_routines_but_keep_all_alarms_and_status(self):
+        device = preview.DemoDevice("full", speed=1)
+        device.request("POST", "command", body=dict(action="start", hardwareReady=True, recipeId=device.recipes[0]["id"]))
+        status = device.status()
+        for title in ("CICLO AVVIATO", "STOP", "CICLO IN PAUSA", "CICLO RIPRESO", "CICLO COMPLETATO"):
+            self.assertIsNone(tool.format_notice(title, status=status, mode="essenziale"))
+            brief = tool.format_notice(title, status=status, mode="sintetica")
+            detailed = tool.format_notice(title, status=status, mode="dettagliata")
+            self.assertIn("Programma:", brief)
+            self.assertNotIn("PT100 #1:", brief)
+            for field in ("PT100 #1:", "PID: Kp", "Target istantaneo:"):
+                self.assertIn(field, detailed)
+        for mode in tool.MODE_LABELS:
+            for title in ("EMERGENZA", "ALLARME FORNO", "BLACKOUT · ALIMENTAZIONE RIPRISTINATA"):
+                critical = tool.format_notice(title, "Uscita spenta", status, True, mode=mode)
+                self.assertIn("Motivo: Uscita spenta", critical)
+                self.assertIn("PT100 #1:", critical)
+            self.assertIn("PT100 #1:", tool.format_status(status, mode))
+            self.assertIn("Modalità notifiche: " + tool.MODE_LABELS[mode], tool.format_status(status, mode))
+
+    def test_essential_selection_discards_only_pending_routine_events(self):
+        pending = tool.deque([(0, 1, "old start", True), (2, 2, "alarm", True),
+                              (-1, 3, {"pdf": b"%PDF"}, False), (1, 4, "status reply", False),
+                              (0, 5, tool.GuideMessage(), False)])
+        tool.discard_routine_events(pending)
+        self.assertEqual(len(pending), 4)
+        self.assertEqual(pending[0][2], "alarm")
+        self.assertIn("pdf", pending[1][2])
+        self.assertEqual(pending[2][2], "status reply")
+        self.assertIsInstance(pending[3][2], tool.GuideMessage)
+
+    def test_mode_keyboard_and_confirmation_are_silent(self):
+        captured = []
+        api = tool.TelegramApi(TOKEN)
+        with patch.object(api, "call", side_effect=lambda method, **payload: captured.append(payload)):
+            api.send(42, tool.mode_menu("essenziale"), reply_markup=tool.mode_keyboard())
+        self.assertTrue(captured[0]["disable_notification"])
+        self.assertEqual(captured[0]["reply_markup"]["keyboard"][0], ["🛡️ Essenziale", "🔔 Sintetica"])
+        self.assertTrue(captured[0]["reply_markup"]["is_persistent"])
 
 
 class PreviewTest(unittest.TestCase):

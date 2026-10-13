@@ -2,6 +2,7 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -17,10 +18,17 @@
 #define WORKSHOP_WIFI_SSID ""
 #define WORKSHOP_WIFI_PASSWORD ""
 #endif
+#if __has_include("ota_config.h")
+#include "ota_config.h"
+#endif
+#ifndef OVEN_OTA_PASSWORD
+#define OVEN_OTA_PASSWORD ""
+#endif
 
 constexpr char AP_SSID[] = "OvenController-FieldTest";
 constexpr char AP_PASSWORD[] = "oven12345";
 constexpr char MDNS_HOST[] = "oven-field-test";
+constexpr uint16_t OTA_PORT = 3232;
 constexpr uint32_t SAMPLE_MS = 500, HISTORY_MS = 1000;
 constexpr size_t HISTORY_CAP = 3600, HISTORY_PAGE = 300, LOG_CAP = 128;
 Adafruit_MAX31865 rtd1(PIN_CS1), rtd2(PIN_CS2);
@@ -31,6 +39,7 @@ portMUX_TYPE outputMux = portMUX_INITIALIZER_UNLOCKED;
 uint32_t ownerToken = 0;
 bool serverReady = false, apReady = false, mdnsReady = false;
 bool wasConnected = false, interrupted = false, activeSaved = false;
+bool otaEnabled = false, otaUpdating = false;
 uint32_t bootCount = 0, lastSample = 0, sampleAt = 0, lastHistory = 0, lastNetwork = 0, lastChip = 0;
 float chipC = NAN;
 String resetReason, lastStationIp;
@@ -50,7 +59,7 @@ QueueHandle_t outputNotices;
 
 const char *modeName(TestMode mode) {
   switch (mode) {
-    case TestMode::RelayPulse: return "Impulso rele";
+    case TestMode::RelayPulse: return "Rele temporizzato";
     case TestMode::RelaySequence: return "Rele: 3 impulsi";
     case TestMode::LedGreen: return "LED verde";
     case TestMode::LedRed: return "LED rosso";
@@ -87,8 +96,10 @@ void outputTask(void *) {
   for (;;) {
     portENTER_CRITICAL(&outputMux);
     TestMode previousMode = outputs.mode;
-    TestEvent event = outputs.tick(millis(), serverReady);
-    if (!outputs.armed) ownerToken = 0;
+    TestEvent event = TestEvent::None;
+    if (otaUpdating) outputs.stop();
+    else event = outputs.tick(millis(), serverReady);
+    if (outputs.mode == TestMode::Idle) ownerToken = 0;
     writeOutputs();
     OutputNotice notice{event, previousMode, outputs.relay, outputs.red, outputs.green};
     portEXIT_CRITICAL(&outputMux);
@@ -108,16 +119,46 @@ void stopOutputs(const String &why) {
   logEvent("STOP", why);
 }
 
+void setupOta() {
+  if (!OVEN_OTA_PASSWORD[0]) {
+    logEvent("OTA", "OTA disabilitato: configura la password in include/ota_config.h");
+    return;
+  }
+  ArduinoOTA.setHostname(MDNS_HOST);
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setPassword(OVEN_OTA_PASSWORD);
+  // mDNS is shared with the dashboard and managed by updateNetwork().
+  ArduinoOTA.setMdnsEnabled(false);
+  ArduinoOTA.onStart([] {
+    portENTER_CRITICAL(&outputMux);
+    otaUpdating = true; outputs.stop(); ownerToken = 0; writeOutputs();
+    portEXIT_CRITICAL(&outputMux);
+    prefs.putBool("active", false); activeSaved = false;
+    logEvent("OTA", "Aggiornamento avviato: uscite spente e test disabilitati");
+  });
+  ArduinoOTA.onEnd([] {
+    logEvent("OTA", "Aggiornamento completato: riavvio con rele spento");
+    // Keep the output lock until ArduinoOTA reboots the board.
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    stopOutputs("Aggiornamento OTA fallito: uscite spente");
+    portENTER_CRITICAL(&outputMux); otaUpdating = false; portEXIT_CRITICAL(&outputMux);
+    logEvent("OTA", "Errore aggiornamento, codice " + String(static_cast<unsigned>(error)));
+  });
+  ArduinoOTA.begin();
+  otaEnabled = true;
+  logEvent("OTA", "Upload Wi-Fi con password attivo, porta " + String(OTA_PORT));
+}
+
 void drainOutputNotices() {
   OutputNotice notice;
   while (xQueueReceive(outputNotices, &notice, 0) == pdTRUE) {
     if (notice.event == TestEvent::Completed) logEvent("TEST", String(modeName(notice.previous)) + ": terminato automaticamente");
-    if (notice.event == TestEvent::ConnectionLost) logEvent("STOP", "Heartbeat assente da 2,5 s: test fermato e comandi disabilitati");
-    if (notice.event == TestEvent::ArmExpired) logEvent("STOP", "Abilitazione scaduta dopo 60 s: test fermato");
+    if (notice.event == TestEvent::ConnectionLost) logEvent("STOP", "Heartbeat assente da 2,5 s: test fermato");
     logEvent("GPIO", String("Comando rele ") + (notice.relay ? "ON" : "OFF") +
              "; rosso " + (notice.red ? "ON" : "OFF") + "; verde " + (notice.green ? "ON" : "OFF"));
   }
-  if (activeSaved && !outputSnapshot().armed) { prefs.putBool("active", false); activeSaved = false; }
+  if (activeSaved && outputSnapshot().mode == TestMode::Idle) { prefs.putBool("active", false); activeSaved = false; }
 }
 
 String sensorMessage(const Sensor &s) {
@@ -169,18 +210,20 @@ void sendJson(int code, const JsonDocument &doc) {
 }
 void sendError(int code, const char *message) { JsonDocument doc; doc["error"] = message; sendJson(code, doc); }
 
-void statusApi() {
+void statusApi(uint32_t testToken = 0) {
   auto state = outputSnapshot();
   JsonDocument doc;
   const uint32_t now = millis();
   doc["firmware"] = "field-test-1.0"; doc["bootCount"] = bootCount;
   doc["uptimeMs"] = now; doc["sampleAtMs"] = sampleAt;
   doc["resetReason"] = resetReason; doc["interrupted"] = interrupted;
-  doc["armed"] = state.armed; doc["armRemainingMs"] = state.armRemaining(now);
+  if (testToken) doc["token"] = testToken;
   doc["running"] = state.mode != TestMode::Idle; doc["test"] = modeName(state.mode);
   doc["remainingMs"] = state.remaining(now);
   doc["relay"] = state.relay; doc["red"] = state.red; doc["green"] = state.green;
   doc["leaseMs"] = OutputTest::LEASE_MS;
+  doc["otaEnabled"] = otaEnabled; doc["otaUpdating"] = otaUpdating;
+  doc["otaHostname"] = MDNS_HOST; doc["otaPort"] = OTA_PORT;
   doc["workshopConfigured"] = WORKSHOP_WIFI_SSID[0] != '\0';
   doc["workshopConnected"] = WiFi.status() == WL_CONNECTED;
   doc["stationIp"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "";
@@ -208,21 +251,8 @@ void commandApi() {
     sendError(400, "Richiesta JSON non valida"); return;
   }
   String action = input["action"].as<String>();
-  if (action == "stop") { stopOutputs("STOP manuale: uscita spenta, test disabilitati"); statusApi(); return; }
-  if (action == "arm") {
-    if (!input["loadsDisconnected"].is<bool>() || !input["loadsDisconnected"].as<bool>()) {
-      sendError(400, "Conferma che le resistenze reali siano scollegate"); return;
-    }
-    const uint32_t token = esp_random() | 1U;
-    portENTER_CRITICAL(&outputMux);
-    const bool busy = outputs.armed;
-    if (!busy) { outputs.arm(millis()); ownerToken = token; writeOutputs(); }
-    portEXIT_CRITICAL(&outputMux);
-    if (busy) { sendError(409, "Test gia abilitati da una dashboard: premi STOP per liberarli"); return; }
-    prefs.putBool("active", true); activeSaved = true;
-    logEvent("TEST", "Test abilitati per 60 s con resistenze dichiarate scollegate; heartbeat richiesto");
-    JsonDocument reply; reply["token"] = token; sendJson(200, reply); return;
-  }
+  if (action == "stop") { stopOutputs("STOP manuale: uscita spenta"); statusApi(); return; }
+  if (otaUpdating) { sendError(503, "Aggiornamento OTA in corso: test disabilitati"); return; }
   TestMode mode = TestMode::Idle;
   if (action == "relayPulse") mode = TestMode::RelayPulse;
   else if (action == "relaySequence") mode = TestMode::RelaySequence;
@@ -234,22 +264,22 @@ void commandApi() {
   else { sendError(400, "Azione sconosciuta"); return; }
   uint32_t duration = 1000;
   if (mode == TestMode::RelayPulse) {
-    if (!input["durationMs"].is<uint32_t>()) { sendError(400, "Durata intera richiesta (100..5000 ms)"); return; }
+    if (!input["durationMs"].is<uint32_t>()) { sendError(400, "Durata intera richiesta in ms"); return; }
     duration = input["durationMs"].as<uint32_t>();
-    if (duration < 100 || duration > 5000) { sendError(400, "Durata ammessa 100..5000 ms"); return; }
+    if (!OutputTest::validRelayDuration(duration)) {
+      sendError(400, "Durata ammessa: 100..5000 ms, 30 s, 1 min, 2 min o 10 min"); return;
+    }
   }
-  if (!input["token"].is<uint32_t>()) { sendError(403, "Abilita prima i test da questa dashboard"); return; }
-  const uint32_t token = input["token"].as<uint32_t>();
+  const uint32_t token = esp_random() | 1U;
   portENTER_CRITICAL(&outputMux);
-  const bool owned = token != 0 && token == ownerToken && outputs.armed;
-  const bool started = owned && outputs.start(mode, millis(), duration);
-  if (started) writeOutputs();
+  const bool started = outputs.start(mode, millis(), duration);
+  if (started) { ownerToken = token; writeOutputs(); }
   portEXIT_CRITICAL(&outputMux);
-  if (!owned) { sendError(403, "Abilitazione assente, scaduta o appartenente a un'altra dashboard"); return; }
-  if (!started) { sendError(409, "Test in corso o abilitazione scaduta: attendi o premi STOP"); return; }
+  if (!started) { sendError(409, "Test in corso: attendi o premi STOP"); return; }
+  prefs.putBool("active", true); activeSaved = true;
   logEvent("TEST", String(modeName(mode)) + (mode == TestMode::RelayPulse ? " " + String(duration) + " ms" : "") +
            "; nessun feedback fisico dell'uscita");
-  statusApi();
+  statusApi(token);
 }
 
 void heartbeatApi() {
@@ -259,7 +289,7 @@ void heartbeatApi() {
   portENTER_CRITICAL(&outputMux);
   bool ok = token != 0 && token == ownerToken && outputs.heartbeat(millis());
   portEXIT_CRITICAL(&outputMux);
-  if (!ok) { sendError(403, "Abilitazione scaduta: test fermati"); return; }
+  if (!ok) { sendError(403, "Test terminato o appartenente a un'altra dashboard"); return; }
   server.sendHeader("Cache-Control", "no-store"); server.send(204);
 }
 
@@ -298,13 +328,18 @@ void updateNetwork() {
   if (uint32_t(millis() - lastNetwork) < 1000) return;
   lastNetwork = millis();
   const bool connected = WiFi.status() == WL_CONNECTED;
+  if (!mdnsReady && (apReady || connected)) {
+    mdnsReady = MDNS.begin(MDNS_HOST);
+    if (mdnsReady) {
+      MDNS.addService("http", "tcp", 80);
+      if (otaEnabled) MDNS.enableArduino(OTA_PORT, true);
+    }
+  }
   if (connected && (!wasConnected || lastStationIp != WiFi.localIP().toString())) {
     lastStationIp = WiFi.localIP().toString();
-    if (!mdnsReady) { mdnsReady = MDNS.begin(MDNS_HOST); if (mdnsReady) MDNS.addService("http", "tcp", 80); }
     logEvent("RETE", "Dashboard capannone: http://" + lastStationIp + "/");
   }
   if (!connected && wasConnected) {
-    if (mdnsReady) { MDNS.end(); mdnsReady = false; }
     logEvent("RETE", "Wi-Fi capannone disconnesso; rete diretta disponibile");
   }
   wasConnected = connected;
@@ -326,7 +361,7 @@ void setup() {
   bootCount = prefs.getUInt("boots", 0) + 1; prefs.putUInt("boots", bootCount);
   resetReason = String(esp_reset_reason());
   logEvent("AVVIO", "Firmware diagnostico; rele spento; reset codice " + resetReason);
-  if (interrupted) logEvent("STOP", "Abilitazione/test interrotto da reset o alimentazione: nessuna ripresa automatica");
+  if (interrupted) logEvent("STOP", "Test interrotto da reset o alimentazione: nessuna ripresa automatica");
   pinMode(PIN_CS1, OUTPUT); digitalWrite(PIN_CS1, HIGH);
   pinMode(PIN_CS2, OUTPUT); digitalWrite(PIN_CS2, HIGH);
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, -1);
@@ -338,10 +373,11 @@ void setup() {
   if (apReady) logEvent("RETE", String(AP_SSID) + ": http://" + WiFi.softAPIP().toString() + "/");
   else logEvent("ERRORE", "Access Point non avviato");
   if (WORKSHOP_WIFI_SSID[0]) { WiFi.setAutoReconnect(true); WiFi.begin(WORKSHOP_WIFI_SSID, WORKSHOP_WIFI_PASSWORD); }
+  setupOta();
   server.on("/", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html; charset=utf-8", WEB_HTML); });
   server.on("/style.css", HTTP_GET, [] { server.send_P(200, "text/css; charset=utf-8", WEB_CSS); });
   server.on("/app.js", HTTP_GET, [] { server.send_P(200, "application/javascript; charset=utf-8", WEB_JS); });
-  server.on("/api/status", HTTP_GET, statusApi); server.on("/api/command", HTTP_POST, commandApi);
+  server.on("/api/status", HTTP_GET, [] { statusApi(); }); server.on("/api/command", HTTP_POST, commandApi);
   server.on("/api/heartbeat", HTTP_POST, heartbeatApi);
   server.on("/api/logs", HTTP_GET, logsApi); server.on("/api/history", HTTP_GET, historyApi);
   server.onNotFound([] { sendError(404, "Percorso non trovato"); });
@@ -353,6 +389,8 @@ void setup() {
 void loop() {
   // GPIO deadlines run independently in outputTask, including during slow HTTP/SPI operations.
   drainOutputNotices();
+  if (otaEnabled) ArduinoOTA.handle();
+  if (otaUpdating) { delay(5); return; }
   server.handleClient(); updateNetwork();
   if (!lastSample || uint32_t(millis() - lastSample) >= SAMPLE_MS) {
     lastSample = millis();

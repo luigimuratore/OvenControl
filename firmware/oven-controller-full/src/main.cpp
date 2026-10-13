@@ -12,7 +12,10 @@
 #include <nvs.h>
 #include <cmath>
 #include <ctime>
+#include <atomic>
 #include "profile.h"
+#include "pid_control.h"
+#include "manual_control.h"
 #include "cycle_report.h"
 #include "report_curve.h"
 #include "output_supervisor.h"
@@ -21,7 +24,9 @@
 #include "thermal_limits.h"
 #include "telegram_service.h"
 #include "power_recovery.h"
+#include "wifi_recovery.h"
 #include "hardware_config.h"
+#include "firmware_version.h"
 #include "web_assets.h"
 #if __has_include("wifi_config.h")
 #include "wifi_config.h"
@@ -49,7 +54,6 @@ TelegramService telegramBot;
 // ESP32-S3 N16R8; GPIO35/36 are occupied by PSRAM on this module.
 constexpr int CS1 = PIN_CS1, CS2 = PIN_CS2;
 constexpr int HEAT = PIN_RELAY, RED = PIN_RED, GREEN = PIN_GREEN;
-constexpr float MAX_DELTA = 10.0f;
 constexpr float MAX_TARGET_OVERSHOOT = 8.0f;
 constexpr uint32_t SAMPLE_MS = 500, HISTORY_MS = 10000;
 constexpr uint32_t CHECKPOINT_MS = 30000, MAX_CYCLE_MS = 12UL * 3600000UL;
@@ -117,6 +121,11 @@ Phase phase = Phase::Idle;
 bool cycleStopped = false;
 bool relayOn = false, apReady = false, ntpStarted = false, ntpSynced = false;
 bool mdnsReady = false, stationWasConnected = false, sensorFaultLogged = false;
+std::atomic<bool> wifiRecoveryRunning{false}, wifiRecoveryAllowed{true};
+std::atomic<uint32_t> wifiRetryCount{0}, wifiRetryWaitMs{0}, wifiReasonSeq{0};
+std::atomic<unsigned> wifiLastReason{0};
+std::atomic<bool> wifiLastRetryAccepted{true};
+uint32_t wifiLoggedReasonSeq = 0, wifiLoggedRetryCount = 0, lastNtpAttempt = 0;
 bool hadInterrupted = false, checkpointWriteFaultLogged = false;
 bool powerRestored = false, bootNoticePending = false;
 recovery::Cause bootCause = recovery::Cause::Other;
@@ -130,12 +139,15 @@ float chipTemperatureC = NAN;
 uint32_t lastChipTemperatureAt = 0;
 String stationIp, faultText, resetReason, lastCycleError;
 String interruptedProgram;
-float setpointC = NAN, duty = 0, integral = 0, derivative = 0, previousMean = NAN;
+float setpointC = NAN, duty = 0;
+regulation::Pid pidController;
+manual::Session manualSession;
+bool manualOperation = false;
 float kp = 12.0f, ki = 0.015f, kd = 50.0f;
 float stepStartC = NAN;
 uint8_t stepIndex = 0;
 uint32_t stepStarted = 0, cycleStarted = 0, pausedAt = 0, holdInBandMs = 0;
-uint32_t previousControlAt = 0, windowStarted = 0, lastSampleAt = 0, lastHistoryAt = 0;
+uint32_t windowStarted = 0, lastSampleAt = 0, lastHistoryAt = 0;
 uint32_t lastNetworkCheck = 0, lastPidLog = 0, lastLagLog = 0, checkpointAt = 0;
 uint32_t sampleAtMs = 0, bootCount = 0, eventSeq = 0, persistedSeq = 0;
 uint64_t previousCheckpoint = 0, outageUpperBoundSec = 0;
@@ -208,6 +220,41 @@ bool heaterOn() { return outputSnapshot().relay; }
 heater::Fault heaterFault() { return outputSnapshot().guard.fault; }
 bool diagnosticMode() { return outputSnapshot().diagnostic; }
 bool cycleActive() { return phase == Phase::Running || phase == Phase::Paused; }
+bool heatingOperation() {
+  if (phase != Phase::Running || !std::isfinite(setpointC)) return false;
+  if (manualOperation) return manualSession.heatingAllowed();
+  return stepIndex < activeRecipe.count && activeRecipe.steps[stepIndex].type != profile::Type::Cooldown;
+}
+const profile::Step *followingStep() {
+  return stepIndex + 1 < activeRecipe.count ? &activeRecipe.steps[stepIndex + 1] : nullptr;
+}
+bool workshopReady() { return WiFi.status() == WL_CONNECTED && uint32_t(WiFi.localIP()) != 0; }
+void wifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    const unsigned reason = info.wifi_sta_disconnected.reason ? info.wifi_sta_disconnected.reason : 1;
+    // Reconnect explicitly requests a local disconnect (reason 8). Retain
+    // the original failure rather than replacing it with our recovery action.
+    if (reason != 8) { wifiLastReason = reason; ++wifiReasonSeq; }
+  }
+}
+void wifiRecoveryTask(void *) {
+  network::RetryPlan plan; plan.begin(millis());
+  for (;;) {
+    const uint32_t now = millis(); const bool connected = workshopReady();
+    const auto action = plan.tick(now, connected, wifiRecoveryAllowed.load());
+    wifiRetryWaitMs = connected ? 0 : plan.waitMs(now);
+    if (action != network::Action::None && !workshopReady() && wifiRecoveryAllowed.load()) {
+      bool accepted;
+      if (action == network::Action::Reconfigure || !(WiFi.getMode() & WIFI_MODE_STA)) {
+        // Station only: keep the direct AP and keep credentials out of NVS.
+        const auto status = WiFi.begin(WORKSHOP_WIFI_SSID, WORKSHOP_WIFI_PASSWORD, 0, nullptr, true);
+        accepted = status != WL_CONNECT_FAILED && status != WL_NO_SHIELD;
+      } else accepted = WiFi.reconnect();
+      wifiLastRetryAccepted = accepted; ++wifiRetryCount;
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
 void writeOutputs() {
   // Caller holds heaterMux; only this supervisor owns the GPIOs.
   digitalWrite(HEAT, outputs.relay == RELAY_ACTIVE_HIGH ? HIGH : LOW);
@@ -261,8 +308,7 @@ const char *testModeName(TestMode mode) {
   }
 }
 void resetPid() {
-  duty = integral = derivative = 0;
-  previousMean = NAN; previousControlAt = 0; windowStarted = millis();
+  duty = 0; pidController.reset(); windowStarted = millis();
   inhibitHeater();
 }
 void recordHistory(bool force = false, uint8_t eventFlag = 0);
@@ -271,8 +317,25 @@ String telegramStatus();
 void telegramNotice(const String &title, const String &reason = "", bool critical = false);
 void stopCycle(Phase next, const String &reason) {
   const float finalReference = setpointC;
-  inhibitHeater(); duty = 0;
+  resetPid();
   if (next == Phase::Fault) faultText = reason;
+  if (manualOperation && cycleActive()) {
+    manualSession.stop(millis()); phase = next; setpointC = NAN; cycleStopped = false;
+    if (next == Phase::Fault) { lastCycleError = reason.substring(0, 240); prefs.putString("cycleError", lastCycleError); }
+    const bool saved = recoveryJournal.finish(recoveryStore);
+    const bool legacySaved = prefs.putBool("active", false) == sizeof(bool);
+    if (!saved || !legacySaved) {
+      portENTER_CRITICAL(&heaterMux); outputs.blockRecovery(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+      recoveryJournal.data.pending = true; phase = Phase::Fault;
+      faultText = "Registro di sicurezza non salvato: uscite bloccate; riconoscimento richiesto";
+      logEvent("ALLARME", faultText, false); telegramNotice("ALLARME MEMORIA DI SICUREZZA", faultText, true);
+    }
+    logEvent(next == Phase::Fault ? "ALLARME" : "MANUALE", reason);
+    recordHistory(true, next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
+    if (!outputSnapshot().emergency && saved && legacySaved)
+      telegramNotice(next == Phase::Fault ? "ALLARME · CONTROLLO MANUALE" : "MANUALE FERMATO · STOP", reason, next == Phase::Fault);
+    return; // Manual operation never creates/replaces a program report.
+  }
   if (phase == Phase::Running || phase == Phase::Paused) {
     cycleStopped = next == Phase::Idle;
     if (next == Phase::Fault) {
@@ -367,12 +430,8 @@ void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
     [&] {
       readSensorConversion(rtd, sensor);
       if (!sensor.valid || !thermal::belowHardLimit(sensor.c)) return false;
-      const auto &other = sensors[1 - index];
-      if (other.valid && fabsf(sensor.c - other.c) > MAX_DELTA) return false;
       // Do not discard an unsafe but otherwise valid confirmation by reading again.
-      return phase != Phase::Running || stepIndex >= activeRecipe.count ||
-             activeRecipe.steps[stepIndex].type == profile::Type::Cooldown ||
-             !std::isfinite(setpointC) || sensor.c < setpointC + MAX_TARGET_OVERSHOOT;
+      return !heatingOperation() || sensor.c < setpointC + MAX_TARGET_OVERSHOOT;
     });
   sensor.recoveryFailed = recovery == probes::RecoveryResult::Failed;
   // Preserve rejection even if the final conversion has no hardware fault bit:
@@ -406,8 +465,7 @@ String sensorMessage(const Sensor &sensor) {
 float meanC() { return (sensors[0].c + sensors[1].c) * 0.5f; }
 float hottestC() { return fmaxf(sensors[0].c, sensors[1].c); }
 bool sensorsHealthy() {
-  return sensors[0].valid && sensors[1].valid && thermal::belowHardLimit(hottestC()) &&
-         fabsf(sensors[0].c - sensors[1].c) <= MAX_DELTA;
+  return thermal::healthyPair(sensors[0].c, sensors[0].valid, sensors[1].c, sensors[1].valid);
 }
 const char *typeName(profile::Type type) {
   return type == profile::Type::Ramp ? "ramp" : type == profile::Type::Hold ? "hold" : "cooldown";
@@ -446,6 +504,11 @@ String telegramStatus() {
     icon = "⚠️"; state = "SONDE NON PRONTE";
   }
   else if (phase == Phase::Paused) { icon = "⏸️"; state = "CICLO IN PAUSA"; }
+  else if (phase == Phase::Running && manualOperation) {
+    icon = manualSession.mode == manual::Mode::Cooldown || manualSession.coolingToTarget ? "❄️" : "✅";
+    state = manualSession.mode == manual::Mode::Cooldown ? "MANUALE · COOLDOWN PASSIVO" :
+      manualSession.coolingToTarget ? "MANUALE · RAFFREDDAMENTO VERSO TARGET" : "MANUALE · REGOLAZIONE";
+  }
   else if (phase == Phase::Running) { icon = "✅"; state = "CICLO IN CORSO"; }
   else if (phase == Phase::Complete) { icon = "✅✅✅"; state = "CICLO COMPLETATO"; }
   else if (cycleStopped) {
@@ -462,7 +525,15 @@ String telegramStatus() {
   if (faultText.length()) text += "Motivo: " + faultText.substring(0, 300) + "\n";
   if (output.diagnostic) text += "\n🧪 TEST\n" + String(testModeName(output.test.mode)) + "\n";
   // Selection and historical reports do not represent a currently active cycle.
-  if (cycleActive()) {
+  if (cycleActive() && manualOperation) {
+    text += "\n🎛 CONTROLLO MANUALE\n";
+    if (manualSession.mode == manual::Mode::Cooldown) text += "Cooldown passivo: riscaldamento SPENTO.\n";
+    text += "Target finale: " + String(manualSession.target, 1) + " °C\n";
+    text += "Setpoint: " + String(manualSession.reference, 1) + " °C · rate " + String(manualSession.rateCMin, 2) + " °C/min\n";
+    if (manualSession.mode != manual::Mode::Cooldown) text +=
+      String(manualSession.coolingToTarget ? "Riscaldamento spento: raffreddamento verso il nuovo target.\n" : "Regolazione PID fino al comando dell'operatore.\n");
+    text += "Tempo manuale: " + telegramTime(uint32_t(manualSession.elapsedMs(now) / 1000)) + "\n";
+  } else if (cycleActive()) {
     text += "\n📋 CICLO ATTIVO\nProgramma: " + activeRecipe.name + "\n";
     String remainingText = "non disponibile";
     bool estimated = false;
@@ -476,7 +547,7 @@ String telegramStatus() {
       const auto elapsed = uint32_t((phase == Phase::Paused ? pausedAt : now) - stepStarted);
       const float remaining = profile::remainingSec(step, stepStartC, elapsed, holdInBandMs,
         sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
-        sensors[0].valid && sensors[1].valid ? hottestC() : NAN);
+        sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
       if (std::isfinite(remaining)) remainingText = telegramTime(uint32_t(remaining));
       estimated = step.type != profile::Type::Hold;
     }
@@ -514,14 +585,19 @@ String telegramStatus() {
   }
   text += "\n🧠 SISTEMA\nUptime: " + telegramTime(now / 1000) + "\nAvvio: #" + String(bootCount) + "\n";
   text += "RAM libera/min: " + String(ESP.getFreeHeap()) + " / " + String(ESP.getMinFreeHeap()) + " B\n";
+  text += "Modalità notifiche: " + String(telegram::modeName(telegramBot.mode())) + "\n";
   text += "Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + " dBm";
   return text;
 }
 void telegramNotice(const String &title, const String &reason, bool critical) {
   if (!telegramBot.configured) return;
+  const auto mode = telegramBot.mode();
+  if (!telegram::allowEvent(mode, critical)) return;
   const char *icon = critical ? "🚨" : "✅";
   if (title.indexOf("EMERGENZA") >= 0 || title.indexOf("ALLARME") >= 0) icon = "🚨";
-  else if (title == "CICLO AVVIATO") icon = "🚀";
+  else if (title == "CICLO AVVIATO" || title == "MANUALE AVVIATO") icon = "🚀";
+  else if (title == "MANUALE · TARGET MODIFICATO") icon = "🎯";
+  else if (title == "MANUALE · COOLDOWN") icon = "❄️";
   else if (title == "CICLO IN PAUSA") icon = "⏸️";
   else if (title == "CICLO RIPRESO") icon = "⏯️";
   else if (title.indexOf("STOP") >= 0 || title.indexOf("FERMATO") >= 0 || title.indexOf("PAUSA") >= 0 ||
@@ -529,21 +605,22 @@ void telegramNotice(const String &title, const String &reason, bool critical) {
            title.indexOf("AVVISO") >= 0) icon = "⚠️";
   String text = String(icon) + " " + title + "\n";
   char date[64]; reportpdf::date(utcNow(), date, sizeof(date));
-  if (!critical) {
+  if (!critical && mode != telegram::Mode::Detailed) {
     const bool cycleEvent = title == "CICLO AVVIATO" || title == "CICLO FERMATO · STOP" ||
       title == "CICLO COMPLETATO" || title == "CICLO IN PAUSA" || title == "CICLO RIPRESO";
     if (cycleEvent && activeRecipe.count) text += "Programma: " + activeRecipe.name + "\n";
+    if (title.startsWith("MANUALE") && reason.length()) text += reason + "\n";
     text += "📅 " + String(date);
-    telegramBot.notify(text, false);
+    telegramBot.notifyEvent(text, false);
     return;
   }
   text += "📅 " + String(date) + "\n";
   if (!cycleActive() && activeRecipe.count) text += "\nProgramma dell'evento: " + activeRecipe.name + "\n";
   if (reason.length()) text += "Motivo: " + reason + "\n";
   text += "\n📍 STATO AL MOMENTO DELL'EVENTO\n" + telegramStatus();
-  telegramBot.notify(text, critical);
+  telegramBot.notifyEvent(text, critical);
 }
-void beginStep() {
+void beginStep(bool preservePid = false) {
   if (stepIndex >= activeRecipe.count) {
     stopCycle(Phase::Complete, "Ciclo finito: tutti gli step completati"); return;
   }
@@ -552,37 +629,30 @@ void beginStep() {
   stepStartC = profile::startTemperature(step, meanC(), stepIndex > 0 ? setpointC : NAN);
   holdInBandMs = 0;
   holdTimer.reset(stepStarted);
-  resetPid();
+  if (!preservePid) resetPid();
   setpointC = profile::setpoint(step, stepStartC, 0);
   logEvent("CICLO", "Step " + String(stepIndex + 1) + "/" + String(activeRecipe.count) +
           " " + String(typeName(step.type)) + " verso " + String(step.target, 1) + " °C" +
           (step.type == profile::Type::Hold ? "; " + String(step.minutes) + " min in banda" :
            "; " + String(step.rate, 2) + " °C/min"));
 }
-void advanceStep() { cycleReport.advance(millis(), holdInBandMs); ++stepIndex; beginStep(); }
+void advanceStep() {
+  const bool preservePid = stepIndex + 1 < activeRecipe.count &&
+    regulation::continuousHold(activeRecipe.steps[stepIndex], activeRecipe.steps[stepIndex + 1]);
+  cycleReport.advance(millis(), holdInBandMs); ++stepIndex; beginStep(preservePid);
+}
 void applyWindow() {
   heater::Plan plan;
   plan.cycleActive = phase == Phase::Running || phase == Phase::Paused;
-  plan.heatingAllowed = phase == Phase::Running && stepIndex < activeRecipe.count &&
-                        activeRecipe.steps[stepIndex].type != profile::Type::Cooldown && std::isfinite(setpointC);
+  plan.manual = manualOperation;
+  plan.heatingAllowed = heatingOperation();
   plan.healthy = sensorsHealthy(); plan.sampleAt = sampleAtMs;
   plan.cycleAt = cycleStarted; plan.windowAt = windowStarted;
   plan.windowMs = controlSettings.windowMs; plan.duty = duty;
   portENTER_CRITICAL(&heaterMux); outputs.publish(plan); portEXIT_CRITICAL(&heaterMux);
 }
 void controlPid(float actual, uint32_t now) {
-  float dt = previousControlAt ? float(uint32_t(now - previousControlAt)) / 1000.0f : 0.5f;
-  dt = constrain(dt, 0.1f, 2.0f);
-  // Conservative starting gains, to be tuned on the actual oven with a low-temperature recipe.
-  float error = setpointC - actual;
-  float rawDerivative = std::isfinite(previousMean) ? -(actual - previousMean) / dt : 0;
-  derivative = 0.8f * derivative + 0.2f * rawDerivative;
-  float candidate = constrain(integral + ki * error * dt, 0.0f, controlSettings.maxPower);
-  float raw = kp * error + candidate + kd * derivative;
-  if (!((raw >= controlSettings.maxPower && error > 0) || (raw <= 0 && error < 0))) integral = candidate;
-  duty = constrain(kp * error + integral + kd * derivative, 0.0f, controlSettings.maxPower);
-  if (hottestC() >= setpointC + 1.0f) { duty = 0; integral = 0; }
-  previousMean = actual; previousControlAt = now;
+  duty = pidController.update(setpointC, actual, kp, ki, kd, controlSettings.maxPower, now);
   applyWindow();
   if (uint32_t(now - lastPidLog) >= 30000) {
     lastPidLog = now;
@@ -593,7 +663,7 @@ void controlPid(float actual, uint32_t now) {
 void sampleAndControl() {
   readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]);
   uint32_t now = millis(); sampleAtMs = now;
-  if (cycleActive() && stepIndex < activeRecipe.count) {
+  if (!manualOperation && cycleActive() && stepIndex < activeRecipe.count) {
     const float reference = phase == Phase::Running ?
       profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, uint32_t(now - stepStarted)) : setpointC;
     cycleReport.observe(now, sensors[0].c, sensors[1].c, sensors[0].valid, sensors[1].valid, reference, duty);
@@ -617,13 +687,19 @@ void sampleAndControl() {
   if (!thermal::belowHardLimit(hottestC())) {
     trip("Temperatura >= " + String(thermal::kHardLimit, 0) + " °C: uscita spenta"); return;
   }
-  if (fabsf(sensors[0].c - sensors[1].c) > MAX_DELTA) {
-    trip("Differenza PT100 > 10 °C: uscita spenta"); return;
-  }
-  if ((phase == Phase::Running || phase == Phase::Paused) && uint32_t(now - cycleStarted) >= MAX_CYCLE_MS) {
+  if (!manualOperation && (phase == Phase::Running || phase == Phase::Paused) && uint32_t(now - cycleStarted) >= MAX_CYCLE_MS) {
     trip("Tempo massimo ciclo 12 ore, incluse pause, superato"); return;
   }
   if (phase != Phase::Running) { holdTimer.update(now, false, false); inhibitHeater(); return; }
+  if (manualOperation) {
+    manualSession.tick(hottestC(), now);
+    setpointC = manualSession.reference;
+    if (!manualSession.heatingAllowed()) { duty = 0; inhibitHeater(); return; }
+    if (hottestC() >= setpointC + MAX_TARGET_OVERSHOOT) {
+      trip("Sovratemperatura rispetto al target manuale (+8 °C): uscita spenta"); return;
+    }
+    controlPid(meanC(), now); return;
+  }
   const auto &step = activeRecipe.steps[stepIndex];
   float actual = meanC();
   uint32_t elapsed = uint32_t(now - stepStarted);
@@ -638,7 +714,7 @@ void sampleAndControl() {
   }
   controlPid(actual, now);
   if (step.type == profile::Type::Ramp) {
-    if (profile::rampDone(step, stepStartC, elapsed, fminf(sensors[0].c, sensors[1].c))) {
+    if (profile::rampDone(step, stepStartC, elapsed, fminf(sensors[0].c, sensors[1].c), hottestC(), followingStep())) {
       advanceStep(); return;
     }
     if (setpointC - actual > 5 && uint32_t(now - lastLagLog) > 300000) {
@@ -660,7 +736,7 @@ void recordHistory(bool force, uint8_t eventFlag) {
                   (relayOn ? 4 : 0) | (std::isfinite(setpointC) ? 8 : 0) | eventFlag;
   history[historyHead] = {++historySeq, now, sensors[0].valid ? sensors[0].c : 0,
                           sensors[1].valid ? sensors[1].c : 0,
-                          std::isfinite(setpointC) ? setpointC : 0, duty, flags, stepIndex};
+                          std::isfinite(setpointC) ? setpointC : 0, duty, flags, uint8_t(manualOperation ? 255 : stepIndex)};
   historyHead = (historyHead + 1) % HISTORY_CAP;
   if (historyCount < HISTORY_CAP) ++historyCount;
 }
@@ -889,21 +965,34 @@ void statusApi(uint32_t testToken = 0) {
   doc["red"] = output.red; doc["green"] = output.green;
   doc["otaEnabled"] = otaEnabled; doc["otaUpdating"] = output.updating;
   doc["otaHostname"] = MDNS_NAME; doc["otaPort"] = OTA_PORT;
-  bool stationReady = WiFi.status() == WL_CONNECTED;
-  doc["mode"] = "FULL"; doc["firmware"] = "full-1.4"; doc["phase"] = phaseName(); doc["relay"] = heaterOn();
+  bool stationReady = workshopReady();
+  doc["mode"] = "FULL"; doc["firmware"] = firmwareinfo::kVersion;
+  doc["firmwareModifiedOn"] = firmwareinfo::kModifiedOn;
+  doc["phase"] = phaseName(); doc["relay"] = heaterOn();
+  doc["operation"] = manualOperation ? "manual" : "program";
+  JsonObject manualState = doc["manual"].to<JsonObject>();
+  manualState["active"] = manualOperation && cycleActive() && manualSession.active();
+  manualState["mode"] = manual::modeName(manualSession.mode);
+  manualState["coolingToTarget"] = manualSession.coolingToTarget;
+  if (std::isfinite(manualSession.target)) manualState["targetC"] = manualSession.target; else manualState["targetC"] = nullptr;
+  manualState["elapsedSec"] = manualSession.elapsedMs(millis()) / 1000;
+  manualState["startedAtMs"] = manualSession.startedAt;
+  manualState["rateCMin"] = manualSession.rateCMin;
+  if (std::isfinite(manualSession.reference)) manualState["setpointC"] = manualSession.reference; else manualState["setpointC"] = nullptr;
   doc["emergency"] = output.emergency;
   doc["ready"] = !output.diagnostic && !output.updating && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault &&
                  !output.emergency && !output.recoveryBlocked && !recoveryJournal.data.pending &&
                  heaterFault() == heater::Fault::None && uint32_t(millis() - sampleAtMs) < heater::Guard::kStaleMs;
   doc["actuator"] = controlSettings.ssr ? "ssr" : "relay";
   doc["windowSec"] = controlSettings.windowMs / 1000; doc["maxPower"] = controlSettings.maxPower;
-  doc["cycleElapsedSec"] = cycleActive() ? uint32_t(millis() - cycleStarted) / 1000 :
+  doc["cycleElapsedSec"] = !manualOperation && cycleActive() ? uint32_t(millis() - cycleStarted) / 1000 :
     activeRecipe.count && reportAvailable && lastReport.startMs == cycleStarted && lastReport.boot == bootCount ?
       uint32_t(lastReport.endMs - lastReport.startMs) / 1000 : 0;
   doc["stepRemainingSec"] = nullptr;
   doc["stepRemainingEstimated"] = false;
-  if (activeRecipe.count) doc["cycleStartedAtMs"] = cycleStarted; else doc["cycleStartedAtMs"] = nullptr;
-  doc["stepElapsedSec"] = phase == Phase::Running ? uint32_t(millis() - stepStarted) / 1000 :
+  if (manualOperation && manualSession.active()) doc["cycleStartedAtMs"] = manualSession.startedAt;
+  else if (activeRecipe.count) doc["cycleStartedAtMs"] = cycleStarted; else doc["cycleStartedAtMs"] = nullptr;
+  doc["stepElapsedSec"] = manualOperation ? 0 : phase == Phase::Running ? uint32_t(millis() - stepStarted) / 1000 :
                            phase == Phase::Paused ? uint32_t(pausedAt - stepStarted) / 1000 : 0;
   doc["freeHeap"] = ESP.getFreeHeap(); doc["minFreeHeap"] = ESP.getMinFreeHeap();
   telegramBot.status(doc["telegram"].to<JsonObject>());
@@ -912,6 +1001,11 @@ void statusApi(uint32_t testToken = 0) {
   doc["duty"] = duty;
   JsonObject pid = doc["pid"].to<JsonObject>();
   pid["kp"] = kp; pid["ki"] = ki; pid["kd"] = kd;
+  JsonObject pidState = doc["pidState"].to<JsonObject>();
+  pidState["integralPct"] = pidController.integral;
+  pidState["proportionalPct"] = pidController.proportional;
+  pidState["derivativePct"] = kd * pidController.derivative;
+  pidState["meanLimited"] = pidController.meanLimited;
   if (std::isfinite(setpointC)) doc["target"] = setpointC; else doc["target"] = nullptr;
   doc["stepIndex"] = stepIndex;
   doc["stepCount"] = activeRecipe.count;
@@ -922,13 +1016,22 @@ void statusApi(uint32_t testToken = 0) {
     doc["stepRate"] = step.type == profile::Type::Hold ? 0 : step.rate;
     doc["holdInBandSec"] = holdInBandMs / 1000;
     doc["holdRequiredSec"] = uint32_t(step.minutes) * 60;
+    const bool toHold = profile::rampToHold(step, followingStep());
+    doc["stepTransitionToHold"] = toHold;
+    doc["stepCompletionBandC"] = step.type == profile::Type::Hold || toHold ? profile::kHoldBand : profile::kBand;
+    doc["stepCompletionTarget"] = toHold ? followingStep()->target : step.target;
     if (cycleActive()) {
       const uint32_t elapsed = uint32_t((phase == Phase::Paused ? pausedAt : millis()) - stepStarted);
       const float remaining = profile::remainingSec(step, stepStartC, elapsed, holdInBandMs,
         sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
-        sensors[0].valid && sensors[1].valid ? hottestC() : NAN);
+        sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
       if (std::isfinite(remaining)) doc["stepRemainingSec"] = remaining;
       doc["stepRemainingEstimated"] = step.type != profile::Type::Hold;
+      doc["stepWaitingForTemperature"] = step.type == profile::Type::Ramp &&
+        profile::setpoint(step, stepStartC, elapsed) >= step.target - 0.001f &&
+        !profile::rampDone(step, stepStartC, elapsed,
+          sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
+          sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
     }
   }
   doc["fault"] = faultText; doc["bootCount"] = bootCount;
@@ -952,6 +1055,14 @@ void statusApi(uint32_t testToken = 0) {
   doc["workshopConfigured"] = WORKSHOP_WIFI_SSID[0] != '\0';
   doc["workshopConnected"] = stationReady;
   doc["stationIp"] = stationReady ? WiFi.localIP().toString() : "";
+  doc["stationMac"] = WORKSHOP_WIFI_SSID[0] ? WiFi.macAddress() : "";
+  JsonObject wifi = doc["wifi"].to<JsonObject>();
+  wifi["recoveryRunning"] = wifiRecoveryRunning.load();
+  wifi["recoveryPaused"] = !wifiRecoveryAllowed.load();
+  wifi["statusCode"] = int(WiFi.status()); wifi["retryCount"] = wifiRetryCount.load();
+  wifi["retryInSec"] = stationReady ? 0 : (wifiRetryWaitMs.load() + 999) / 1000;
+  wifi["lastDisconnectReason"] = wifiLastReason.load();
+  wifi["lastDisconnectMessage"] = network::reasonText(wifiLastReason.load());
   doc["apIp"] = apReady ? WiFi.softAPIP().toString() : "";
   doc["localName"] = mdnsReady ? String(MDNS_NAME) + ".local" : "";
   doc["uptimeMs"] = millis(); doc["sampleAtMs"] = sampleAtMs;
@@ -1037,7 +1148,8 @@ void commandApi() {
     portENTER_CRITICAL(&heaterMux); outputs.stopAll(); ownerToken = 0; writeOutputs(); portEXIT_CRITICAL(&heaterMux);
     stopTests("STOP manuale: test fermato"); inhibitHeater();
     logEvent("STOP", "STOP manuale: tutte le uscite spente");
-    if (phase == Phase::Running || phase == Phase::Paused) stopCycle(Phase::Idle, "Ciclo fermato manualmente");
+    if (phase == Phase::Running || phase == Phase::Paused) stopCycle(Phase::Idle,
+      manualOperation ? "Controllo manuale fermato dall'operatore" : "Ciclo fermato manualmente");
     statusApi(); return;
   }
   if (outputSnapshot().updating) { error(503, "Aggiornamento OTA in corso"); return; }
@@ -1057,6 +1169,7 @@ void commandApi() {
     logEvent("INFO", "Allarme/interruzione riconosciuti dall'operatore"); statusApi(); return;
   }
   if (action == "pause") {
+    if (manualOperation && cycleActive()) { error(409, "Nel manuale usa COOLDOWN o STOP"); return; }
     if (phase != Phase::Running) { error(409, "Nessun ciclo da mettere in pausa"); return; }
     phase = Phase::Paused; pausedAt = millis(); cycleReport.setPaused(pausedAt, true); inhibitHeater(); duty = 0;
     holdTimer.update(pausedAt, false, false);
@@ -1087,11 +1200,12 @@ void commandApi() {
     // Read again here: a stale status must never authorize a heat command.
     readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]);
     sampleAtMs = millis();
-    if (!sensorsHealthy()) { error(409, "Entrambe le PT100 reali devono essere valide e concordi"); return; }
+    if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
     const char *id = doc["recipeId"] | "";
     int selected = -1;
     for (size_t i = 0; i < recipeCount; ++i) if (recipes[i].id == id) { selected = int(i); break; }
     if (selected < 0) { error(404, "Programma non trovato"); return; }
+    manualOperation = false; manualSession = manual::Session{};
     activeRecipe = recipes[selected];
     if (activeRecipe.steps[0].type == profile::Type::Ramp &&
         meanC() >= activeRecipe.steps[0].target - profile::kBand) {
@@ -1124,6 +1238,78 @@ void commandApi() {
     sampleAndControl(); statusApi(); return;
   }
   error(400, "Azione sconosciuta");
+}
+void manualApi() {
+  drainHeaterNotices();
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) { error(400, "JSON non valido"); return; }
+  const String action = doc["action"] | "";
+  if (action == "stop") {
+    if (manualOperation && cycleActive()) stopCycle(Phase::Idle, "Controllo manuale fermato dall'operatore");
+    statusApi(); return;
+  }
+  const auto output = outputSnapshot();
+  if (output.updating || output.diagnostic || output.emergency || output.recoveryBlocked || recoveryJournal.data.pending ||
+      phase == Phase::Fault || phase == Phase::Interrupted || heaterFault() != heater::Fault::None) {
+    error(409, "Controllo manuale bloccato: esci da TEST o riconosci prima allarmi/interruzioni"); return;
+  }
+  if (action == "cooldown") {
+    if (!manualOperation || !cycleActive()) { error(409, "Nessun controllo manuale attivo"); return; }
+    const float target = doc["targetC"].is<float>() ? doc["targetC"].as<float>() : NAN;
+    const float rate = doc["rateCMin"].is<float>() ? doc["rateCMin"].as<float>() : NAN;
+    if (!manualSession.cooldown(target, rate, millis())) {
+      error(400, "Cooldown: target da 0 a 400 °C non superiore al setpoint e rate minimo 0,1 °C/min"); return;
+    }
+    resetPid(); setpointC = manualSession.reference;
+    logEvent("MANUALE", "Cooldown manuale: verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; uscita spenta"); recordHistory(true);
+    telegramNotice("MANUALE · COOLDOWN", "Verso " + String(target, 1) + " °C · " + String(rate, 2) + " °C/min; riscaldamento spento.");
+    statusApi(); return;
+  }
+  if (action != "start" && action != "target") { error(400, "Azione manuale sconosciuta"); return; }
+  if ((!doc["targetC"].is<float>() && !doc["targetC"].is<int>()) || !thermal::validTarget(doc["targetC"].as<float>())) {
+    error(400, "Target manuale numerico da 0 a 400 °C"); return;
+  }
+  if (!doc["rateCMin"].is<float>() || !manual::Session::validRate(doc["rateCMin"].as<float>())) {
+    error(400, "Rate manuale numerico: minimo 0,1 °C/min"); return;
+  }
+  if (action == "start" && cycleActive()) { error(409, "Ferma il programma o il controllo manuale già attivo"); return; }
+  if (action == "target" && (!manualOperation || !cycleActive())) { error(409, "Avvia prima il controllo manuale"); return; }
+  if (action == "start" && (!doc["hardwareReady"].is<bool>() || !doc["hardwareReady"].as<bool>())) {
+    error(400, "Conferma CHECK HARDWARE/AMBIENTE EFFETTUATO"); return;
+  }
+  readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+  if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
+  const float requested = doc["targetC"].as<float>();
+  const float rate = doc["rateCMin"].as<float>();
+  const uint32_t now = millis();
+  if (action == "start") {
+    manual::Session proposed;
+    if (!proposed.start(requested, rate, hottestC(), meanC(), now)) { error(409, "Avvio manuale non valido"); return; }
+    resetPid();
+    if (!recoveryJournal.begin(recoveryStore, "Controllo manuale", utcNow()) ||
+        prefs.putULong64("checkpoint", utcNow()) != sizeof(uint64_t) || prefs.putBool("active", true) != sizeof(bool)) {
+      portENTER_CRITICAL(&heaterMux); outputs.blockRecovery(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+      recoveryJournal.data.pending = true; phase = Phase::Interrupted;
+      error(507, "Memoria di sicurezza non disponibile: manuale non avviato"); return;
+    }
+    manualSession = proposed;
+    manualOperation = true; phase = Phase::Running; cycleStopped = false;
+    activeRecipe = Recipe{}; stepIndex = 0; cycleStarted = now;
+    checkpointAt = now - CHECKPOINT_MS;
+    setpointC = manualSession.reference;
+    logEvent("MANUALE", "Manuale avviato: target " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min");
+    recordHistory(true, HISTORY_START);
+    telegramNotice("MANUALE AVVIATO", "Target: " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min");
+  } else {
+    const bool wasCooldown = manualSession.mode == manual::Mode::Cooldown;
+    const bool wasCooling = manualSession.coolingToTarget;
+    if (!manualSession.changeTarget(requested, rate, hottestC(), meanC(), now)) { error(409, "Cambio target manuale non valido"); return; }
+    if (wasCooldown || wasCooling || manualSession.coolingToTarget) resetPid();
+    setpointC = manualSession.reference;
+    logEvent("MANUALE", "Target manuale modificato: " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min"); recordHistory(true);
+    telegramNotice("MANUALE · TARGET MODIFICATO", "Target: " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min");
+  }
+  sampleAndControl(); applyWindow(); statusApi();
 }
 void logsApi() {
   JsonDocument doc; doc["bootCount"] = bootCount; JsonArray list = doc["events"].to<JsonArray>();
@@ -1269,6 +1455,7 @@ void setupOta() {
   ArduinoOTA.setHostname(MDNS_NAME); ArduinoOTA.setPort(OTA_PORT);
   ArduinoOTA.setPassword(OVEN_OTA_PASSWORD); ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([] {
+    wifiRecoveryAllowed = false;
     telegramBot.setAvailable(false);
     portENTER_CRITICAL(&heaterMux); outputs.beginUpdate(); ownerToken = 0; writeOutputs(); portEXIT_CRITICAL(&heaterMux);
     stopTests("Aggiornamento OTA: test fermato");
@@ -1289,7 +1476,19 @@ void setupOta() {
 void updateNetwork() {
   if (uint32_t(millis() - lastNetworkCheck) < 1000) return;
   lastNetworkCheck = millis();
-  bool connected = WiFi.status() == WL_CONNECTED;
+  bool connected = workshopReady();
+  const auto reasonSeq = wifiReasonSeq.load();
+  if (reasonSeq != wifiLoggedReasonSeq) {
+    wifiLoggedReasonSeq = reasonSeq;
+    const auto reason = wifiLastReason.load();
+    logEvent("ATTENZIONE", "Wi-Fi capannone: " + String(network::reasonText(reason)) + " · codice " + String(reason), false);
+  }
+  const auto retries = wifiRetryCount.load();
+  if (retries != wifiLoggedRetryCount) {
+    wifiLoggedRetryCount = retries;
+    logEvent("RETE", "Recupero Wi-Fi, tentativo " + String(retries) +
+      (wifiLastRetryAccepted.load() ? ": richiesta inviata" : ": nessuna conferma immediata, verificare stato/errore"), false);
+  }
   if (connected) {
     String ip = WiFi.localIP().toString();
     if (!stationWasConnected || stationIp != ip) {
@@ -1305,7 +1504,8 @@ void updateNetwork() {
     if (mdnsReady) { MDNS.addService("http", "tcp", 80); if (otaEnabled) MDNS.enableArduino(OTA_PORT, true); }
   }
   portENTER_CRITICAL(&heaterMux); outputServerReady = apReady || connected; portEXIT_CRITICAL(&heaterMux);
-  if (connected && !ntpStarted) {
+  if (connected && (!ntpStarted || (!ntpSynced && uint32_t(millis() - lastNtpAttempt) >= 60000))) {
+    lastNtpAttempt = millis();
     configTime(0, 0, WORKSHOP_NTP_SERVER); ntpStarted = true;
     logEvent("RETE", "Sincronizzazione ora NTP in corso");
   }
@@ -1459,6 +1659,8 @@ void setup() {
   // NVS can fail when persistent event logs have filled that partition.
   // This must precede mode(), which initializes the Wi-Fi driver.
   WiFi.persistent(false);
+  WiFi.setHostname(MDNS_NAME);
+  WiFi.onEvent(wifiEvent);
   bool wifiReady = WiFi.mode(WORKSHOP_WIFI_SSID[0] ? WIFI_AP_STA : WIFI_AP);
   if (!wifiReady) logEvent("ALLARME", "Driver Wi-Fi non avviato");
   apReady = wifiReady && WiFi.softAP(AP_SSID, AP_PASSWORD);
@@ -1474,6 +1676,12 @@ void setup() {
   server.on("/api/test/heartbeat", HTTP_POST, testHeartbeatApi);
   server.on("/api/test/history", HTTP_GET, testHistoryApi);
   server.on("/", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html; charset=utf-8", WEB_HTML); });
+  const auto serveFavicon = [] {
+    server.sendHeader("Cache-Control", "public, max-age=86400");
+    server.send_P(200, "image/jpeg", reinterpret_cast<const char *>(WEB_FAVICON), sizeof(WEB_FAVICON));
+  };
+  server.on("/favicon.jpg", HTTP_GET, serveFavicon);
+  server.on("/favicon.ico", HTTP_GET, serveFavicon);
   server.on("/style.css", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/css; charset=utf-8", WEB_CSS); });
   server.on("/app.js", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "application/javascript; charset=utf-8", WEB_JS); });
   server.on("/report-export.js", HTTP_GET, [] { server.send_P(200, "application/javascript; charset=utf-8", WEB_EXPORT_JS); });
@@ -1485,15 +1693,21 @@ void setup() {
   server.on("/api/recipes", HTTP_GET, recipesApi);
   server.on("/api/recipes", HTTP_POST, saveRecipesApi);
   server.on("/api/command", HTTP_POST, commandApi);
+  server.on("/api/manual", HTTP_POST, manualApi);
   server.on("/api/pid", HTTP_POST, pidApi);
   server.on("/api/control", HTTP_POST, controlSettingsApi);
   server.on("/api/logs", HTTP_GET, logsApi);
   server.on("/api/history", HTTP_GET, historyApi);
   server.onNotFound([] { error(404, "Percorso non trovato"); });
   server.begin();
+  if (WORKSHOP_WIFI_SSID[0]) {
+    wifiRecoveryRunning = xTaskCreatePinnedToCore(wifiRecoveryTask, "wifi-recovery", 4096, nullptr, 1, nullptr, 0) == pdPASS;
+    if (!wifiRecoveryRunning) logEvent("ATTENZIONE", "Recupero Wi-Fi non avviato; riconnessione della libreria ancora attiva", false);
+  }
   chipTemperatureC = temperatureRead();
   lastChipTemperatureAt = millis();
   if (apReady) logEvent("RETE", "Dashboard diretta: http://" + WiFi.softAPIP().toString() + "/");
+  telegramBot.setMode(telegram::modeFrom(prefs.getUChar("tgMode", uint8_t(telegram::Mode::Brief))));
   if (telegramBot.begin(OVEN_TELEGRAM_TOKEN, OVEN_TELEGRAM_CHAT_ID)) {
     logEvent("TELEGRAM", "Task notifiche attivo; /status riservato alla chat privata configurata", false);
     // Compose one alert with its time estimate once NTP is available, before
@@ -1505,7 +1719,22 @@ void setup() {
 void loop() {
   drainHeaterNotices();
   if (otaEnabled) ArduinoOTA.handle();
-  telegramBot.setAvailable(WiFi.status() == WL_CONNECTED && ntpSynced && !outputSnapshot().updating);
+  wifiRecoveryAllowed = !outputSnapshot().updating;
+  telegramBot.setAvailable(workshopReady() && ntpSynced && !outputSnapshot().updating);
+  const int requestedMode = telegramBot.takeModeRequest();
+  if (telegram::validMode(requestedMode)) {
+    const auto selected = telegram::modeFrom(requestedMode);
+    if (selected == telegramBot.mode()) {
+      telegramBot.reply(String("🎛 Modalità già attiva: ") + telegram::modeName(selected), true);
+    } else if (prefsReady && prefs.putUChar("tgMode", uint8_t(selected)) == sizeof(uint8_t)) {
+      telegramBot.setMode(selected);
+      logEvent("TELEGRAM", String("Modalità notifiche: ") + telegram::modeName(selected), false);
+      telegramBot.reply(String("✅ Modalità salvata: ") + telegram::modeName(selected) +
+        "\n/status sempre disponibile. Allarmi e PDF restano attivi.", true);
+    } else {
+      telegramBot.reply(String("⚠️ Modalità non salvata. Resta attiva: ") + telegram::modeName(telegramBot.mode()), true);
+    }
+  }
   if (telegramBot.takeStatusRequest()) telegramBot.reply(telegramStatus());
   if (outputSnapshot().updating) { delay(5); return; }
   server.handleClient();

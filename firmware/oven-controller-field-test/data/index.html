@@ -51,9 +51,7 @@
     <aside class="panel control-panel">
       <h2>Comandi di collaudo</h2>
       <p>Ogni prova è temporizzata. Nessun PID e nessuna ricetta. Puoi testare relè e LED anche con sonde assenti o in fault.</p>
-      <label class="confirm-loads"><input id="loadsDisconnected" type="checkbox"> Le resistenze reali del forno sono fisicamente scollegate.</label>
-      <button id="armBtn" class="primary full" disabled>ABILITA TEST PER 60 s</button>
-      <p id="armState" class="hint">Comandi disabilitati · Solo lettura sonde</p>
+      <p class="hint">Premi direttamente il pulsante della prova desiderata. Mantieni questa pagina visibile durante il test.</p>
       <button id="stopBtn" class="danger full" disabled>STOP · RELÈ SPENTO</button>
       <div id="messageBox" class="notice hidden" role="status" aria-live="polite"></div>
       <div class="test-progress"><strong id="testName">Lettura sonde</strong><span id="testRemaining">—</span></div>
@@ -68,11 +66,13 @@
       <p class="hint">Sequenza: spenti → verde → rosso → entrambi, 2 s ciascuno. GPIO4 resta spento. A riposo verde acceso = dashboard avviata; rosso segue il relè. Durante il test LED il rosso è indipendente dal relè.</p>
       <hr>
       <h2>Test comando relè</h2>
-      <label class="field"><span>Durata impulso</span><select id="pulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select></label>
-      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Invia impulso</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
-      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e disabilita i test. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
+      <label class="field"><span>Durata accensione relè</span><select id="pulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option><option value="30000">30 s</option><option value="60000">1 min</option><option value="120000">2 min</option><option value="600000">10 min</option></select></label>
+      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Accendi relè</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
+      <p class="hint">Il relè resta acceso per tutta la durata scelta e poi si spegne automaticamente. STOP è sempre disponibile.</p>
+      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e ferma la prova. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
       <hr>
       <h2>Rete e scheda</h2>
+      <div class="network-line"><span>Aggiornamenti Wi-Fi OTA</span><strong id="otaState">—</strong></div>
       <div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta</span><strong>OvenController-FieldTest</strong></div><span id="apAddress" class="network-address">—</span></div>
       <div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Reset codice</span><strong id="resetReason">—</strong></div><div><span>Chip ESP</span><strong id="chipTemperature">—</strong></div><div><span>RAM libera / minimo</span><strong id="heap">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="rssi">—</strong></div><div><span>Test al reset</span><strong id="interrupted">—</strong></div></div>
       <p class="hint">La temperatura del chip ESP non è quella del regolatore o dell'aria. Nessuna uscita riparte automaticamente dopo un reset. Nessun login: usa una rete di prova controllata.</p>

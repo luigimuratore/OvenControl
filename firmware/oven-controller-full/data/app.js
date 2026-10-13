@@ -6,6 +6,8 @@ const types = { ramp: "Ramp", hold: "Hold", cooldown: "Cooldown" };
 const markerNames = { 16: "INIZIO CICLO", 32: "STOP", 64: "FINE CICLO", 128: "ALLARME" };
 let recipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
 let pidLoaded = false;
+let manualTargetDirty = false;
+let selectedView = 'Dashboard';
 let settingsLoaded = false, recipesLoaded = false, recipesDirty = false, commandBusy = false, commandGeneration = 0, exportBusy = false;
 let recipeLoadBusy = false;
 let events = [], eventKey = "", logsBusy = false;
@@ -67,7 +69,11 @@ function remainingStepSeconds(s) {
   if (readings.length !== 2 || !(s.stepRate > 0) || !Number.isFinite(s.target)) return null;
   const ramp = s.stepType === 'ramp';
   const reference = ramp ? s.stepFinalTarget - s.target : s.target - s.stepFinalTarget;
-  const measured = ramp ? s.stepFinalTarget - 1 - Math.min(...readings) : Math.max(...readings) - s.stepFinalTarget - 1;
+  const band = Number.isFinite(s.stepCompletionBandC) ? s.stepCompletionBandC : 1;
+  const endTarget = Number.isFinite(s.stepCompletionTarget) ? s.stepCompletionTarget : s.stepFinalTarget;
+  const measured = ramp && s.stepTransitionToHold ?
+    Math.max(endTarget - band - Math.min(...readings), Math.max(...readings) - endTarget - band) :
+    ramp ? endTarget - band - Math.min(...readings) : Math.max(...readings) - endTarget - band;
   return Math.ceil(Math.max(0, reference, measured) * 60 / s.stepRate);
 }
 function dateAt(ms) { return new Date(timeOffset + ms).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
@@ -136,6 +142,13 @@ function createChartInspector(canvas, tooltip, cursor) {
     const readings = plot.series.filter(s => Number.isFinite(point[s.key]));
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
+    if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
+      const difference = Number((point.target - point.actual).toFixed(1));
+      const highlight = document.createElement('div');
+      highlight.className = 'chart-tooltip-difference';
+      highlight.textContent = `Target − media PT100: ${difference > 0 ? '+' : ''}${temp(difference)} °C`;
+      tooltip.append(highlight);
+    }
     tooltip.hidden = cursor.hidden = false;
     cursor.style.left = `${plot.x(point.ms) * sx}px`;
     cursor.style.top = `${plot.top * sy}px`; cursor.style.height = `${(plot.bottom - plot.top) * sy}px`;
@@ -153,11 +166,20 @@ function createChartInspector(canvas, tooltip, cursor) {
   return {update(data) { plot = data; paint(); }, clear() { plot = null; hide(); }};
 }
 
+function updateDeltaIndicator(delta) {
+  put('deltaTemp', temp(delta));
+  $('deltaCard').classList.toggle('delta-warning', Number.isFinite(delta) && delta > 10 && delta <= 20);
+  $('deltaCard').classList.toggle('delta-danger', Number.isFinite(delta) && delta > 20);
+}
 function display(s) {
+  const version = s.preview ? s.firmwareVersion || s.firmware : s.firmware;
+  const modified = typeof s.firmwareModifiedOn === 'string' && /^(\d{4})-(\d{2})-(\d{2})$/.exec(s.firmwareModifiedOn);
+  const modifiedDate = modified ? `${modified[3]}/${modified[2]}/${modified[1]}` : 'non disponibile';
+  put('firmwareInfo', `${s.preview ? 'Anteprima locale · ' : ''}Firmware ${version || '—'} · Ultima modifica: ${modifiedDate}`);
   if (boot !== null && boot !== s.bootCount) {
     history = []; live = []; hasOlder = false; chartAtEnd = true; chartStart = 0; eventKey = "";
     cycleAnchor = cycleKey = null;
-    pidLoaded = settingsLoaded = false; $("hardwareReady").checked = false;
+    pidLoaded = settingsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     if (!recipesDirty) { recipesLoaded = false; loadRecipes().catch(() => {}); }
   }
   boot = s.bootCount; latest = s; connected = true; lastResponseAt = performance.now(); renderFailed = false;
@@ -171,7 +193,29 @@ function display(s) {
   const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1 + t2) / 2 : NaN;
   const target = s.target === null ? NaN : Number(s.target);
   put("avgTemp", temp(avg)); put("targetTemp", temp(target));
-  put("deltaTemp", temp(Math.abs(t1 - t2)));
+  const manual = s.manual || {}, manualActive = !!manual.active;
+  put('targetLabel', selectedView === 'Manual' || manualActive ? 'Setpoint manuale' : 'Setpoint di rampa');
+  const manualLabel = manual.mode === 'cooldown' ? 'COOLDOWN · uscita spenta' :
+    manual.coolingToTarget ? 'RAFFREDDAMENTO VERSO TARGET · uscita spenta' :
+    Math.abs(manual.setpointC - manual.targetC) > .01 ? 'MANUALE · RAMPA' : 'MANUALE · MANTENIMENTO PID';
+  put('manualState', manualActive ? manualLabel : !s.manual ? 'Disponibile dopo aggiornamento del firmware' :
+    ['fault','interrupted'].includes(s.phase) || s.emergency ? 'Bloccato: riconosci prima allarme/interruzione' :
+    ['running','paused'].includes(s.phase) ? 'Programma attivo: termina prima il ciclo' : 'Fermo');
+  $('manualState').classList.toggle('is-active', manualActive);
+  $('manualState').classList.toggle('is-cooling', manualActive && (manual.mode === 'cooldown' || manual.coolingToTarget));
+  put('manualAppliedTarget', manualActive ? `${temp(manual.targetC)} °C` : '—');
+  put('manualAppliedRate', manualActive ? `${manual.rateCMin} °C/min` : '—');
+  put('manualDuration', clock(Number(manual.elapsedSec) || 0));
+  if (!manualTargetDirty && manualActive) {
+    if (Number.isFinite(manual.targetC)) $(manual.mode === 'cooldown' ? 'manualCooldownTarget' : 'manualTarget').value = manual.targetC;
+    if (Number.isFinite(manual.rateCMin)) $('manualRate').value = manual.rateCMin;
+  }
+  put('manualHint', manualActive ? manual.mode === 'cooldown' ?
+    'Raffreddamento passivo. APPLICA TARGET riattiva la regolazione; STOP chiude il manuale.' : manual.coolingToTarget ?
+    'Il target è sotto la temperatura attuale: il riscaldamento resta spento fino al raffreddamento, poi riprende il PID.' :
+    'Rampa al rate scelto, poi mantenimento senza durata. APPLICA TARGET cambia target/rate; COOLDOWN spegne il riscaldamento.' :
+    'COOLDOWN spegne il riscaldamento e mantiene il monitoraggio. STOP chiude il manuale. Dopo un reset non riparte da solo.');
+  updateDeltaIndicator(Math.abs(t1 - t2));
   put("t1", Number.isFinite(t1) ? `${temp(t1)} °C` : "Non valida");
   put("t2", Number.isFinite(t2) ? `${temp(t2)} °C` : "Non valida");
   for (let i = 0; i < 2; i++) {
@@ -181,7 +225,7 @@ function display(s) {
   put("relayState", s.relay ? "ACCESO" : "SPENTO"); $("relayState").classList.toggle("heating", s.relay);
   put("pidInfo", s.test?.enabled ? "Comando manuale TEST · PID escluso" : `PID ${Math.round(s.duty)}% · finestra ${s.windowSec} s · max ${s.maxPower}%`);
   put("uptime", clock(s.uptimeMs / 1000));
-  put("cycleInfo", s.recipeName && (s.phase === "running" || s.phase === "paused") ? s.recipeName : "Due PT100 reali · nessuna simulazione");
+  put("cycleInfo", manualActive ? manualLabel : s.recipeName && (s.phase === "running" || s.phase === "paused") ? s.recipeName : "Due PT100 reali · nessuna simulazione");
   put("stepPosition", s.phase === "complete" ? `${s.stepCount} / ${s.stepCount} · Terminata` : s.stepCount && s.stepIndex < s.stepCount ? `${s.stepIndex + 1} / ${s.stepCount} · ${types[s.stepType] || "—"}` : "—");
   put("finalTarget", Number.isFinite(s.stepFinalTarget) ? `${temp(s.stepFinalTarget)} °C` : "—");
   put("rateInfo", s.stepType === "hold" ? `${clock(s.holdInBandSec)} / ${clock(s.holdRequiredSec)}` :
@@ -193,7 +237,11 @@ function display(s) {
   put("cycleDuration", clock(s.cycleElapsedSec));
   const remaining = remainingStepSeconds(s), activeStep = ['running', 'paused'].includes(s.phase);
   put("stepDuration", remaining === null ? '—' : clock(remaining));
-  put("stepTimeHint", activeStep ? s.stepType === 'hold' ? 'Tempo ancora richiesto in banda ±5 °C' :
+  put("stepTimeHint", activeStep ? s.phase === 'paused' ? 'Conteggio sospeso durante la pausa' :
+    s.stepType === 'ramp' && s.stepWaitingForTemperature ? s.stepTransitionToHold ?
+    `Riferimento al target: attendo entrambe le PT100 entro ±${s.stepCompletionBandC} °C per iniziare il mantenimento` :
+    `Riferimento al target: attendo la sonda più fredda ad almeno ${temp(s.stepFinalTarget - (s.stepCompletionBandC || 1))} °C` :
+    s.stepType === 'hold' ? 'Tempo ancora richiesto in banda ±5 °C' :
     remaining === null ? 'Stima non disponibile' : 'Stima al rate del programma' : '');
   $('globalStop').classList.toggle('is-latched', !!s.emergency);
   $('globalStop').setAttribute?.('aria-pressed', String(!!s.emergency));
@@ -202,6 +250,19 @@ function display(s) {
   put("heapInfo", `${Math.round(s.freeHeap / 1024)} / ${Math.round(s.minFreeHeap / 1024)} kB`);
   put("sampleAge", `${s.sampleAgeMs} ms`); put("rssiInfo", s.workshopConnected ? `${s.rssi} dBm` : "—");
   put("workshopState", s.workshopConnected ? "Connesso" : s.workshopConfigured ? "In attesa" : "Non configurato");
+  const wifiInfo = [], wifi = s.wifi;
+  if (s.stationMac) wifiInfo.push(`MAC: ${s.stationMac}`);
+  if (wifi && s.workshopConfigured) {
+    if (wifi.retryCount) wifiInfo.push(`Tentativi di recupero: ${wifi.retryCount}`);
+    if (!s.workshopConnected) {
+      if (wifi.lastDisconnectReason) wifiInfo.push(`Ultimo errore ${wifi.lastDisconnectReason}: ${wifi.lastDisconnectMessage}`);
+      if (wifi.statusCode === 0) wifiInfo.push('Connessione in corso / in attesa di indirizzo IP');
+      wifiInfo.push(wifi.recoveryPaused ? 'Recupero sospeso durante aggiornamento' : wifi.recoveryRunning ?
+        `Nuovo tentativo entro circa ${wifi.retryInSec} s` : 'Recupero aggiuntivo non disponibile: controlla il log');
+    }
+  }
+  $('wifiDiagnostics').hidden = !wifiInfo.length;
+  put('wifiDiagnostics', wifiInfo.join(' · '));
   const station = $("workshopAddress"); station.hidden = !s.stationIp;
   if (s.stationIp) { station.href = `http://${s.stationIp}/`; station.textContent = station.href; }
   const local = $("localAddress"); local.hidden = !s.localName;
@@ -210,7 +271,7 @@ function display(s) {
   put("apAddress", s.apIp ? `http://${s.apIp}/` : "");
   const bad = s.phase === "fault" || s.phase === "interrupted";
   $("statusDot").className = `status-dot ${bad ? "fault" : s.test?.running ? "paused" : s.phase === "running" ? "running" : s.phase === "paused" ? "paused" : "idle"}`;
-  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : labels[s.phase] || s.phase);
+  put("statusText", s.test?.enabled ? (s.test.running ? "TEST IN CORSO" : "MODALITÀ TEST") : manualActive ? manualLabel : labels[s.phase] || s.phase);
   $("alarmBox").classList.toggle("hidden", !bad);
   put("alarmText", s.fault || (s.phase === "interrupted" ? "Il ciclo precedente si è interrotto. uscita spenta. Valuta il materiale prima di iniziare un nuovo ciclo." : ""));
   put('cycleErrorInfo', s.emergency ? `Emergenza attiva: ${s.fault || 'uscite bloccate fino al riconoscimento.'}` :
@@ -249,6 +310,23 @@ function updateControls() {
   $("startBtn").disabled = !connected || commandBusy || !latest?.ready || blocked || latest?.phase === "interrupted" ||
                             !recipesLoaded || recipesDirty || !recipes.length || !$("hardwareReady").checked;
   $("hardwareReady").disabled = active;
+  const manualActive = !!latest?.manual?.active, supported = !!latest?.manual;
+  const targetText = String($('manualTarget').value).trim(), manualTarget = targetText ? Number(targetText) : NaN;
+  const validManualTarget = Number.isFinite(manualTarget) && manualTarget >= 0 && manualTarget <= 400;
+  const rateText = String($('manualRate').value).trim(), rate = rateText ? Number(rateText) : NaN;
+  const validRate = Number.isFinite(rate) && rate >= .1;
+  const cooldownText = String($('manualCooldownTarget').value).trim(), cooldownTarget = cooldownText ? Number(cooldownText) : NaN;
+  const validCooldown = Number.isFinite(cooldownTarget) && cooldownTarget >= 0 && cooldownTarget <= 400 &&
+    Number.isFinite(latest?.target) && cooldownTarget <= latest.target;
+  $('manualHardwareReady').disabled = active || !connected;
+  $('manualStart').disabled = !supported || !connected || commandBusy || blocked || !latest?.ready ||
+    !validManualTarget || !validRate || !$('manualHardwareReady').checked || latest?.phase === 'interrupted';
+  $('manualApply').disabled = !supported || !connected || commandBusy || !manualActive || !latest?.ready || !validManualTarget || !validRate;
+  $('manualCooldown').disabled = !connected || !manualActive || latest?.manual?.mode === 'cooldown' || !!latest?.otaUpdating || !validRate || !validCooldown;
+  $('manualStop').disabled = !connected || !manualActive;
+  $('manualTarget').disabled = !connected || commandBusy || !!latest?.otaUpdating;
+  $('manualRate').disabled = $('manualTarget').disabled;
+  $('manualCooldownTarget').disabled = !connected || !!latest?.otaUpdating;
   $("recipeSelect").disabled = active || !connected;
   $("globalStop").disabled = false;
   $("refreshReport").disabled = !connected || !latest?.reportAvailable || reportBusy;
@@ -261,6 +339,7 @@ function updateControls() {
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
   $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || latest?.phase !== "paused";
   $("resetBtn").disabled = !connected || commandBusy || blocked || !["fault", "interrupted"].includes(latest?.phase);
+  $('manualReset').disabled = $('resetBtn').disabled;
   $("stopBtn").disabled = !latest;
 }
 function markDirty() { recipesDirty = true; updateControls(); }
@@ -344,6 +423,7 @@ function download(name, data, mime) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 async function command(action) {
+  const wasManual = !!latest?.manual?.active;
   const safetyAction = action === 'stop' || action === 'emergency';
   if ((commandBusy || testCommandBusy) && !safetyAction) return;
   if (safetyAction) cancelTestOwnership();
@@ -351,21 +431,60 @@ async function command(action) {
   try {
     const result = await api("/api/command", { action, recipeId: selectedId, hardwareReady: $("hardwareReady").checked });
     if (generation !== commandGeneration) { if (action === "start") api("/api/command", {action:"stop"}).catch(() => {}); return; }
-    if (["start", "stop", "emergency", "reset"].includes(action)) $("hardwareReady").checked = false;
+    if (["start", "stop", "emergency", "reset"].includes(action)) $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
+    const text = ({ start: "Ciclo avviato.", pause: "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
+}
+async function manualCommand(action) {
+  if (action === 'stop') return command('stop');
+  const safetyAction = action === 'cooldown';
+  if ((commandBusy || testCommandBusy) && !safetyAction) return;
+  const body = {action, hardwareReady: $('manualHardwareReady').checked};
+  if (action === 'start' || action === 'target' || safetyAction) {
+    const value = String($(safetyAction ? 'manualCooldownTarget' : 'manualTarget').value).trim();
+    body.targetC = value ? Number(value) : NaN;
+    if (!Number.isFinite(body.targetC) || body.targetC < 0 || body.targetC > 400) {
+      note('manualMessage', 'Inserisci un target da 0 a 400 °C.', true); return;
+    }
+    const rateValue = String($('manualRate').value).trim();
+    body.rateCMin = rateValue ? Number(rateValue) : NaN;
+    if (!Number.isFinite(body.rateCMin) || body.rateCMin < .1) {
+      note('manualMessage', 'Inserisci un rate di almeno 0,1 °C/min.', true); return;
+    }
+  }
+  const generation = ++commandGeneration;
+  commandBusy = true; updateControls();
+  try {
+    const result = await api('/api/manual', body);
+    if (generation !== commandGeneration) {
+      if ((action === 'start' || action === 'target') && result.manual?.active)
+        api('/api/command', {action:'stop'}).catch(() => {});
+      return;
+    }
+    manualTargetDirty = false;
+    if (action === 'start' || safetyAction) $('manualHardwareReady').checked = $('hardwareReady').checked = false;
+    display(result);
+    if (action === 'start') { chartAtEnd = true; drawSoon(); }
+    const text = result.phase === 'fault' || result.phase === 'interrupted' ? result.fault || 'Controllo manuale bloccato.' :
+      action === 'cooldown' ? 'Cooldown manuale: uscita spenta, monitoraggio attivo.' :
+      `Target manuale ${temp(result.manual?.targetC)} °C applicato.`;
+    note('manualMessage', text, result.phase === 'fault' || result.phase === 'interrupted');
+    note('globalMessage', text, result.phase === 'fault' || result.phase === 'interrupted');
+  } catch (e) {
+    if (generation === commandGeneration) { note('manualMessage', e.message, true); note('globalMessage', e.message, true); }
+  } finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); } }
 }
 function historyPoint(row) {
   const [seq, ms, t1, t2, target, duty, flags, step] = row;
   const a = t1 === null ? NaN : Number(t1), b = t2 === null ? NaN : Number(t2);
   return { seq, ms, t1: a, t2: b, actual: Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : NaN,
            target: target === null ? NaN : Number(target), duty: Number(duty), relay: !!(flags & 4),
-           marker: flags & 0xf0, step };
+           marker: flags & 0xf0, step: step === 255 ? null : step, operation: step === 255 ? 'manual' : 'program' };
 }
 async function loadHistory(initial = false) {
   if (historyBusy) return;
@@ -433,7 +552,7 @@ function drawChart() {
   for (const p of markers.sort((a, b) => Boolean(a.marker & 16) - Boolean(b.marker & 16))) {
     const start = !!(p.marker & 16);
     const color = start ? "#cc9cff" : p.marker & 128 ? "#ff5e6c" : p.marker & 64 ? "#4ba3ff" : "#f6b94f";
-    const label = markerNames[p.marker] || "EVENTO";
+    const label = start && p.operation === 'manual' ? 'INIZIO MANUALE' : markerNames[p.marker] || "EVENTO";
     const px = x(p.ms);
     ctx.save();
     ctx.strokeStyle = color; ctx.lineWidth = start ? 4 : 2;
@@ -488,10 +607,11 @@ async function refreshLogs() {
 function connectionLost() {
   const age = lastResponseAt === null ? Infinity : performance.now() - lastResponseAt;
   const stale = age < 6000;
-  connected = false; renderFailed = false; $("hardwareReady").checked = false; testOffline(stale);
+  connected = false; renderFailed = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false; testOffline(stale);
   put("statusText", stale ? `AGGIORNAMENTO IN RITARDO · ${Math.ceil(age / 1000)} s` : "ESP NON RAGGIUNGIBILE");
   $("statusDot").className = `status-dot ${stale ? 'paused' : 'fault'}`;
   if (!stale) for (const id of ["avgTemp", "targetTemp", "deltaTemp", "t1", "t2", "cycleDuration", "stepDuration"]) put(id, "—");
+  if (!stale) updateDeltaIndicator(NaN);
   put("sampleAge", Number.isFinite(age) ? `Non aggiornate da ${Math.ceil(age / 1000)} s` : 'Non disponibili');
   put("relayState", "SCONOSCIUTO"); put("pidInfo", "Comando attuale non verificato");
   $("relayState").classList.remove('heating');
@@ -519,15 +639,20 @@ async function refresh() {
   finally { busy = false; }
 }
 function show(view) {
-  for (const name of ["Dashboard", "Recipes", "Test", "Logs", "Report"]) {
+  selectedView = view;
+  for (const name of ["Dashboard", "Manual", "Recipes", "Test", "Logs", "Report"]) {
     const active = view === name;
     $(`tab${name}`).classList.toggle("active", active);
-    $(`${name.toLowerCase()}View`).hidden = !active;
+    if (name !== 'Manual') $(`${name.toLowerCase()}View`).hidden = name === 'Dashboard' ? !['Dashboard','Manual'].includes(view) : !active;
   }
+  $('programControls').hidden = view === 'Manual';
+  $('manualControl').hidden = view !== 'Manual';
+  put('ovenTitle', view === 'Manual' ? 'Forno · Manuale' : 'Forno');
+  put('targetLabel', view === 'Manual' || latest?.manual?.active ? 'Setpoint manuale' : 'Setpoint di rampa');
   if (view !== "Test") cancelTestOwnership(true);
   if (view === "Report" && latest?.reportAvailable) loadReport();
   if (view === "Logs") refreshLogs();
-  if (view === "Dashboard") drawSoon();
+  if (view === "Dashboard" || view === 'Manual') drawSoon();
 }
 
 const reportOutcomes = {completed: "CICLO COMPLETATO", stopped: "CICLO FERMATO", fault: "CICLO IN ALLARME"};
@@ -703,6 +828,7 @@ function validateRecipes(list) {
 }
 
 $("tabDashboard").onclick = () => show("Dashboard");
+$('tabManual').onclick = () => show('Manual');
 $("tabRecipes").onclick = () => show("Recipes");
 $("tabTest").onclick = () => show("Test");
 $("tabLogs").onclick = () => show("Logs");
@@ -718,6 +844,15 @@ $("pauseBtn").onclick = () => command("pause");
 $("resumeBtn").onclick = () => command("resume");
 $("stopBtn").onclick = () => command("stop");
 $("globalStop").onclick = () => command("emergency");
+$('manualTarget').oninput = () => { manualTargetDirty = true; updateControls(); };
+$('manualRate').oninput = $('manualTarget').oninput;
+$('manualCooldownTarget').oninput = $('manualTarget').oninput;
+$('manualReset').onclick = () => command('reset');
+$('manualHardwareReady').onchange = () => updateControls();
+$('manualStart').onclick = () => manualCommand('start');
+$('manualApply').onclick = () => manualCommand('target');
+$('manualCooldown').onclick = () => manualCommand('cooldown');
+$('manualStop').onclick = () => manualCommand('stop');
 $("hardwareReady").onchange = updateControls;
 $("resetBtn").onclick = () => command("reset");
 $("recipeSelect").onchange = e => { selectedId = e.target.value; renderPreview(); };

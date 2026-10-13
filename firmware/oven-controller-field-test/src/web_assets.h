@@ -55,9 +55,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!DOCTYPE html>
     <aside class="panel control-panel">
       <h2>Comandi di collaudo</h2>
       <p>Ogni prova è temporizzata. Nessun PID e nessuna ricetta. Puoi testare relè e LED anche con sonde assenti o in fault.</p>
-      <label class="confirm-loads"><input id="loadsDisconnected" type="checkbox"> Le resistenze reali del forno sono fisicamente scollegate.</label>
-      <button id="armBtn" class="primary full" disabled>ABILITA TEST PER 60 s</button>
-      <p id="armState" class="hint">Comandi disabilitati · Solo lettura sonde</p>
+      <p class="hint">Premi direttamente il pulsante della prova desiderata. Mantieni questa pagina visibile durante il test.</p>
       <button id="stopBtn" class="danger full" disabled>STOP · RELÈ SPENTO</button>
       <div id="messageBox" class="notice hidden" role="status" aria-live="polite"></div>
       <div class="test-progress"><strong id="testName">Lettura sonde</strong><span id="testRemaining">—</span></div>
@@ -72,11 +70,13 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!DOCTYPE html>
       <p class="hint">Sequenza: spenti → verde → rosso → entrambi, 2 s ciascuno. GPIO4 resta spento. A riposo verde acceso = dashboard avviata; rosso segue il relè. Durante il test LED il rosso è indipendente dal relè.</p>
       <hr>
       <h2>Test comando relè</h2>
-      <label class="field"><span>Durata impulso</span><select id="pulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option></select></label>
-      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Invia impulso</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
-      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e disabilita i test. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
+      <label class="field"><span>Durata accensione relè</span><select id="pulseDuration"><option value="100">0,1 s</option><option value="500">0,5 s</option><option value="1000" selected>1 s</option><option value="2000">2 s</option><option value="5000">5 s</option><option value="30000">30 s</option><option value="60000">1 min</option><option value="120000">2 min</option><option value="600000">10 min</option></select></label>
+      <div class="buttons relay-buttons"><button data-action="relayPulse" class="primary" disabled>Accendi relè</button><button data-action="relaySequence" disabled>3 impulsi da 1 s</button></div>
+      <p class="hint">Il relè resta acceso per tutta la durata scelta e poi si spegne automaticamente. STOP è sempre disponibile.</p>
+      <p class="hint">Sequenza relè: 1 s ON / 2 s OFF, per 3 volte. Rosso segue il comando. Se manca l'heartbeat della dashboard per 2,5 s, il supervisore spegne il relè e ferma la prova. Cambiare scheda del browser o bloccare il telefono ferma le prove.</p>
       <hr>
       <h2>Rete e scheda</h2>
+      <div class="network-line"><span>Aggiornamenti Wi-Fi OTA</span><strong id="otaState">—</strong></div>
       <div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta</span><strong>OvenController-FieldTest</strong></div><span id="apAddress" class="network-address">—</span></div>
       <div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Reset codice</span><strong id="resetReason">—</strong></div><div><span>Chip ESP</span><strong id="chipTemperature">—</strong></div><div><span>RAM libera / minimo</span><strong id="heap">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="rssi">—</strong></div><div><span>Test al reset</span><strong id="interrupted">—</strong></div></div>
       <p class="hint">La temperatura del chip ESP non è quella del regolatore o dell'aria. Nessuna uscita riparte automaticamente dopo un reset. Nessun login: usa una rete di prova controllata.</p>
@@ -482,23 +482,19 @@ function message(text, error = false) {
   $('messageBox').className = `notice${error ? ' error' : ''}`;
 }
 function setControls() {
-  const owned = online && !!token && !!state?.armed;
-  $('armBtn').disabled = !online || commandBusy || !!state?.armed || !$('loadsDisconnected').checked;
-  $('loadsDisconnected').disabled = !!state?.armed;
   $('stopBtn').disabled = !online;
   $('pulseDuration').disabled = !!state?.running;
   document.querySelectorAll('[data-action]').forEach(button => {
-    button.disabled = !owned || commandBusy || !!state?.running;
+    button.disabled = !online || commandBusy || !!state?.running || !!state?.otaUpdating;
   });
   $('exportSamples').disabled = !online || historyBusy;
   $('refreshLogs').disabled = !online || logsBusy;
   $('exportLogs').disabled = !online || logsBusy;
 }
-function clearOwnership() { token = 0; $('loadsDisconnected').checked = false; }
+function clearOwnership() { token = 0; }
 function setOffline() {
   online = false; clearOwnership();
   $('statusText').textContent = 'Scollegato'; $('statusDot').className = 'status-dot fault';
-  $('armState').textContent = 'Collegamento perso · Riabilita i test dopo la riconnessione';
   $('relayState').textContent = 'SCONOSCIUTO'; $('relayHint').textContent = 'Ultimo stato non aggiornato';
   $('greenIndicator').className = $('redIndicator').className = 'physical-led unknown';
   for (let i = 1; i <= 2; i++) {
@@ -507,16 +503,17 @@ function setOffline() {
     $(`fault${i}`).textContent = 'Connessione persa';
   }
   $('deltaTemp').textContent = '—'; $('testName').textContent = 'Collegamento perso'; $('testRemaining').textContent = '—';
+  $('otaState').textContent = 'Collegamento perso';
   setControls();
 }
 function renderStatus(data) {
   if (boot !== null && boot !== data.bootCount) {
     clearOwnership(); samples = []; historySeq = 0; historyGeneration++;
     logs = []; $('logList').textContent = 'Scheda riavviata · Caricamento log…';
-    message('Scheda riavviata: relè spento e comandi da riabilitare.');
+    message('Scheda riavviata: relè spento.');
   }
   boot = data.bootCount; state = data; online = true;
-  if (!data.armed && token) clearOwnership();
+  if (!data.running && token) clearOwnership();
   $('statusText').textContent = data.running ? 'Test in corso' : 'Connesso';
   $('statusDot').className = `status-dot ${data.running ? 'paused' : 'running'}`;
   $('uptime').textContent = duration(data.uptimeMs);
@@ -535,12 +532,10 @@ function renderStatus(data) {
     $(`fault${i}`).textContent = `Fault 0x${sensor.faultCode.toString(16).padStart(2, '0').toUpperCase()} · ${sensor.message}`;
   });
   $('deltaTemp').textContent = data.sensors.every(s => s.valid) ? fmt(Math.abs(data.sensors[0].c - data.sensors[1].c)) : '—';
-  $('armState').textContent = data.armed ?
-    `${token ? 'Test abilitati su questa pagina' : 'Test abilitati da altra pagina'} · ${Math.ceil(data.armRemainingMs / 1000)} s residui` :
-    'Comandi disabilitati · Solo lettura sonde';
   $('testName').textContent = data.test;
-  $('testRemaining').textContent = data.running ? `${(data.remainingMs / 1000).toFixed(1)} s` : '—';
+  $('testRemaining').textContent = data.running ? (data.remainingMs >= 60000 ? duration(Math.ceil(data.remainingMs / 1000) * 1000) : `${(data.remainingMs / 1000).toFixed(1)} s`) : '—';
   $('workshopState').textContent = data.workshopConnected ? 'Connesso' : data.workshopConfigured ? 'In connessione' : 'Non configurato';
+  $('otaState').textContent = data.otaUpdating ? 'Aggiornamento in corso' : data.otaEnabled ? `Attivo · Porta ${data.otaPort}` : 'Disabilitato';
   const address = $('workshopAddress'); address.hidden = !data.stationIp;
   if (data.stationIp) address.href = address.textContent = `http://${data.stationIp}/`;
   const local = $('localAddress'); local.hidden = !data.localName;
@@ -558,29 +553,23 @@ async function command(action) {
   const generation = ++commandGeneration;
   commandBusy = true; setControls();
   try {
-    const body = {action, token};
-    if (action === 'arm') body.loadsDisconnected = $('loadsDisconnected').checked;
+    const body = {action};
     if (action === 'relayPulse') body.durationMs = Number($('pulseDuration').value);
     if (action === 'stop') clearOwnership();
     const data = await api('/api/command', body);
     if (generation !== commandGeneration) {
-      if (action === 'arm') void api('/api/command', {action: 'stop'}).catch(() => {});
+      if (action !== 'stop') void api('/api/command', {action: 'stop'}).catch(() => {});
       return;
     }
-    if (action === 'arm') {
-      token = data.token;
-      // Take a fresh status before enabling buttons. Start the lease immediately.
-      lastHeartbeat = performance.now(); await api('/api/heartbeat', {token});
-      const status = await api('/api/status');
-      if (generation !== commandGeneration) return;
-      renderStatus(status);
-      message('Test abilitati per 60 s. Mantieni questa pagina visibile.');
-    } else { renderStatus(data); message(action === 'stop' ? 'STOP ricevuto: relè spento e test disabilitati.' : 'Prova avviata: osserva il circuito.'); }
+    token = data.token || 0;
+    lastHeartbeat = 0;
+    renderStatus(data);
+    if (token) void heartbeat();
+    message(action === 'stop' ? 'STOP ricevuto: relè spento.' : 'Prova avviata: mantieni questa pagina visibile.');
     lastLogPoll = 0;
   } catch (error) {
     if (generation !== commandGeneration) return;
     message(error.name === 'AbortError' ? 'Risposta assente: verifica la connessione. Il supervisore arresta il test senza heartbeat.' : error.message, true);
-    if (action === 'arm') clearOwnership();
   } finally { if (generation === commandGeneration) { commandBusy = false; setControls(); } }
 }
 async function heartbeat() {
@@ -588,7 +577,7 @@ async function heartbeat() {
   heartbeatBusy = true; lastHeartbeat = performance.now();
   const requestToken = token;
   try { await api('/api/heartbeat', {token: requestToken}); }
-  catch (error) { if (token === requestToken) { clearOwnership(); message('Abilitazione persa: verifica il collegamento e riabilita i test.', true); setControls(); } }
+  catch (error) { if (token === requestToken) { clearOwnership(); setControls(); void poll(); } }
   finally { heartbeatBusy = false; }
 }
 async function poll() {
@@ -703,14 +692,12 @@ async function exportCsv() {
   finally { historyBusy = false; setControls(); }
 }
 function stopOnHide() {
-  if (!token) return;
+  if (!token && !commandBusy) return;
   commandGeneration++; commandBusy = false; clearOwnership(); setControls();
   // Best effort immediate stop. The firmware lease also expires independently.
   const body = new Blob([JSON.stringify({action: 'stop'})], {type: 'text/plain'});
   navigator.sendBeacon('/api/command', body);
 }
-$('loadsDisconnected').addEventListener('change', setControls);
-$('armBtn').addEventListener('click', () => void command('arm'));
 $('stopBtn').addEventListener('click', () => void command('stop'));
 document.querySelectorAll('[data-action]').forEach(b => b.addEventListener('click', () => void command(b.dataset.action)));
 $('exportSamples').addEventListener('click', () => void exportCsv());

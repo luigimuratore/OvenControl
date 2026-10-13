@@ -8,6 +8,8 @@
 #include <new>
 #include <algorithm>
 #include "telegram_policy.h"
+#include "telegram_delivery.h"
+#include "telegram_runtime.h"
 #include "report_pdf.h"
 
 // Arduino's WiFiClientSecure library shadows the SDK's esp_crt_bundle.h.
@@ -17,7 +19,7 @@ extern "C" esp_err_t esp_crt_bundle_attach(void *conf);
 // The worker owns all HTTPS/JSON state. The loop only copies fixed-size messages
 // into PSRAM queues with zero wait. No sensor, PID, Preferences or GPIO access here.
 class TelegramService {
-  struct Message { uint32_t created; bool pin = false; char text[telegram::kMessageBytes]; };
+  struct Message { uint32_t created; bool pin = false, menu = false, event = false; char text[telegram::kMessageBytes]; };
   struct ReportJob {
     reports::Snapshot report;
     reportpdf::Point *points = nullptr;
@@ -34,8 +36,10 @@ class TelegramService {
     esp_http_client_handle_t http = nullptr;
     int64_t offset = -1;
     int64_t pinMessageId = 0;
-    uint32_t nextPoll = 0, nextRequest = 0, lastSend = 0;
-    unsigned failures = 0, serverRetry = 0;
+    uint32_t lastSend = 0;
+    unsigned serverRetry = 0;
+    std::atomic<bool> tlsConnected{false};
+    telegram::RetryLane messages, polling, attachments;
     ReportJob *document = nullptr;
     char *pdf = nullptr;
     size_t pdfBytes = 0;
@@ -56,9 +60,22 @@ class TelegramService {
   uint8_t documentStorage[3 * sizeof(ReportJob *)]{};
   uint8_t *alarmStorage = nullptr, *noticeStorage = nullptr, *replyStorage = nullptr;
   std::atomic<bool> available{false}, statusRequest{false}, running{false};
+  std::atomic<int> modeValue{int(telegram::Mode::Brief)}, requestedMode{-1};
   std::atomic<uint32_t> sent{0}, failed{0}, dropped{0}, lastSuccess{0};
   std::atomic<int> lastHttp{0};
   std::atomic<uint32_t> reportsSent{0}, reportsDropped{0}, reportsPending{0};
+  std::atomic<uint32_t> reportsUnconfirmed{0}, duplicateReportsSkipped{0};
+  std::atomic<uint32_t> internalFree{0}, largestInternalBlock{0}, memoryDeferrals{0};
+  std::atomic<uint32_t> pollCount{0}, lastPoll{0}, commandsReceived{0}, staleCommands{0};
+  telegram::RecentReportCycles queuedCycles;
+#if defined(CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN) && defined(CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN)
+  static constexpr size_t kTlsRecordBytes = CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN > CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN ?
+    CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN : CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN;
+#elif defined(CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN)
+  static constexpr size_t kTlsRecordBytes = CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN;
+#else
+  static constexpr size_t kTlsRecordBytes = 16384;
+#endif
 
   static void releaseReport(ReportJob *job) {
     if (!job) return;
@@ -72,9 +89,10 @@ class TelegramService {
   }
   static void renderYield() { vTaskDelay(pdMS_TO_TICKS(1)); }
 
-  static bool due(uint32_t now, uint32_t deadline) { return int32_t(now - deadline) >= 0; }
   static esp_err_t httpEvent(esp_http_client_event_t *event) {
     auto *w = static_cast<Worker *>(event->user_data);
+    if (event->event_id == HTTP_EVENT_ON_CONNECTED) w->tlsConnected = true;
+    if (event->event_id == HTTP_EVENT_DISCONNECTED || event->event_id == HTTP_EVENT_ERROR) w->tlsConnected = false;
     if (event->event_id == HTTP_EVENT_ON_DATA && event->data_len > 0) {
       const size_t bytes = size_t(event->data_len);
       if (w->used + bytes >= kResponseBytes) w->overflow = true;
@@ -82,18 +100,23 @@ class TelegramService {
     }
     return ESP_OK;
   }
-  bool request(const char *method, const String &body, JsonDocument &response) {
-    // TLS allocations use internal heap in this SDK. Leave room for control/web.
-    if (ESP.getFreeHeap() < 60000 || heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768) {
-      // A retained TLS session may itself occupy this margin. Release it before
-      // retrying the check, so low heap cannot permanently trap that session.
+  bool tlsRoom() {
+    const auto ready = [&] {
+      internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      largestInternalBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      return telegram::tlsHeapReady(internalFree.load(), largestInternalBlock.load(),
+        worker->tlsConnected.load(), kTlsRecordBytes);
+    };
+    if (!ready()) {
       closeHttp();
-      if (ESP.getFreeHeap() < 60000 || heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768) {
-        lastHttp = -2; return false;
-      }
+      if (!ready()) { lastHttp = -2; ++memoryDeferrals; return false; }
     }
+    return true;
+  }
+  bool request(const char *method, const String &body, JsonDocument &response) {
     auto &w = *worker;
     w.used = 0; w.overflow = false; w.serverRetry = 0;
+    if (!tlsRoom()) return false;
     String url = String("https://api.telegram.org/bot") + token + "/" + method;
     if (!w.http) {
       esp_http_client_config_t config{};
@@ -103,7 +126,7 @@ class TelegramService {
       config.event_handler = httpEvent; config.user_data = &w;
       config.keep_alive_enable = true; config.buffer_size = 1024; config.buffer_size_tx = 1024;
       w.http = esp_http_client_init(&config);
-      if (!w.http) { lastHttp = -2; return false; }
+      if (!w.http) { lastHttp = -3; return false; }
     }
     esp_http_client_set_url(w.http, url.c_str());
     esp_http_client_set_method(w.http, HTTP_METHOD_POST);
@@ -141,25 +164,35 @@ class TelegramService {
       filter.remove("result"); filter["result"]["message_id"] = true;
     }
     const auto error = deserializeJson(response, w.response, DeserializationOption::Filter(filter));
-    if (error) return false;
+    if (error) { lastHttp = -4; return false; }
     w.serverRetry = response["parameters"]["retry_after"] | 0U;
     return code == 200 && response["ok"].as<bool>();
   }
   void closeHttp() {
     if (worker->http) { esp_http_client_cleanup(worker->http); worker->http = nullptr; }
+    worker->tlsConnected = false;
   }
-  void backoff() {
+  void backoff(telegram::RetryLane &lane) {
     ++failed;
-    worker->nextRequest = millis() + telegram::retryMs(++worker->failures, worker->serverRetry);
+    lane.fail(millis(), worker->serverRetry);
   }
   bool sendMessage(const Message &message, bool critical) {
+    if (message.event && !telegram::allowEvent(mode(), critical)) return true;
     JsonDocument body(&allocator), response(&allocator);
     body["chat_id"] = chatId; body["text"] = message.text;
     body["disable_notification"] = !critical;
+    if (message.menu) {
+      JsonObject markup = body["reply_markup"].to<JsonObject>();
+      markup["resize_keyboard"] = true; markup["is_persistent"] = true; markup["one_time_keyboard"] = false;
+      JsonArray rows = markup["keyboard"].to<JsonArray>();
+      JsonArray first = rows.add<JsonArray>(); first.add(telegram::kEssentialButton); first.add(telegram::kBriefButton);
+      JsonArray second = rows.add<JsonArray>(); second.add(telegram::kDetailedButton); second.add("/status");
+      rows.add<JsonArray>().add("/modalita");
+    }
     String payload; serializeJson(body, payload);
-    if (!request("sendMessage", payload, response)) { backoff(); return false; }
+    if (!request("sendMessage", payload, response)) { backoff(worker->messages); return false; }
     if (message.pin) worker->pinMessageId = response["result"]["message_id"] | int64_t(0);
-    worker->failures = 0; worker->nextRequest = millis(); worker->lastSend = millis();
+    worker->messages.success(millis()); worker->lastSend = millis();
     ++sent; lastSuccess = millis(); return true;
   }
   void pinGuide() {
@@ -170,12 +203,13 @@ class TelegramService {
     if (!request("pinChatMessage", payload, response)) {
       // A deleted message or inaccessible chat cannot be repaired by retrying.
       if (lastHttp == 400 || lastHttp == 403) { worker->pinMessageId = 0; ++dropped; }
-      backoff(); return;
+      backoff(worker->messages); return;
     }
-    worker->pinMessageId = 0; worker->failures = 0; worker->nextRequest = millis();
+    worker->pinMessageId = 0; worker->messages.success(millis());
   }
   bool sendDocument() {
     auto &w = *worker;
+    w.serverRetry = 0;
     if (!w.pdf) {
       w.pdf = static_cast<char *>(ps_malloc(reportpdf::kCapacity));
       if (w.pdf) w.pdfBytes = reportpdf::generate(w.pdf, reportpdf::kCapacity, w.document->report,
@@ -188,10 +222,7 @@ class TelegramService {
     }
     // Release the polling TLS session before opening the streaming upload.
     closeHttp();
-    if (!available || ESP.getFreeHeap() < 60000 ||
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32768) {
-      lastHttp = -2; backoff(); return false;
-    }
+    if (!available || !tlsRoom()) { backoff(w.attachments); return false; }
     char name[128]; reportpdf::filename(w.document->report, name, sizeof(name));
     const String boundary = "OvenPdf" + String(esp_random(), HEX) + String(esp_random(), HEX);
     const String prefix = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
@@ -208,45 +239,58 @@ class TelegramService {
     config.crt_bundle_attach = esp_crt_bundle_attach; config.disable_auto_redirect = true;
     config.buffer_size = 1024; config.buffer_size_tx = 1024;
     auto client = esp_http_client_init(&config);
-    if (!client) { lastHttp = -2; backoff(); return false; }
+    if (!client) { lastHttp = -3; backoff(w.attachments); return false; }
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_header(client, "Content-Type", ("multipart/form-data; boundary=" + boundary).c_str());
     const uint32_t began = millis();
-    bool interrupted = false;
+    bool interrupted = false, mayHaveDelivered = false;
     bool ok = esp_http_client_open(client, prefix.length() + w.pdfBytes + suffix.length()) == ESP_OK;
-    const auto write = [&](const char *data, size_t bytes) {
+    const auto write = [&](const char *data, size_t bytes, bool finalBoundary = false) {
       size_t at = 0;
       while (at < bytes && available && uint32_t(millis() - began) < 25000) {
         if (uxQueueMessagesWaiting(alarms)) { interrupted = true; return false; }
+        // A failed final write may still have reached the server. Do not repeat
+        // an upload with an ambiguous result, even if its reply is lost.
+        if (finalBoundary) mayHaveDelivered = true;
         const int n = esp_http_client_write(client, data + at, std::min(size_t(1024), bytes - at));
         if (n <= 0) return false;
         at += n; vTaskDelay(pdMS_TO_TICKS(1));
       }
       return at == bytes;
     };
-    ok = ok && write(prefix.c_str(), prefix.length()) && write(w.pdf, w.pdfBytes) && write(suffix.c_str(), suffix.length());
+    ok = ok && write(prefix.c_str(), prefix.length()) && write(w.pdf, w.pdfBytes) && write(suffix.c_str(), suffix.length(), true);
     if (ok) ok = esp_http_client_fetch_headers(client) >= 0;
     const int code = ok ? esp_http_client_get_status_code(client) : -1;
-    size_t bytes = 0;
-    while (ok && !esp_http_client_is_complete_data_received(client) && bytes < kResponseBytes - 1) {
-      if (!available || uint32_t(millis() - began) >= 30000) { ok = false; break; }
-      const int n = esp_http_client_read(client, w.response + bytes, kResponseBytes - 1 - bytes);
-      if (n < 0) { ok = false; break; }
-      if (!n) { ok = esp_http_client_is_complete_data_received(client); break; }
-      bytes += n;
-    }
-    ok = ok && esp_http_client_is_complete_data_received(client);
-    esp_http_client_cleanup(client); w.response[bytes] = 0; lastHttp = code; w.serverRetry = 0;
+    w.response[0] = '\0';
+    if (ok) telegram::readDocumentBody(w.response, kResponseBytes,
+      [&](char *data, size_t bytes) { return esp_http_client_read(client, data, int(bytes)); },
+      [&]() { return esp_http_client_is_complete_data_received(client); },
+      [&]() { return available.load() && uint32_t(millis() - began) < 30000; });
+    esp_http_client_cleanup(client); lastHttp = code; w.serverRetry = 0;
     // A new alarm preempts the attachment; preserve the PDF without imposing
     // the upload retry delay on that alarm's notification.
-    if (interrupted) { w.nextRequest = millis(); return false; }
+    if (interrupted && !mayHaveDelivered) { w.attachments.success(millis()); return false; }
     JsonDocument response(&allocator), filter(&allocator);
     filter["ok"] = true; filter["parameters"]["retry_after"] = true;
-    if (ok && !deserializeJson(response, w.response, DeserializationOption::Filter(filter)))
+    filter["result"]["message_id"] = true;
+    const bool validResponse = !deserializeJson(response, w.response, DeserializationOption::Filter(filter)) &&
+      response["ok"].is<bool>();
+    if (validResponse)
       w.serverRetry = response["parameters"]["retry_after"] | 0U;
-    else ok = false;
-    if (!ok || code != 200 || !response["ok"].as<bool>()) { backoff(); return false; }
-    w.failures = 0; w.nextRequest = millis(); w.lastSend = millis();
+    const auto result = telegram::documentResult(mayHaveDelivered, code, validResponse,
+      response["ok"].as<bool>(), response["result"]["message_id"] | int64_t(0));
+    if (result == telegram::DocumentResult::Retry) { backoff(w.attachments); return false; }
+    if (result != telegram::DocumentResult::Confirmed) {
+      ++failed;
+      if (result == telegram::DocumentResult::Uncertain) ++reportsUnconfirmed;
+      finishDocument(false); w.attachments.success(millis());
+      // Silent, single warning; the attachment itself is no longer queued.
+      notify(result == telegram::DocumentResult::Uncertain ?
+        "⚠️ Conferma PDF Telegram non ricevuta. Per evitare duplicati il report non verrà reinviato automaticamente; se manca in chat, scaricalo dalla dashboard." :
+        "⚠️ PDF rifiutato da Telegram. Scarica il report dalla dashboard e verifica la configurazione del bot.");
+      return false;
+    }
+    w.attachments.success(millis()); w.lastSend = millis();
     ++sent; lastSuccess = millis(); finishDocument(true); return true;
   }
   void poll() {
@@ -255,8 +299,8 @@ class TelegramService {
     body["offset"] = w.offset; body["limit"] = 1; body["timeout"] = 2;
     body["allowed_updates"].to<JsonArray>().add("message");
     String payload; serializeJson(body, payload);
-    if (!request("getUpdates", payload, response)) { backoff(); return; }
-    w.failures = 0; w.nextRequest = millis();
+    if (!request("getUpdates", payload, response)) { backoff(w.polling); return; }
+    ++pollCount; lastPoll = millis();
     bool found = false;
     for (JsonObjectConst update : response["result"].as<JsonArrayConst>()) {
       found = true;
@@ -266,23 +310,31 @@ class TelegramService {
       const JsonObjectConst message = update["message"];
       if (!telegram::authorized(chatId, message["chat"]["id"] | int64_t(0),
           message["from"]["id"] | int64_t(0), message["chat"]["type"] | "")) continue;
-      if (!telegram::fresh(message["date"] | int64_t(0), int64_t(time(nullptr)))) continue;
-      switch (telegram::command(message["text"] | "")) {
+      if (!telegram::fresh(message["date"] | int64_t(0), int64_t(time(nullptr)))) { ++staleCommands; continue; }
+      const auto command = telegram::command(message["text"] | "");
+      if (command != telegram::Command::None) ++commandsReceived;
+      switch (command) {
         case telegram::Command::Status: statusRequest = true; break;
         case telegram::Command::Help:
-          notify(telegram::kGuideText, false, strcmp(message["text"] | "", "/start") == 0);
+          notify(String(telegram::kGuideText) + "\n\nModalità attiva: " + telegram::modeName(mode()),
+            false, strcmp(message["text"] | "", "/start") == 0, true);
           break;
+        case telegram::Command::ModeMenu:
+          reply(String("🎛 Modalità attiva: ") + telegram::modeName(mode()) + "\n\n" + telegram::kModeMenuText, true);
+          break;
+        case telegram::Command::Essential: requestedMode = int(telegram::Mode::Essential); break;
+        case telegram::Command::Brief: requestedMode = int(telegram::Mode::Brief); break;
+        case telegram::Command::Detailed: requestedMode = int(telegram::Mode::Detailed); break;
         default: break;
       }
     }
-    w.nextPoll = millis() + (found ? 200 : 2000);
+    w.polling.success(millis(), found ? 200 : 2000);
   }
   void run() {
     auto &w = *worker;
     for (;;) {
       if (!available.load()) { closeHttp(); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
       const uint32_t now = millis();
-      if (!due(now, w.nextRequest)) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
       if (!w.hasCritical) w.hasCritical = xQueueReceive(alarms, &w.critical, 0) == pdTRUE;
       if (!w.hasReply) w.hasReply = xQueueReceive(replies, &w.reply, 0) == pdTRUE;
       if (!w.hasNotice) w.hasNotice = xQueueReceive(notices, &w.notice, 0) == pdTRUE;
@@ -290,19 +342,22 @@ class TelegramService {
       if (w.document && uint32_t(now - w.document->created) > 86400000) finishDocument(false);
       if (w.hasReply && telegram::expired(now, w.reply.created, true, false)) { w.hasReply = false; ++dropped; }
       if (w.hasNotice && telegram::expired(now, w.notice.created, false, false)) { w.hasNotice = false; ++dropped; }
+      // A selection also suppresses old routine events still waiting in the queue.
+      if (w.hasNotice && w.notice.event && !telegram::allowEvent(mode(), false)) w.hasNotice = false;
       Message *out = w.hasCritical ? &w.critical : w.hasReply ? &w.reply : w.hasNotice ? &w.notice : nullptr;
-      if (out && uint32_t(now - w.lastSend) >= 1100) {
+      if (out && w.messages.ready(now) && uint32_t(now - w.lastSend) >= 1100) {
         if (sendMessage(*out, out == &w.critical)) {
           if (out == &w.critical) w.hasCritical = false;
           else if (out == &w.reply) w.hasReply = false;
           else w.hasNotice = false;
         }
       }
-      else if (!out && w.pinMessageId) pinGuide();
-      else if (!out && w.document && uint32_t(now - w.document->created) >= 2000 && uint32_t(now - w.lastSend) >= 1100)
+      else if (!out && w.pinMessageId && w.messages.ready(now)) pinGuide();
+      else if (!out && w.polling.ready(now)) poll();
+      else if (!out && w.document && w.attachments.ready(now) && uint32_t(now - w.document->created) >= 2000 && uint32_t(now - w.lastSend) >= 1100)
         sendDocument();
-      // Commands are read even with a stream of notices. Polling is bounded at 2 s.
-      if (due(millis(), w.nextRequest) && due(millis(), w.nextPoll)) poll();
+      // Polling has its own retry deadline, independent of messages and PDFs.
+      if (w.polling.ready(millis())) poll();
       vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
@@ -349,17 +404,23 @@ public:
     return running;
   }
   void setAvailable(bool ready) { available = ready; }
+  telegram::Mode mode() const { return telegram::modeFrom(modeValue.load()); }
+  void setMode(telegram::Mode selected) { modeValue = int(selected); }
+  int takeModeRequest() { return requestedMode.exchange(-1); }
   bool takeStatusRequest() { return running && statusRequest.exchange(false); }
-  bool notify(const String &text, bool critical = false, bool pin = false) {
+  bool notify(const String &text, bool critical = false, bool pin = false, bool menu = false, bool event = false) {
     if (!running) return false;
-    Message message{}; copyText(message, text); message.pin = pin;
+    if (event && !telegram::allowEvent(mode(), critical)) return true;
+    Message message{}; copyText(message, text); message.pin = pin; message.menu = menu; message.event = event;
     const bool queued = xQueueSend(critical ? alarms : notices, &message, 0) == pdTRUE;
     if (!queued) ++dropped;
     return queued;
   }
+  bool notifyEvent(const String &text, bool critical = false) { return notify(text, critical, false, false, true); }
   template <typename Sample>
   bool report(const reports::Snapshot &snapshot, const Sample *curve, size_t count, bool partial) {
     if (!running) return false;
+    if (queuedCycles.contains(snapshot.boot, snapshot.startMs)) { ++duplicateReportsSkipped; return true; }
     if (reportsPending >= 4 || count > 4321 || (count && !curve)) { ++reportsDropped; return false; }
     auto *job = static_cast<ReportJob *>(ps_malloc(sizeof(ReportJob)));
     if (!job) { ++reportsDropped; return false; }
@@ -372,18 +433,27 @@ public:
       curve[i].flags & 8 ? curve[i].setpoint : NAN};
     ++reportsPending;
     if (xQueueSend(documents, &job, 0) != pdTRUE) { --reportsPending; releaseReport(job); ++reportsDropped; return false; }
+    queuedCycles.remember(snapshot.boot, snapshot.startMs);
     return true;
   }
-  void reply(const String &text) {
+  void reply(const String &text, bool menu = false) {
     if (!running) return;
-    Message message{}; copyText(message, text); xQueueOverwrite(replies, &message);
+    Message message{}; copyText(message, text); message.menu = menu; xQueueOverwrite(replies, &message);
   }
   void status(JsonObject object) const {
     object["configured"] = configured; object["running"] = running.load();
+    object["notificationMode"] = telegram::modeKey(mode());
     object["networkReady"] = available.load(); object["sent"] = sent.load();
     object["failedAttempts"] = failed.load(); object["dropped"] = dropped.load();
     object["lastHttpCode"] = lastHttp.load(); object["lastSentAtMs"] = lastSuccess.load();
     object["reportsSent"] = reportsSent.load(); object["reportsPending"] = reportsPending.load();
     object["reportsDropped"] = reportsDropped.load();
+    object["reportsUnconfirmed"] = reportsUnconfirmed.load();
+    object["duplicateReportsSkipped"] = duplicateReportsSkipped.load();
+    object["internalFreeBytes"] = internalFree.load(); object["largestInternalBlockBytes"] = largestInternalBlock.load();
+    object["tlsConnected"] = worker && worker->tlsConnected.load();
+    object["tlsRecordBytes"] = kTlsRecordBytes; object["memoryDeferrals"] = memoryDeferrals.load();
+    object["pollCount"] = pollCount.load(); object["lastPollAtMs"] = lastPoll.load();
+    object["commandsReceived"] = commandsReceived.load(); object["staleCommands"] = staleCommands.load();
   }
 };

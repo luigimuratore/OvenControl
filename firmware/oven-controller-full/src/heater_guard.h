@@ -10,6 +10,7 @@ inline bool validSettings(bool ssr, float maxPower, uint32_t windowMs) {
 enum class Fault : uint8_t { None, StaleControl, CycleTimeout, InvalidPlan };
 struct Plan {
   bool cycleActive = false, heatingAllowed = false, healthy = false;
+  bool manual = false; // Manual regulation ends only on operator command or a fault.
   uint32_t sampleAt = 0, cycleAt = 0, windowAt = 0, windowMs = 60000;
   float duty = 0;
 };
@@ -24,7 +25,7 @@ class Guard {
   bool tick(uint32_t now) {
     on = false;
     if (fault != Fault::None || !plan.cycleActive) return false;
-    if (uint32_t(now - plan.cycleAt) >= kMaxCycleMs) fault = Fault::CycleTimeout;
+    if (!plan.manual && uint32_t(now - plan.cycleAt) >= kMaxCycleMs) fault = Fault::CycleTimeout;
     else if (uint32_t(now - plan.sampleAt) >= kStaleMs) fault = Fault::StaleControl;
     else if (!plan.healthy || !std::isfinite(plan.duty) || plan.duty < 0 || plan.duty > 100 ||
              plan.windowMs < 1000 || plan.windowMs > 300000) fault = Fault::InvalidPlan;

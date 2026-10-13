@@ -1,3 +1,4 @@
 .pio/
 .vscode/
 include/wifi_config.h
+include/ota_config.h

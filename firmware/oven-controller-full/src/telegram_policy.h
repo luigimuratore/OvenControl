@@ -7,12 +7,38 @@ constexpr size_t kMessageBytes = 2400;
 constexpr uint32_t kCommandAgeSec = 120;
 constexpr uint32_t kReplyLifetimeMs = 10000;
 constexpr uint32_t kNoticeLifetimeMs = 3600000;
+enum class Mode : uint8_t { Essential, Brief, Detailed };
+inline bool validMode(int value) { return value >= 0 && value <= 2; }
+inline Mode modeFrom(int value) { return validMode(value) ? Mode(value) : Mode::Brief; }
+inline const char *modeName(Mode mode) {
+  return mode == Mode::Essential ? "Essenziale" : mode == Mode::Detailed ? "Dettagliata" : "Sintetica";
+}
+inline const char *modeKey(Mode mode) {
+  return mode == Mode::Essential ? "essenziale" : mode == Mode::Detailed ? "dettagliata" : "sintetica";
+}
+inline bool allowEvent(Mode mode, bool critical) { return critical || mode != Mode::Essential; }
+constexpr const char *kEssentialButton = "🛡️ Essenziale";
+constexpr const char *kBriefButton = "🔔 Sintetica";
+constexpr const char *kDetailedButton = "📋 Dettagliata";
+constexpr const char *kModeMenuText = R"modes(Scegli come ricevere gli eventi:
+🛡️ Essenziale — Solo emergenze/allarmi/blackout e PDF.
+🔔 Sintetica — Eventi brevi, allarmi dettagliati e PDF.
+📋 Dettagliata — Tutti gli eventi con stato completo e PDF.
+
+/status resta sempre disponibile. Gli eventi ordinari e i PDF restano silenziosi; gli allarmi mantengono la notifica sonora.)modes";
 constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 
 📋 COMANDI
 /status — Stato completo: ciclo, temperature, uscite, PID e allarmi.
 /help — Aiuto sul bot.
 /start — Mostra e fissa questa guida; non avvia il forno.
+/modalita — Mostra la modalità attiva e i pulsanti di scelta.
+
+🎛 MODALITÀ NOTIFICHE
+🛡️ /essenziale — Solo emergenze/allarmi/blackout e PDF.
+🔔 /sintetica — Eventi brevi, allarmi dettagliati e PDF.
+📋 /dettagliata — Tutti gli eventi con stato completo e PDF.
+La scelta viene salvata; /status resta sempre disponibile.
 
 🔔 EVENTI AUTOMATICI
 🚀 Avvio · ⏸️ Pausa · ⏯️ Ripresa · ⚠️ STOP · ✅ Fine ciclo.
@@ -43,11 +69,15 @@ inline bool authorized(int64_t configured, int64_t chat, int64_t sender, const c
 inline bool fresh(int64_t date, int64_t now) {
   return date > 0 && now >= date && now - date <= kCommandAgeSec;
 }
-enum class Command { None, Status, Help };
+enum class Command { None, Status, Help, ModeMenu, Essential, Brief, Detailed };
 inline Command command(const char *text) {
   if (!text) return Command::None;
   if (std::strcmp(text, "/status") == 0) return Command::Status;
   if (std::strcmp(text, "/start") == 0 || std::strcmp(text, "/help") == 0) return Command::Help;
+  if (std::strcmp(text, "/modalita") == 0) return Command::ModeMenu;
+  if (std::strcmp(text, "/essenziale") == 0 || std::strcmp(text, kEssentialButton) == 0) return Command::Essential;
+  if (std::strcmp(text, "/sintetica") == 0 || std::strcmp(text, kBriefButton) == 0) return Command::Brief;
+  if (std::strcmp(text, "/dettagliata") == 0 || std::strcmp(text, kDetailedButton) == 0) return Command::Detailed;
   return Command::None;
 }
 inline bool expired(uint32_t now, uint32_t created, bool reply, bool critical) {

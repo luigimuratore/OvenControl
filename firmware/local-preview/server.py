@@ -17,6 +17,16 @@ ROOT = Path(__file__).resolve().parents[1]
 PROJECTS = {"full": "oven-controller-full", "field-test": "oven-controller-field-test"}
 
 
+def full_firmware_metadata():
+    source = (ROOT / "oven-controller-full/include/firmware_version.h").read_text()
+    values = {}
+    for key, symbol in (("firmwareVersion", "kVersion"), ("firmwareModifiedOn", "kModifiedOn")):
+        match = re.search(rf'{symbol}\s*=\s*"([^"]+)"', source)
+        if match:
+            values[key] = match.group(1)
+    return values
+
+
 class ApiError(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
@@ -67,6 +77,10 @@ class DemoDevice:
         self.recipes = json.loads((ROOT / "oven-controller-full/examples/recipes.json").read_text())
         self.report_work, self.last_report = None, None
         self.active, self.step_index = None, 0
+        self.operation, self.manual_mode, self.manual_target = "program", "idle", None
+        self.manual_cooling = False
+        self.manual_rate = 1.0
+        self.manual_started = self.manual_ended = 0.0
         self.cycle_at = self.step_at = self.now
         self.step_elapsed = self.hold = 0.0
         self.was_in_band = False
@@ -114,7 +128,7 @@ class DemoDevice:
         flags = int(a["valid"]) | (int(b["valid"]) << 1)
         if self.mode == "full":
             flags |= (4 if self.relay else 0) | (8 if self.target is not None else 0) | marker
-            row = [self.seq, int(at * 1000), a["c"], b["c"], self.target, self.duty, flags, self.step_index]
+            row = [self.seq, int(at * 1000), a["c"], b["c"], self.target, self.duty, flags, 255 if self.operation == "manual" else self.step_index]
         else:
             relay, red, green = self.outputs()
             flags |= (4 if relay else 0) | (8 if red else 0) | (16 if green else 0)
@@ -225,11 +239,11 @@ class DemoDevice:
             remaining -= dt
             self.now += dt
             if self.mode == "field-test":
-                if self.armed and (self.now - self.heartbeat_at >= 2.5 or self.now - self.arm_at >= 60):
+                if self.action and self.now - self.heartbeat_at >= 2.5:
                     self.stop_field()
-                    self.log("STOP", "Abilitazione simulata scaduta: uscite spente.")
+                    self.log("STOP", "Heartbeat assente da 2,5 s: test simulato fermato.")
                 if self.action and self.now - self.test_at >= self.test_duration:
-                    self.action = ""
+                    self.stop_field()
                     self.log("TEST", "Prova simulata terminata.")
             elif self.test_enabled:
                 if self.action and self.now - self.heartbeat_at >= 2.5:
@@ -248,7 +262,74 @@ class DemoDevice:
                 self.record()
                 self.last_sample = self.now
 
+    def end_manual(self, phase="idle", record=True):
+        self.manual_ended = self.now
+        self.manual_mode, self.manual_cooling = "idle", False
+        self.phase, self.target, self.duty, self.relay = phase, None, 0.0, False
+        if record:
+            self.record(marker=128 if phase == "fault" else 32)
+
+    def manual_command(self, body):
+        action = body.get("action")
+        if action == "stop":
+            if self.operation == "manual" and self.phase == "running":
+                self.end_manual()
+                self.log("MANUALE", "Controllo manuale fermato dall'operatore")
+            return self.status()
+        require(not self.test_enabled and not self.emergency and self.phase not in ("fault", "interrupted"),
+                "Manuale bloccato: esci da TEST o riconosci l'allarme", 409)
+        active = self.manual_mode != "idle" and self.phase == "running"
+        require(action in ("start", "target", "cooldown"), "Azione manuale sconosciuta")
+        target, rate = body.get("targetC"), body.get("rateCMin")
+        require(number(target, 0, 400), "Target manuale numerico da 0 a 400 °C")
+        require(number(rate, .1, 3.4e38), "Rate minimo: 0,1 °C/min")
+        if action == "cooldown":
+            require(active, "Nessun controllo manuale attivo", 409)
+            require(target <= self.target, "Target cooldown superiore al setpoint")
+            self.manual_mode, self.manual_cooling = "cooldown", False
+            self.manual_target, self.manual_rate = target, rate
+            self.duty, self.relay = 0.0, False
+            self.record()
+            self.log("MANUALE", "Cooldown manuale: uscita spenta, raffreddamento passivo")
+            return self.status()
+        require(not self.missing and self.temperature + .2 < 415, "Sonde non pronte", 409)
+        if action == "start":
+            require(self.phase not in ("running", "paused"), "Ferma prima il programma/manuale", 409)
+            require(body.get("hardwareReady") is True, "CHECK HARDWARE/AMBIENTE richiesto")
+            self.operation, self.active = "manual", None
+            self.manual_started, self.cycle_at = self.now, self.now
+            self.step_index, self.step_elapsed = 0, 0
+            self.phase = "running"
+            self.target = self.temperature + .1
+        else:
+            require(active, "Avvia prima il controllo manuale", 409)
+        if self.manual_mode == "cooldown" or self.manual_cooling:
+            self.target = self.temperature + .1
+        self.manual_mode, self.manual_target, self.manual_rate = "regulating", target, rate
+        self.manual_cooling = self.temperature + .2 > target + 1 or self.target > target + 1
+        self.duty, self.relay = 0.0, False
+        self.record(marker=16 if action == "start" else 0)
+        self.log("MANUALE", ("Manuale avviato: target " if action == "start" else "Target manuale modificato: ") + str(target) + " °C · rate " + str(rate) + " °C/min")
+        return self.status()
+
     def advance_full(self, dt):
+        if self.manual_mode != "idle":
+            self.duty, self.relay = 0.0, False
+            movement = self.manual_rate * dt / 60
+            self.target = min(self.manual_target, self.target + movement) if self.target < self.manual_target else max(self.manual_target, self.target - movement)
+            if self.manual_mode == "regulating":
+                if self.manual_cooling and self.temperature + .2 <= self.manual_target + 1 and self.target == self.manual_target:
+                    self.manual_cooling = False
+                if not self.manual_cooling:
+                    self.duty = min(self.control["maxPower"], max(0, (self.target - self.temperature) * self.pid["kp"]))
+                    self.relay = self.duty > 0 and (self.now - self.manual_started) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
+            if self.temperature + .2 >= 415 or (self.manual_mode == "regulating" and not self.manual_cooling and self.temperature + .2 >= self.target + 8):
+                self.fault = "Sovratemperatura manuale simulata"
+                self.end_manual("fault")
+                self.log("ALLARME", self.fault)
+                return
+            self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
+            return
         if self.phase in ("running", "paused"):
             self.account_report(dt)
         self.duty, self.relay = 0.0, False
@@ -303,15 +384,16 @@ class DemoDevice:
             relay, red, green = self.outputs()
             names = {"relayPulse": "Impulso relè", "relaySequence": "Relè: 3 impulsi", "ledGreen": "LED verde",
                      "ledRed": "LED rosso", "ledBoth": "Entrambi i LED", "ledOff": "LED spenti", "ledSequence": "Sequenza LED"}
-            base.update(armed=self.armed, armRemainingMs=max(0, int((60 - self.now + self.arm_at) * 1000)) if self.armed else 0,
+            base.update(otaEnabled=False, otaUpdating=False, otaPort=3232,
                         running=bool(self.action), test=names.get(self.action, "Lettura sonde simulate"),
                         remainingMs=max(0, int((self.test_duration - self.now + self.test_at) * 1000)) if self.action else 0,
                         relay=relay, red=red, green=green, leaseMs=2500)
         else:
+            base.update(full_firmware_metadata())
             active = self.phase in ("running", "paused")
             step = self.active["steps"][self.step_index] if self.active and self.step_index < len(self.active["steps"]) else {}
             remaining = None
-            if active:
+            if active and self.manual_mode == "idle":
                 if step.get("type") == "hold":
                     remaining = max(0, math.ceil(step["duration"] * 60 - self.hold))
                 else:
@@ -324,10 +406,15 @@ class DemoDevice:
             base.update(stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
                         emergency=self.emergency, lastCycleError=self.last_cycle_error)
             base.update(self.control)
+            manual_active = self.manual_mode != "idle" and self.phase == "running"
+            base.update(operation=self.operation, manual=dict(active=manual_active, mode=self.manual_mode,
+                targetC=self.manual_target, rateCMin=self.manual_rate, setpointC=self.target, coolingToTarget=self.manual_cooling,
+                elapsedSec=max(0, int((self.now if manual_active else self.manual_ended) - self.manual_started)),
+                startedAtMs=int(self.manual_started * 1000)))
             base.update(mode="FULL", phase=self.phase, fault=self.fault, relay=self.relay, duty=self.duty,
                         ready=not self.missing and self.phase not in ("fault", "interrupted"), pid=dict(self.pid),
-                        cycleElapsedSec=int(self.now - self.cycle_at) if active else int(self.last_report["durationMs"] / 1000) if self.last_report else 0, stepElapsedSec=int(self.step_elapsed) if active else 0,
-                        cycleStartedAtMs=int(self.cycle_at * 1000) if self.active else None,
+                        cycleElapsedSec=0 if self.operation == "manual" else int(self.now - self.cycle_at) if active else int(self.last_report["durationMs"] / 1000) if self.last_report else 0, stepElapsedSec=int(self.step_elapsed) if active and self.operation != "manual" else 0,
+                        cycleStartedAtMs=int(self.manual_started * 1000) if manual_active else int(self.cycle_at * 1000) if self.active else None,
                         target=self.target, stepIndex=self.step_index, stepCount=len(self.active["steps"]) if self.active else 0,
                         recipeName=self.active["name"] if self.active else "", stepType=step.get("type", ""),
                         stepFinalTarget=step.get("target"), stepRate=step.get("rate", 0), holdInBandSec=int(self.hold),
@@ -389,10 +476,14 @@ class DemoDevice:
                             samples=copy.deepcopy(rows), more=more, moreBefore=more_before)
             raise ApiError(404, "API non trovata")
         require(isinstance(body, dict), "Oggetto JSON richiesto")
+        if endpoint == "manual" and self.mode == "full":
+            return self.manual_command(body)
         if endpoint == "preview-sensor":
             require(type(body.get("missing")) is bool, "Stato sonda non valido")
             self.missing = body["missing"]
             if self.mode == "full" and self.missing and self.phase in ("running", "paused"):
+                if self.operation == "manual":
+                    self.end_manual("fault", record=False)
                 self.observe_report()
                 self.finish_report("fault", "Fault PT100 simulato")
                 self.phase, self.fault, self.duty, self.relay = "fault", "Fault PT100 simulato", 0.0, False
@@ -428,6 +519,8 @@ class DemoDevice:
             self.emergency = True
             self.duty, self.relay = 0.0, False
             self.fault = "EMERGENZA simulata: uscite bloccate fino al riconoscimento"
+            if self.operation == "manual" and self.manual_mode != "idle":
+                self.end_manual("fault", record=False)
             if self.phase in ("running", "paused"):
                 self.finish_report("fault", self.fault)
             self.phase, self.target = "fault", None
@@ -435,6 +528,9 @@ class DemoDevice:
         elif action == "stop":
             self.stop_field()
             self.duty, self.relay = 0.0, False
+            if self.operation == "manual" and self.manual_mode != "idle":
+                self.end_manual()
+                self.log("MANUALE", "Controllo manuale fermato dall'operatore")
             if self.phase in ("running", "paused"):
                 self.finish_report("stopped", "Ciclo simulato fermato manualmente")
                 self.phase, self.target = "idle", None
@@ -453,11 +549,13 @@ class DemoDevice:
             first = recipe["steps"][0]
             require(first["type"] != "ramp" or self.temperature + .1 < first["target"] - 1, "Temperatura già vicina al primo target", 409)
             require(first["type"] != "cooldown" or self.temperature + .1 > first["target"] + 1, "Temperatura già sotto il cooldown", 409)
+            self.operation, self.manual_mode = "program", "idle"
             self.active, self.phase, self.step_index, self.cycle_at = copy.deepcopy(recipe), "running", 0, self.now
             self.begin_step()
             self.begin_report()
             self.record(marker=16)
         elif action == "pause":
+            require(self.manual_mode == "idle", "Nel manuale usa COOLDOWN o STOP", 409)
             require(self.phase == "running", "Nessun ciclo in corso", 409)
             if self.report_work:
                 self.report_work["pauseCount"] += 1
@@ -510,7 +608,7 @@ class DemoDevice:
 
     def field_command(self, endpoint, body):
         if endpoint == "heartbeat":
-            require(self.armed and type(body.get("token")) is int and body["token"] == self.token, "Abilitazione simulata scaduta", 403)
+            require(self.action and type(body.get("token")) is int and body["token"] == self.token, "Test terminato o di un’altra dashboard", 403)
             self.heartbeat_at = self.now
             return None
         require(endpoint == "command", "API non trovata", 404)
@@ -519,25 +617,20 @@ class DemoDevice:
             self.stop_field()
             self.log("STOP", "STOP simulato: uscite spente")
             return self.status()
-        if action == "arm":
-            require(body.get("loadsDisconnected") is True, "Conferma richiesta (solo nella simulazione)")
-            require(not self.armed, "Test già abilitati", 409)
-            self.armed, self.token = True, secrets.randbelow(2**31 - 1) + 1
-            self.arm_at = self.heartbeat_at = self.now
-            self.log("TEST", "Test simulati abilitati per 60 s")
-            return {"token": self.token}
         durations = {"relayPulse": 1, "relaySequence": 9, "ledSequence": 8,
                      "ledGreen": 3, "ledRed": 3, "ledBoth": 3, "ledOff": 3}
         require(isinstance(action, str) and action in durations, "Azione sconosciuta")
-        require(self.armed and type(body.get("token")) is int and body["token"] == self.token, "Abilita prima i test simulati", 403)
         require(not self.action, "Test già in corso", 409)
         duration = durations[action]
         if action == "relayPulse":
-            require(type(body.get("durationMs")) is int and 100 <= body["durationMs"] <= 5000, "Durata: 100–5000 ms interi")
+            require(type(body.get("durationMs")) is int and (100 <= body["durationMs"] <= 5000 or body["durationMs"] in (30000, 60000, 120000, 600000)), "Durata relè non valida")
             duration = body["durationMs"] / 1000
-        self.action, self.test_at, self.test_duration = action, self.now, duration
+        self.action, self.test_at, self.test_duration, self.heartbeat_at = action, self.now, duration, self.now
+        self.token = secrets.randbelow(2**31 - 1) + 1
         self.log("TEST", f"Prova simulata: {action}")
-        return self.status()
+        result = self.status()
+        result["token"] = self.token
+        return result
 
 
 class PreviewServer(ThreadingHTTPServer):
@@ -615,13 +708,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             require(method == "GET", "Metodo non consentito", 405)
             name = "index.html" if len(pieces) == 1 else pieces[1] if len(pieces) == 2 else ""
-            require(name in ("index.html", "app.js", "style.css", "preview.js", "report-export.js", "jspdf.umd.min.js"), "File non trovato", 404)
+            require(name in ("index.html", "app.js", "style.css", "preview.js", "report-export.js", "jspdf.umd.min.js", "favicon.jpg"), "File non trovato", 404)
             path = Path(__file__).with_name("preview.js") if name == "preview.js" else ROOT / PROJECTS[mode] / "data" / ("vendor/jspdf.umd.min.js" if name == "jspdf.umd.min.js" else name)
+            if name == "favicon.jpg":
+                self.send(path.read_bytes(), "image/jpeg")
+                return
             content = path.read_text(encoding="utf-8")
             if name == "index.html":
                 for asset in ("report-export.js", "jspdf.umd.min.js"):
                     content = content.replace(f'src="/{asset}"', f'src="/{mode}/{asset}"')
                 content = content.replace('href="/style.css"', f'href="/{mode}/style.css"')
+                content = content.replace('href="/favicon.jpg', f'href="/{mode}/favicon.jpg')
                 content = content.replace('<script src="/app.js"></script>', f'<script src="/{mode}/preview.js"></script><script src="/{mode}/app.js"></script>')
                 content = content.replace("sull'ESP", "nell'anteprima").replace("sul controllore", "nell'anteprima")
                 content = content.replace("PT100 reali", "PT100 simulate").replace("Temperature reali", "Temperature simulate")

@@ -19,6 +19,9 @@ for filename, symbol in (("index.html", "WEB_HTML"), ("style.css", "WEB_CSS"), (
 pdf_js = gzip.compress((data / "vendor/jspdf.umd.min.js").read_bytes(), mtime=0)
 parts.append("const uint8_t WEB_PDF_JS[] PROGMEM = {\n" + "\n".join(
     ",".join(f"0x{b:02x}" for b in pdf_js[i:i+24]) + "," for i in range(0, len(pdf_js), 24)) + "\n};\n")
+favicon = (data / "favicon.jpg").read_bytes()
+parts.append("const uint8_t WEB_FAVICON[] PROGMEM = {\n" + "\n".join(
+    ",".join(f"0x{b:02x}" for b in favicon[i:i+24]) + "," for i in range(0, len(favicon), 24)) + "\n};\n")
 new_content = "\n".join(parts)
 if not out.exists() or out.read_text(encoding="utf-8") != new_content:
     out.write_text(new_content, encoding="utf-8")

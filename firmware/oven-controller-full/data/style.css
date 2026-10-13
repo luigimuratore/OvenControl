@@ -20,6 +20,12 @@
   --errors-border: #74414b;
   --cycle-timing-bg: #203d52;
   --cycle-timing-border: #4c8ebd;
+  --delta-warning-bg: #42351f;
+  --delta-danger-bg: #45232b;
+  --chart-difference-bg: rgba(75,163,255,.13);
+  --chart-difference-border: rgba(75,163,255,.3);
+  --manual-control-bg: #172a36;
+  --manual-control-border: #34576b;
   --test-enter-bg: #215b83;
   --test-exit-bg: #805c24;
   --emergency-red: #e92632;
@@ -51,6 +57,29 @@ body {
   color: var(--accent);
   font-weight: 700;
 }
+
+.firmware-footer {
+  max-width: 1600px;
+  margin: 0 auto;
+  padding: 12px 34px 28px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  text-align: left;
+}
+.metric.delta-warning { background: var(--delta-warning-bg); border-color: var(--warning); }
+.metric.delta-danger { background: var(--delta-danger-bg); border-color: var(--danger); }
+.metric.delta-warning strong { color: var(--warning); }
+.metric.delta-danger strong { color: var(--danger); }
+.manual-control { padding: 18px; border: 1px solid var(--manual-control-border); border-radius: 14px; background: var(--manual-control-bg); }
+.manual-control h2 { margin-top: 5px; }
+.manual-state { margin: 14px 0; padding: 10px 12px; border-radius: 8px; background: #0d1c27; color: var(--muted); font-size: 13px; font-weight: 600; }
+.manual-state.is-active { color: var(--accent); }
+.manual-state.is-cooling { color: #a8d8ff; }
+.buttons.manual-buttons { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.manual-cooldown { background: #224b67; border-color: #467d9f; }
+.recipe-summary.manual-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 680px) { .firmware-footer { padding-left: 16px; padding-right: 146px; } }
 
 h1 { margin: 5px 0 0; font-size: 30px; }
 h2 { margin: 0 0 4px; font-size: 18px; }
@@ -178,6 +207,7 @@ p { color: var(--muted); margin: 0; }
 .chart-scale select { width: auto; margin: 0; padding: 7px 10px; }
 .chart-plot { position: relative; }
 .chart-tooltip { position: absolute; z-index: 2; pointer-events: none; white-space: pre; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: #15212e; color: var(--text); font-size: 12px; line-height: 1.6; box-shadow: 0 4px 16px #0005; }
+.chart-tooltip-difference { margin-top: 6px; padding: 4px 7px; border: 1px solid var(--chart-difference-border); border-radius: 5px; background: var(--chart-difference-bg); color: #c2e0ff; font-weight: 600; }
 .chart-cursor { position: absolute; pointer-events: none; width: 1px; border-left: 1px dashed #b6c8d9; }
 .legend { display: flex; gap: 10px 14px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
 .legend-line {

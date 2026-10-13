@@ -30,23 +30,19 @@ function message(text, error = false) {
   $('messageBox').className = `notice${error ? ' error' : ''}`;
 }
 function setControls() {
-  const owned = online && !!token && !!state?.armed;
-  $('armBtn').disabled = !online || commandBusy || !!state?.armed || !$('loadsDisconnected').checked;
-  $('loadsDisconnected').disabled = !!state?.armed;
   $('stopBtn').disabled = !online;
   $('pulseDuration').disabled = !!state?.running;
   document.querySelectorAll('[data-action]').forEach(button => {
-    button.disabled = !owned || commandBusy || !!state?.running;
+    button.disabled = !online || commandBusy || !!state?.running || !!state?.otaUpdating;
   });
   $('exportSamples').disabled = !online || historyBusy;
   $('refreshLogs').disabled = !online || logsBusy;
   $('exportLogs').disabled = !online || logsBusy;
 }
-function clearOwnership() { token = 0; $('loadsDisconnected').checked = false; }
+function clearOwnership() { token = 0; }
 function setOffline() {
   online = false; clearOwnership();
   $('statusText').textContent = 'Scollegato'; $('statusDot').className = 'status-dot fault';
-  $('armState').textContent = 'Collegamento perso · Riabilita i test dopo la riconnessione';
   $('relayState').textContent = 'SCONOSCIUTO'; $('relayHint').textContent = 'Ultimo stato non aggiornato';
   $('greenIndicator').className = $('redIndicator').className = 'physical-led unknown';
   for (let i = 1; i <= 2; i++) {
@@ -55,16 +51,17 @@ function setOffline() {
     $(`fault${i}`).textContent = 'Connessione persa';
   }
   $('deltaTemp').textContent = '—'; $('testName').textContent = 'Collegamento perso'; $('testRemaining').textContent = '—';
+  $('otaState').textContent = 'Collegamento perso';
   setControls();
 }
 function renderStatus(data) {
   if (boot !== null && boot !== data.bootCount) {
     clearOwnership(); samples = []; historySeq = 0; historyGeneration++;
     logs = []; $('logList').textContent = 'Scheda riavviata · Caricamento log…';
-    message('Scheda riavviata: relè spento e comandi da riabilitare.');
+    message('Scheda riavviata: relè spento.');
   }
   boot = data.bootCount; state = data; online = true;
-  if (!data.armed && token) clearOwnership();
+  if (!data.running && token) clearOwnership();
   $('statusText').textContent = data.running ? 'Test in corso' : 'Connesso';
   $('statusDot').className = `status-dot ${data.running ? 'paused' : 'running'}`;
   $('uptime').textContent = duration(data.uptimeMs);
@@ -83,12 +80,10 @@ function renderStatus(data) {
     $(`fault${i}`).textContent = `Fault 0x${sensor.faultCode.toString(16).padStart(2, '0').toUpperCase()} · ${sensor.message}`;
   });
   $('deltaTemp').textContent = data.sensors.every(s => s.valid) ? fmt(Math.abs(data.sensors[0].c - data.sensors[1].c)) : '—';
-  $('armState').textContent = data.armed ?
-    `${token ? 'Test abilitati su questa pagina' : 'Test abilitati da altra pagina'} · ${Math.ceil(data.armRemainingMs / 1000)} s residui` :
-    'Comandi disabilitati · Solo lettura sonde';
   $('testName').textContent = data.test;
-  $('testRemaining').textContent = data.running ? `${(data.remainingMs / 1000).toFixed(1)} s` : '—';
+  $('testRemaining').textContent = data.running ? (data.remainingMs >= 60000 ? duration(Math.ceil(data.remainingMs / 1000) * 1000) : `${(data.remainingMs / 1000).toFixed(1)} s`) : '—';
   $('workshopState').textContent = data.workshopConnected ? 'Connesso' : data.workshopConfigured ? 'In connessione' : 'Non configurato';
+  $('otaState').textContent = data.otaUpdating ? 'Aggiornamento in corso' : data.otaEnabled ? `Attivo · Porta ${data.otaPort}` : 'Disabilitato';
   const address = $('workshopAddress'); address.hidden = !data.stationIp;
   if (data.stationIp) address.href = address.textContent = `http://${data.stationIp}/`;
   const local = $('localAddress'); local.hidden = !data.localName;
@@ -106,29 +101,23 @@ async function command(action) {
   const generation = ++commandGeneration;
   commandBusy = true; setControls();
   try {
-    const body = {action, token};
-    if (action === 'arm') body.loadsDisconnected = $('loadsDisconnected').checked;
+    const body = {action};
     if (action === 'relayPulse') body.durationMs = Number($('pulseDuration').value);
     if (action === 'stop') clearOwnership();
     const data = await api('/api/command', body);
     if (generation !== commandGeneration) {
-      if (action === 'arm') void api('/api/command', {action: 'stop'}).catch(() => {});
+      if (action !== 'stop') void api('/api/command', {action: 'stop'}).catch(() => {});
       return;
     }
-    if (action === 'arm') {
-      token = data.token;
-      // Take a fresh status before enabling buttons. Start the lease immediately.
-      lastHeartbeat = performance.now(); await api('/api/heartbeat', {token});
-      const status = await api('/api/status');
-      if (generation !== commandGeneration) return;
-      renderStatus(status);
-      message('Test abilitati per 60 s. Mantieni questa pagina visibile.');
-    } else { renderStatus(data); message(action === 'stop' ? 'STOP ricevuto: relè spento e test disabilitati.' : 'Prova avviata: osserva il circuito.'); }
+    token = data.token || 0;
+    lastHeartbeat = 0;
+    renderStatus(data);
+    if (token) void heartbeat();
+    message(action === 'stop' ? 'STOP ricevuto: relè spento.' : 'Prova avviata: mantieni questa pagina visibile.');
     lastLogPoll = 0;
   } catch (error) {
     if (generation !== commandGeneration) return;
     message(error.name === 'AbortError' ? 'Risposta assente: verifica la connessione. Il supervisore arresta il test senza heartbeat.' : error.message, true);
-    if (action === 'arm') clearOwnership();
   } finally { if (generation === commandGeneration) { commandBusy = false; setControls(); } }
 }
 async function heartbeat() {
@@ -136,7 +125,7 @@ async function heartbeat() {
   heartbeatBusy = true; lastHeartbeat = performance.now();
   const requestToken = token;
   try { await api('/api/heartbeat', {token: requestToken}); }
-  catch (error) { if (token === requestToken) { clearOwnership(); message('Abilitazione persa: verifica il collegamento e riabilita i test.', true); setControls(); } }
+  catch (error) { if (token === requestToken) { clearOwnership(); setControls(); void poll(); } }
   finally { heartbeatBusy = false; }
 }
 async function poll() {
@@ -251,14 +240,12 @@ async function exportCsv() {
   finally { historyBusy = false; setControls(); }
 }
 function stopOnHide() {
-  if (!token) return;
+  if (!token && !commandBusy) return;
   commandGeneration++; commandBusy = false; clearOwnership(); setControls();
   // Best effort immediate stop. The firmware lease also expires independently.
   const body = new Blob([JSON.stringify({action: 'stop'})], {type: 'text/plain'});
   navigator.sendBeacon('/api/command', body);
 }
-$('loadsDisconnected').addEventListener('change', setControls);
-$('armBtn').addEventListener('click', () => void command('arm'));
 $('stopBtn').addEventListener('click', () => void command('stop'));
 document.querySelectorAll('[data-action]').forEach(b => b.addEventListener('click', () => void command(b.dataset.action)));
 $('exportSamples').addEventListener('click', () => void exportCsv());

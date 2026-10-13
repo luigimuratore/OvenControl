@@ -57,4 +57,41 @@ int main() {
   assert(remainingSec(cool, 80, 20 * 60000UL, 0, 64, 65) == 1440);
   assert(remainingSec(cool, 80, 40 * 60000UL, 0, 40, 41) == 0);
   assert(std::isnan(remainingSec(cool, 80, 0, 0, NAN, 65)));
+
+  // Regression: the real 175 C program got stuck in Ramp although both PT100
+  // were in the qualifying hold band (174.7651 / 173.759 C).
+  const Step ramp175{Type::Ramp, 175.0f, 10.0f, 0};
+  const Step hold175{Type::Hold, 175.0f, 0, 60};
+  const uint32_t endOfRamp = 15 * 60000UL; // 25 C -> 175 C at 10 C/min.
+  assert(rampToHold(ramp175, &hold175));
+  assert(!rampDone(ramp175, 25, endOfRamp, 173.759f)); // Previous 1 C completion gate.
+  assert(rampDone(ramp175, 25, endOfRamp, 173.759f, 174.7651f, &hold175));
+  assert(remainingSec(ramp175, 25, endOfRamp, 0, 173.759f, 174.7651f, &hold175) == 0);
+  // In-band measurements must not skip the time/rate of the programmed ramp.
+  assert(!rampDone(ramp175, 25, endOfRamp - 60000, 173.759f, 174.7651f, &hold175));
+  assert(remainingSec(ramp175, 25, endOfRamp - 60000, 0, 173.759f, 174.7651f, &hold175) == 60);
+  assert(rampDone(ramp175, 25, endOfRamp, 170, 180, &hold175));
+  assert(!rampDone(ramp175, 25, endOfRamp, 169.99f, 175, &hold175));
+  assert(!rampDone(ramp175, 25, endOfRamp, 175, 180.01f, &hold175));
+  assert(remainingSec(ramp175, 25, endOfRamp, 0, 175, 181, &hold175) == 6);
+  assert(!rampDone(ramp175, 25, endOfRamp, NAN, 175, &hold175));
+  assert(!rampDone(ramp175, 25, endOfRamp, 173.759f, NAN, &hold175));
+  assert(!rampDone(ramp175, NAN, endOfRamp, 173.759f, 174.7651f, &hold175));
+  const Step differentHold{Type::Hold, 180, 0, 60};
+  assert(!rampToHold(ramp175, &differentHold));
+  assert(!rampToHold(ramp175, &cool));
+  assert(!rampDone(ramp175, 25, endOfRamp, 173.759f, 174.7651f, &differentHold));
+  // Entry starts a new timer: the entire preceding ramp is excluded.
+  HoldTimer timer; timer.reset(endOfRamp);
+  timer.update(endOfRamp + 500, inBand(173.759f, 174.7651f, hold175.target));
+  assert(timer.elapsedMs == 0);
+  timer.update(endOfRamp + 1000, inBand(173.759f, 174.7651f, hold175.target));
+  assert(timer.elapsedMs == 500);
+  timer.update(endOfRamp + 1500, false); assert(timer.elapsedMs == 500);
+  timer.update(endOfRamp + 2000, true); assert(timer.elapsedMs == 500);
+  timer.update(endOfRamp + 2500, true); assert(timer.elapsedMs == 1000);
+  timer.update(endOfRamp + 3000, true, false); assert(timer.elapsedMs == 1000);
+  timer.update(endOfRamp + 3500, true); assert(timer.elapsedMs == 1000);
+  timer.update(endOfRamp + 4000, true); assert(timer.elapsedMs == 1500);
+  timer.update(endOfRamp + 8000, true); assert(timer.elapsedMs == 1500); // Stale interval.
 }

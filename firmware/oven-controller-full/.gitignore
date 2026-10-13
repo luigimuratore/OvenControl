@@ -3,7 +3,10 @@
 include/wifi_config.h
 include/ota_config.h
 include/telegram_config.h
+include/telegram_preferences.json
 
 /tmp/pdfs/
 
-/output/pdf/
+# Grafici delle prove, report e backup locali
+/media/
+/output/

@@ -27,15 +27,70 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "include/telegram_config.h"
+MODE_CONFIG = ROOT / "include/telegram_preferences.json"
 TOKEN_PATTERN = r"[0-9]+:[A-Za-z0-9_-]{20,150}"
 # Share the firmware's guide verbatim; edit kGuideText in telegram_policy.h.
 GUIDE_TEXT = re.search(r'R"guide\((.*?)\)guide"',
     (ROOT / "src/telegram_policy.h").read_text(), re.S)[1]
+MODE_MENU_TEXT = re.search(r'R"modes\((.*?)\)modes"',
+    (ROOT / "src/telegram_policy.h").read_text(), re.S)[1]
+MODE_LABELS = {"essenziale": "Essenziale", "sintetica": "Sintetica", "dettagliata": "Dettagliata"}
+MODE_BUTTONS = {"🛡️ Essenziale": "/essenziale", "🔔 Sintetica": "/sintetica", "📋 Dettagliata": "/dettagliata"}
+
+
+def mode_keyboard():
+    return dict(keyboard=[["🛡️ Essenziale", "🔔 Sintetica"], ["📋 Dettagliata", "/status"], ["/modalita"]],
+                resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
+
+
+def mode_menu(mode):
+    return "🎛 Modalità attiva: " + MODE_LABELS[mode] + "\n\n" + MODE_MENU_TEXT
+
+
+def guide_text(mode):
+    return GUIDE_TEXT + "\n\nModalità attiva: " + MODE_LABELS[mode] + "\n\nANTEPRIMA SIMULATA"
+
+
+class NotificationSettings:
+    """Persist only this private chat's notification choice, independently of the ESP."""
+    def __init__(self, chat, path=MODE_CONFIG):
+        self.chat, self.path, self.mode = chat, Path(path), "sintetica"
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                if data.get("chat_id") == chat and data.get("mode") in MODE_LABELS:
+                    self.mode = data["mode"]
+            except (OSError, ValueError, AttributeError, TypeError):
+                print("Preferenza notifiche non leggibile: modalità Sintetica.", flush=True)
+
+    def select(self, mode):
+        if mode not in MODE_LABELS:
+            raise ValueError("Modalità notifiche non valida.")
+        if mode == self.mode:
+            return False
+        fd, temporary = tempfile.mkstemp(prefix=".telegram-mode-", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(dict(chat_id=self.chat, mode=mode), output)
+                output.flush(); os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        self.mode = mode
+        return True
+
+
+def discard_routine_events(pending):
+    for item in list(pending):
+        if item[3] and item[0] < 2:
+            pending.remove(item)
 
 
 class TelegramError(Exception):
-    def __init__(self, code=0, retry_after=0, reason=None, retryable=None):
+    def __init__(self, code=0, retry_after=0, reason=None, retryable=None, delivery_uncertain=False):
         self.code, self.retry_after = code, retry_after
+        self.delivery_uncertain = delivery_uncertain
         self.retryable = (code == 0 or code == 429 or code >= 500) if retryable is None else retryable
         super().__init__(reason or f"Telegram non disponibile (codice {code}); verifica rete/configurazione.")
 
@@ -126,10 +181,13 @@ class TelegramApi:
                 print(f"{error} Nuovo tentativo tra {delay} s.", flush=True)
                 time.sleep(delay)
 
-    def send(self, chat, text, critical=False):
+    def send(self, chat, text, critical=False, reply_markup=None):
         # Native messages are bounded at 2400 UTF-8 bytes; use the same limit here.
         bounded = text.encode()[:2399].decode(errors="ignore")
-        return self.call("sendMessage", chat_id=chat, text=bounded, disable_notification=not critical)
+        payload = dict(chat_id=chat, text=bounded, disable_notification=not critical)
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        return self.call("sendMessage", **payload)
 
     def send_document(self, chat, filename, pdf, caption=""):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}\.pdf", filename) or not pdf.startswith(b"%PDF-") or len(pdf) > 1048576:
@@ -140,8 +198,44 @@ class TelegramApi:
                   f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption[:1024]}\r\n'
                   f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
                   'Content-Type: application/pdf\r\n\r\n').encode()
-        return self._request("sendDocument", prefix + pdf + f"\r\n--{boundary}--\r\n".encode(),
-                             "multipart/form-data; boundary=" + boundary, timeout=30)
+        try:
+            result = self._request("sendDocument", prefix + pdf + f"\r\n--{boundary}--\r\n".encode(),
+                                   "multipart/form-data; boundary=" + boundary, timeout=30)
+        except TelegramError as error:
+            # urllib does not tell us whether a timed-out POST was accepted.
+            # Telegram has no sendDocument idempotency key: never retry that
+            # uncertain upload (including a 5xx reply), only an explicit 429.
+            if error.code == 0 or error.code >= 500:
+                error.delivery_uncertain = True
+                error.retryable = False
+            raise
+        if not isinstance(result, dict) or not isinstance(result.get("message_id"), int) or result["message_id"] <= 0:
+            raise TelegramError(reason="Conferma PDF Telegram non valida.", retryable=False, delivery_uncertain=True)
+        return result
+
+
+def deliver_pending(api, chat, pending, item):
+    """Consume each PDF on confirmation or uncertain/permanent failure."""
+    payload = item[2]
+    document = isinstance(payload, dict) and "pdf" in payload
+    try:
+        if document:
+            api.send_document(chat, **payload)
+        elif isinstance(payload, dict):
+            api.send(chat, **payload)
+        elif isinstance(payload, GuideMessage):
+            payload.send(api, chat)
+        else:
+            api.send(chat, payload, critical=item[0] == 2)
+    except TelegramError as error:
+        if not document or (error.retryable and not error.delivery_uncertain):
+            raise
+        pending.remove(item)
+        if error.delivery_uncertain:
+            return "⚠️ Conferma PDF Telegram non ricevuta. Per evitare duplicati il report non verrà reinviato automaticamente; se manca in chat, scaricalo dalla dashboard."
+        return "⚠️ PDF rifiutato da Telegram. Scarica il report dalla dashboard e verifica la configurazione del bot."
+    pending.remove(item)
+    return None
 
 
 def read_config(path=CONFIG):
@@ -346,11 +440,18 @@ def status_style(status):
     sensors = status.get("sensors", [])
     valid = [sensor.get("c") for sensor in sensors if sensor.get("valid")
              and isinstance(sensor.get("c"), (int, float)) and math.isfinite(sensor["c"])]
-    if len(valid) != 2 or abs(valid[0] - valid[1]) > 10 or max(valid) >= 415 or status.get("sampleAgeMs", 0) >= 3000:
+    if len(valid) != 2 or max(valid) >= 415 or status.get("sampleAgeMs", 0) >= 3000:
         return "⚠️", "SONDE NON PRONTE"
     if phase == "paused":
         return "⏸️", "CICLO IN PAUSA"
     if phase == "running":
+        manual = status.get("manual", {})
+        if manual.get("active"):
+            if manual.get("mode") == "cooldown":
+                return "❄️", "MANUALE · COOLDOWN PASSIVO"
+            if manual.get("coolingToTarget"):
+                return "❄️", "MANUALE · RAFFREDDAMENTO VERSO TARGET"
+            return "✅", "MANUALE · REGOLAZIONE"
         return "✅", "CICLO IN CORSO"
     if phase == "complete":
         return "✅", "CICLO COMPLETATO"
@@ -364,7 +465,8 @@ def status_style(status):
 def notice_icon(title, critical=False):
     if any(word in title for word in ("EMERGENZA", "ALLARME", "BLACKOUT")):
         return "🚨"
-    cycle_icons = {"CICLO AVVIATO": "🚀", "CICLO IN PAUSA": "⏸️", "CICLO RIPRESO": "⏯️"}
+    cycle_icons = {"CICLO AVVIATO": "🚀", "CICLO IN PAUSA": "⏸️", "CICLO RIPRESO": "⏯️",
+                   "MANUALE AVVIATO": "🚀", "MANUALE · TARGET MODIFICATO": "🎯", "MANUALE · COOLDOWN": "❄️"}
     if title in cycle_icons:
         return cycle_icons[title]
     if any(word in title for word in ("STOP", "FERMATO", "PAUSA", "INTERROT", "INTERRUZ", "RIAVVI", "AVVISO", "NON RAGGIUNGIBILE")):
@@ -372,7 +474,7 @@ def notice_icon(title, critical=False):
     return "🚨" if critical else "✅"
 
 
-def format_status(status):
+def format_status(status, mode="sintetica"):
     icon, state = status_style(status)
     lines = [f"Stato: {icon} {state}", "Aggiornato: " + datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")]
     if status.get("emergency"):
@@ -383,7 +485,18 @@ def format_status(status):
         lines += ["", "🧪 TEST", status["test"].get("name", "")]
     # recipeName can retain a selected/previous program after STOP or completion.
     # Only a running/paused cycle owns an active program and step.
-    if status.get("phase") in ("running", "paused"):
+    manual = status.get("manual", {})
+    if manual.get("active"):
+        lines += ["", "🎛 CONTROLLO MANUALE"]
+        lines.append("Target finale: " + temperature(manual.get("targetC")))
+        if manual.get("mode") == "cooldown":
+            lines.append("Cooldown passivo: riscaldamento SPENTO.")
+        else:
+            lines += ["Riscaldamento spento: raffreddamento verso il nuovo target." if manual.get("coolingToTarget")
+                      else "Regolazione PID fino al comando dell'operatore."]
+        lines.append("Setpoint: " + temperature(manual.get("setpointC")) + f" · rate {manual.get('rateCMin')} °C/min")
+        lines.append("Tempo manuale: " + duration(manual.get("elapsedSec")))
+    elif status.get("phase") in ("running", "paused"):
         lines += ["", "📋 CICLO ATTIVO", "Programma: " + (status.get("recipeName") or "non disponibile")]
         if status.get("stepIndex", 0) < status.get("stepCount", 0):
             kind = {"ramp": "Rampa", "hold": "Mantenimento", "cooldown": "Cooldown passivo"}.get(status.get("stepType"), "non disponibile")
@@ -429,21 +542,26 @@ def format_status(status):
             if interruption.get("pending"):
                 lines.append("Uscite bloccate; riconoscimento e nuovo avvio manuale richiesti.")
     lines += ["", "🧠 SISTEMA", "Uptime simulato: " + duration(status.get("uptimeMs", 0) / 1000),
+              "Modalità notifiche: " + MODE_LABELS[mode],
               f"Avvio: #{status.get('bootCount', 0)}",
               f"RAM libera/min: {status.get('freeHeap', 0)} / {status.get('minFreeHeap', 0)} B",
               "", "Nessun ESP collegato; nessuna uscita fisica."]
     return "\n".join(lines)
 
 
-def format_notice(title, reason="", status=None, critical=False, event_utc=None):
+def format_notice(title, reason="", status=None, critical=False, event_utc=None, mode="sintetica"):
+    if mode == "essenziale" and not critical:
+        return None
     date = datetime.fromtimestamp(event_utc, timezone.utc) if event_utc else datetime.now(timezone.utc)
     stamp = date.astimezone(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M:%S (Italia)")
     lines = [f"{notice_icon(title, critical)} {title}"]
-    if not critical:
+    if not critical and mode != "dettagliata":
         cycle_event = title in ("CICLO AVVIATO", "STOP", "CICLO COMPLETATO", "CICLO IN PAUSA", "CICLO RIPRESO")
         if cycle_event and status and status.get("recipeName") and (
                 status.get("phase") in ("running", "paused") or status.get("cycleStartedAtMs") is not None):
             lines.append("Programma: " + status["recipeName"])
+        if title.startswith("MANUALE") and reason:
+            lines.append(reason)
         return "\n".join(lines + ["📅 " + stamp, "", "ANTEPRIMA SIMULATA"])
     lines += ["📅 " + stamp, "ANTEPRIMA SIMULATA"]
     if status and status.get("recipeName") and status.get("cycleStartedAtMs") is not None and status.get("phase") not in ("running", "paused"):
@@ -451,18 +569,18 @@ def format_notice(title, reason="", status=None, critical=False, event_utc=None)
     if reason:
         lines.append("Motivo: " + reason)
     if status is not None:
-        lines += ["", "📍 STATO AL RILEVAMENTO", format_status(status)]
+        lines += ["", "📍 STATO AL RILEVAMENTO", format_status(status, mode)]
     return "\n".join(lines)
 
 
 class GuideMessage:
     """Keep the sent message ID when pinning needs a retry, avoiding duplicates."""
-    def __init__(self):
-        self.message_id = None
+    def __init__(self, mode="sintetica"):
+        self.message_id, self.mode = None, mode
 
     def send(self, api, chat):
         if self.message_id is None:
-            self.message_id = api.send(chat, GUIDE_TEXT + "\n\nANTEPRIMA SIMULATA")["message_id"]
+            self.message_id = api.send(chat, guide_text(self.mode), reply_markup=mode_keyboard())["message_id"]
         api.call("pinChatMessage", chat_id=chat, message_id=self.message_id, disable_notification=True)
 
 
@@ -482,8 +600,9 @@ class Commands:
             if not private_message(message, self.chat) or not (0 < date <= now and now - date <= 120):
                 continue
             text = message.get("text")
-            if text in ("/status", "/start", "/help"):
-                commands.append(text)
+            command = MODE_BUTTONS.get(text, text) if isinstance(text, str) else None
+            if command in ("/status", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
+                commands.append(command)
         return commands
 
 
@@ -508,7 +627,19 @@ class PreviewEvents:
             message = event.get("message", "")
             action = message.removeprefix("Comando simulato: ")
             event_utc = event.get("utc")
-            if action in mapping:
+            if event.get("level") == "MANUALE":
+                if message.startswith("Manuale avviato:"):
+                    title, self.phase = "MANUALE AVVIATO", "running"
+                elif message.startswith("Target manuale modificato:"):
+                    title = "MANUALE · TARGET MODIFICATO"
+                elif message.startswith("Cooldown manuale:"):
+                    title = "MANUALE · COOLDOWN"
+                elif message.startswith("Controllo manuale fermato"):
+                    title, self.phase = "MANUALE FERMATO · STOP", "idle"
+                else:
+                    continue
+                result.append((title, False, message, event_utc))
+            elif action in mapping:
                 # Like the ESP, STOP without an active cycle is not a cycle-stop event.
                 if action != "stop" or self.phase in ("running", "paused"):
                     result.append((mapping[action], action == "emergency", message, event_utc))
@@ -532,11 +663,14 @@ def preview(api, chat, url):
     if api.read("getWebhookInfo").get("url"):
         raise ValueError("Bot con webhook attivo: usa un bot dedicato.")
     commands = Commands(chat)
+    settings = NotificationSettings(chat)
     events = PreviewEvents(local_json(base, "logs"), local_json(base, "status"))
     reports = PreviewReports(local_json(base, "status"))
     pending = deque(maxlen=32)
 
-    def enqueue(text, priority=0):
+    def enqueue(text, priority=0, event=False):
+        if text is None or (event and priority < 2 and settings.mode == "essenziale"):
+            return
         if len(pending) == pending.maxlen:
             # Preserve queued alarms when dropping a routine preview message.
             expendable = next((item for item in pending if item[0] < 2), None)
@@ -544,9 +678,9 @@ def preview(api, chat, url):
                 print("Coda anteprima piena: messaggio non accodato.", flush=True)
                 return
             pending.remove(expendable)
-        pending.append((priority, time.monotonic(), text))
+        pending.append((priority, time.monotonic(), text, event))
 
-    enqueue(format_notice("COLLEGAMENTO ATTIVO", status=local_json(base, "status")))
+    enqueue(format_notice("COLLEGAMENTO ATTIVO", status=local_json(base, "status"), mode=settings.mode), event=True)
     print("Bot collegato all'anteprima. Invia /status; usa la dashboard per avvio/STOP/emergenza. Ctrl+C per chiudere.", flush=True)
     next_local = next_poll = next_send = retry_until = 0
     unavailable, failures = False, 0
@@ -557,12 +691,12 @@ def preview(api, chat, url):
             try:
                 logs, status = local_json(base, "logs"), local_json(base, "status")
                 for title, critical, reason, event_utc in events.consume(logs, status):
-                    enqueue(format_notice(title, reason, status, critical, event_utc), 2 if critical else 0)
+                    enqueue(format_notice(title, reason, status, critical, event_utc, settings.mode), 2 if critical else 0, event=True)
                 try:
                     captured = reports.capture(base, status)
                     if captured:
                         key, document = captured
-                        if sum(isinstance(p[2], dict) for p in pending) < 3:
+                        if sum(isinstance(p[2], dict) and "pdf" in p[2] for p in pending) < 3:
                             enqueue(document, -1)
                             reports.last = key
                         else:
@@ -571,11 +705,11 @@ def preview(api, chat, url):
                 except ValueError as error:
                     print(str(error), flush=True)
                 if unavailable:
-                    enqueue(format_notice("DASHBOARD NUOVAMENTE RAGGIUNGIBILE"))
+                    enqueue(format_notice("DASHBOARD NUOVAMENTE RAGGIUNGIBILE", mode=settings.mode), event=True)
                 unavailable = False
             except ValueError:
                 if not unavailable:
-                    enqueue(format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE"), 2)
+                    enqueue(format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE", critical=True, mode=settings.mode), 2, event=True)
                 unavailable = True
         if now >= retry_until:
             try:
@@ -585,14 +719,26 @@ def preview(api, chat, url):
                     for command in commands.consume(updates, int(time.time())):
                         if command == "/status":
                             try:
-                                text = format_status(local_json(base, "status"))
+                                text = format_status(local_json(base, "status"), settings.mode)
                             except ValueError:
                                 text = format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE", "Nessuno stato aggiornato disponibile.")
                             enqueue(text, 1)
                         elif command == "/start":
-                            enqueue(GuideMessage())
+                            enqueue(GuideMessage(settings.mode))
+                        elif command == "/help":
+                            enqueue(dict(text=guide_text(settings.mode), reply_markup=mode_keyboard()), 1)
+                        elif command == "/modalita":
+                            enqueue(dict(text=mode_menu(settings.mode), reply_markup=mode_keyboard()), 1)
                         else:
-                            enqueue(GUIDE_TEXT + "\n\nANTEPRIMA SIMULATA", 1)
+                            try:
+                                changed = settings.select(command[1:])
+                                if settings.mode == "essenziale":
+                                    discard_routine_events(pending)
+                                text = ("✅ Modalità salvata: " if changed else "🎛 Modalità già attiva: ") + MODE_LABELS[settings.mode]
+                                text += "\n/status sempre disponibile. Allarmi e PDF restano attivi."
+                            except OSError:
+                                text = "⚠️ Modalità non salvata. Resta attiva: " + MODE_LABELS[settings.mode]
+                            enqueue(dict(text=text, reply_markup=mode_keyboard()), 1)
                 if now >= next_send and pending:
                     # Replies expire after 10 s; notices after 1 h; PDFs after 24 h.
                     for item in list(pending):
@@ -600,13 +746,10 @@ def preview(api, chat, url):
                             pending.remove(item)
                     if pending:
                         item = max(pending, key=lambda p: p[0])
-                        if isinstance(item[2], dict):
-                            api.send_document(chat, **item[2])
-                        elif isinstance(item[2], GuideMessage):
-                            item[2].send(api, chat)
-                        else:
-                            api.send(chat, item[2], critical=item[0] == 2)
-                        pending.remove(item)
+                        warning = deliver_pending(api, chat, pending, item)
+                        if warning:
+                            print(warning, flush=True)
+                            enqueue(warning)
                         next_send = time.monotonic() + 1.1
                 failures = 0
             except TelegramError as error:

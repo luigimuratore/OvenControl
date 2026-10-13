@@ -12,7 +12,9 @@ const OvenExport = (() => {
       const epoch = Number.isFinite(offset) ? offset + (startMs === null ? p.ms : startMs + elapsed(p.ms, startMs)) : NaN;
       rows.push([boot, p.seq, p.ms, Number.isFinite(epoch) ? new Date(epoch).toISOString() : '',
         number(p.t1), number(p.t2), number(p.actual), number(p.target), number(p.duty, 1), p.relay ? 1 : 0,
-        p.marker & 0xe0 ? '' : p.step + 1, names[p.marker] || '', startMs === null ? '' : (elapsed(p.ms, startMs) / 1000).toFixed(3)].map(csvCell).join(','));
+        p.marker & 0xe0 || !Number.isInteger(p.step) || p.step === 255 ? '' : p.step + 1,
+        p.marker === 16 && p.operation === 'manual' ? 'INIZIO MANUALE' : names[p.marker] || '',
+        startMs === null ? '' : (elapsed(p.ms, startMs) / 1000).toFixed(3)].map(csvCell).join(','));
     }
     return '\ufeff' + rows.join('\r\n') + '\r\n';
   }

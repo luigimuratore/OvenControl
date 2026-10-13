@@ -4,25 +4,26 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Oven Controller · Controllo completo</title>
+  <link rel="icon" type="image/jpeg" sizes="640x640" href="/favicon.jpg?v=1">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
-  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
+  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
-  <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
+  <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo, manuale e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
   <main id="dashboardView" class="layout">
     <section class="panel dashboard-panel">
-      <div class="panel-title-row"><div><h2>Forno</h2><p id="cycleInfo">In attesa del controllore</p></div><div class="clock-box"><span>ESP acceso da</span><strong id="uptime">—</strong></div></div>
+      <div class="panel-title-row"><div><h2 id="ovenTitle">Forno</h2><p id="cycleInfo">In attesa del controllore</p></div><div class="clock-box"><span>ESP acceso da</span><strong id="uptime">—</strong></div></div>
       <div class="hero-grid">
         <article class="metric hero"><span>Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
-        <article class="metric hero target"><span>Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
+        <article class="metric hero target"><span id="targetLabel">Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
         <article class="metric"><span>Comando uscita · GPIO4</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
-        <article class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong><small>Arresto oltre 10 °C</small></article>
+        <article id="deltaCard" class="metric"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong></article>
       </div>
       <div class="sensor-grid two"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article></div>
-      <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><label class="chart-scale">Asse Y<select id="chartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="exportSamples" class="ghost">Scarica CSV + grafico</button></div>
+      <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo / manuale</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><label class="chart-scale">Asse Y<select id="chartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="exportSamples" class="ghost">Scarica CSV + grafico</button></div>
         <div class="chart-plot"><canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas><div id="chartCursor" class="chart-cursor" hidden></div><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
         <div class="chart-navigation"><button id="chartBack">← Indietro</button><input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Posizione grafico"><button id="chartForward">Avanti →</button><button id="chartNow">Adesso</button><select id="chartSpan"><option value="900000">15 min</option><option value="1800000" selected>30 min</option><option value="3600000">1 ora</option><option value="all">Tutto</option></select></div>
         <p id="chartRangeLabel" class="chart-range-label">Caricamento…</p>
@@ -30,7 +31,8 @@
       <div id="reportNotice" class="report-notice" hidden><div><strong>Report di fine ciclo disponibile</strong><p id="reportNoticeText"></p></div><button id="openReport" class="ghost">Apri report</button></div>
     </section>
     <aside class="panel control-panel">
-      <h2>Controllo ciclo</h2><ul class="control-notes"><li>La rampa avanza in °C/min.</li><li>Il mantenimento conta solo il tempo con entrambe le PT100 entro ±5 °C dal target.</li><li>Il cooldown è passivo: uscita spenta.</li></ul>
+      <div id="programControls">
+      <h2>Controllo ciclo</h2><ul class="control-notes"><li>La rampa avanza in °C/min. Quando è seguita da un mantenimento, passa allo step successivo dopo che il riferimento ha raggiunto il target e entrambe le PT100 sono entro ±5 °C.</li><li>Il mantenimento conta solo il tempo con entrambe le PT100 entro ±5 °C dal target.</li><li>Il cooldown è passivo: uscita spenta.</li></ul>
       <label class="field"><span>Programma</span><select id="recipeSelect"></select></label>
       <ol id="recipePreview" class="recipe-preview"></ol>
       <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
@@ -40,7 +42,22 @@
       <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo totale</span><strong id="cycleDuration">—</strong></div><div><span>Tempo rimanente step attivo</span><strong id="stepDuration">—</strong><small id="stepTimeHint" class="hint"></small></div></div>
       <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>STOP e PAUSA spengono l'uscita.<br>Dopo un reset non c'è ripresa automatica.</p>
       <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
-      <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><div class="network-line"><span>Rete diretta OvenController-Full</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>
+      </div>
+      <section id="manualControl" class="manual-control" aria-labelledby="manualTitle" hidden>
+        <div class="eyebrow">REGOLAZIONE LIBERA</div><h2 id="manualTitle">Controllo manuale</h2>
+        <p class="hint">Scegli target e rate di rampa. Il forno raggiunge il target e lo mantiene finché vuoi; puoi modificarli durante il test.</p>
+        <div id="manualState" class="manual-state" role="status">Fermo</div>
+        <label class="field"><span>Temperatura target · °C</span><input id="manualTarget" type="number" min="0" max="400" step="0.1" value="50" inputmode="decimal"></label>
+        <label class="field"><span>Rate rampa · °C/min</span><input id="manualRate" type="number" min="0.1" step="0.1" value="1" inputmode="decimal"></label>
+        <label class="field"><span>Target cooldown · °C</span><input id="manualCooldownTarget" type="number" min="0" max="400" step="0.1" value="25" inputmode="decimal"></label>
+        <label class="hardware-ready"><input id="manualHardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
+        <div class="buttons manual-buttons"><button id="manualStart" class="primary">AVVIA MANUALE</button><button id="manualApply">APPLICA TARGET</button><button id="manualCooldown" class="manual-cooldown">COOLDOWN</button><button id="manualStop" class="danger">STOP MANUALE</button></div>
+        <div class="recipe-summary manual-summary"><div><span>Target applicato</span><strong id="manualAppliedTarget">—</strong></div><div><span>Rate applicato</span><strong id="manualAppliedRate">—</strong></div><div><span>Tempo manuale totale</span><strong id="manualDuration">00:00:00</strong></div></div>
+        <p id="manualHint" class="hint">COOLDOWN spegne il riscaldamento e mantiene il monitoraggio. STOP chiude il manuale. Dopo un reset non riparte da solo.</p>
+        <button id="manualReset" class="ghost full">Riconosci allarme / interruzione</button>
+        <div id="manualMessage" class="notice hidden" role="status"></div>
+      </section>
+      <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><p id="wifiDiagnostics" class="hint" hidden></p><div class="network-line"><span>Rete diretta OvenController-Full</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>
       <hr><h2>Corrente e ripartenza</h2><div class="recipe-summary power-summary"><div><span>Avvii</span><strong id="bootCount">—</strong></div><div><span>Ultimo reset</span><strong id="resetReason">—</strong></div><div><span>Ora NTP</span><strong id="timeStatus">—</strong></div><div><span>Temperatura interna ESP</span><strong id="chipTemperature">—</strong></div></div><section class="errors-section" aria-labelledby="errorsTitle"><h3 id="errorsTitle">ERRORI</h3><p id="cycleErrorInfo">In attesa del controllore.</p><p id="outageInfo">In attesa dei dati di interruzione.</p></section>
       <hr><h2>Diagnostica circuito</h2><div class="recipe-summary power-summary"><div><span>Attuatore</span><strong id="actuatorInfo">—</strong></div><div><span>Potenza massima richiesta</span><strong id="powerInfo">—</strong></div><div><span>RAM libera / minimo</span><strong id="heapInfo">—</strong></div><div><span>Età letture</span><strong id="sampleAge">—</strong></div><div><span>Segnale Wi-Fi</span><strong id="rssiInfo">—</strong></div></div>
     </aside>
@@ -143,6 +160,7 @@
       <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la sonda più calda e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. Il tempo in banda richiede entrambe le PT100 entro ±5 °C con letture consecutive fresche. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
     </div>
   </section>
+  <footer id="firmwareInfo" class="firmware-footer">Firmware: in attesa del controllore</footer>
   <script src="/jspdf.umd.min.js"></script>
   <script src="/report-export.js"></script>
   <script src="/app.js"></script>

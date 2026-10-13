@@ -28,6 +28,11 @@ assert.equal(csv.split('\r\n').length,291);
 assert(csv.includes('media_c,setpoint_c'));
 assert(csv.includes('ALLARME')===false);
 assert.equal(csv.split('\r\n')[81].split(',')[6],''); // Invalid mean stays missing.
+const manualCsv = Export.csv([{...points[0], step:null, operation:'manual'},
+  {...points[1], step:255, operation:'manual'}], {boot:1});
+assert.equal(manualCsv.split('\r\n')[1].split(',')[10], '');
+assert.equal(manualCsv.split('\r\n')[1].split(',')[11], 'INIZIO MANUALE');
+assert.equal(manualCsv.split('\r\n')[2].split(',')[10], '');
 assert.equal(Export.elapsed(200,4294967000),496);
 assert.equal(Export.chartModel([{ms:4294967000,actual:1,target:2},{ms:200,actual:2,target:3}],{startMs:4294967000}).rows[1].minutes,496/60000);
 assert(!Export.svg(points,{startMs:0}).includes('NaN'));

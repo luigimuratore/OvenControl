@@ -226,43 +226,44 @@ class DemoTests(unittest.TestCase):
         self.assertFalse(self.full.status()["relay"])
 
     def test_field_pulse_duration_lease_and_stop(self):
-        token = self.post(self.field, action="arm", loadsDisconnected=True)["token"]
-        for bad in (99, 5001, True, 1.5):
+        for bad in (99, 5001, True, 1.5, 600001):
             with self.assertRaises(preview.ApiError):
-                self.post(self.field, action="relayPulse", token=token, durationMs=bad)
-        self.post(self.field, action="relayPulse", token=token, durationMs=1000)
+                self.post(self.field, action="relayPulse", durationMs=bad)
+        token = self.post(self.field, action="relayPulse", durationMs=1000)["token"]
         self.assertTrue(self.field.status()["relay"])
         self.field.advance(1.1)
         self.assertFalse(self.field.status()["relay"])
-        self.assertTrue(self.field.armed)
-        self.post(self.field, "heartbeat", token=token)
-        self.field.advance(2.6)
-        self.assertFalse(self.field.armed)
         with self.assertRaises(preview.ApiError):
             self.post(self.field, "heartbeat", token=token)
-        token = self.post(self.field, action="arm", loadsDisconnected=True)["token"]
-        self.post(self.field, action="relaySequence", token=token)
+        token = self.post(self.field, action="relayPulse", durationMs=30000)["token"]
+        with self.assertRaises(preview.ApiError):
+            self.post(self.field, action="ledGreen")
+        with self.assertRaises(preview.ApiError):
+            self.post(self.field, "heartbeat", token=token + 1)
+        self.field.advance(2.5)
+        self.assertFalse(self.field.status()["running"])
+        self.post(self.field, action="relaySequence")
         self.post(self.field, action="stop")
         self.assertFalse(self.field.status()["relay"])
 
-    def test_field_arm_expires_despite_heartbeats(self):
-        token = self.post(self.field, action="arm", loadsDisconnected=True)["token"]
-        for _ in range(59):
+    def test_field_long_run_has_no_old_arm_timeout_but_needs_heartbeat(self):
+        token = self.post(self.field, action="relayPulse", durationMs=120000)["token"]
+        for _ in range(119):
             self.field.advance(1)
             self.post(self.field, "heartbeat", token=token)
-        self.field.advance(1.1)
-        self.assertFalse(self.field.armed)
+        self.assertTrue(self.field.status()["relay"])
+        self.field.advance(1)
+        self.assertFalse(self.field.status()["running"])
         self.assertEqual(self.field.speed, 1)
 
     def test_led_sequence_and_isolated_devices(self):
-        token = self.post(self.field, action="arm", loadsDisconnected=True)["token"]
-        self.post(self.field, action="ledSequence", token=token)
-        for expected in [(False, False), (False, True), (True, False), (True, True)]:
-            s = self.field.status()
-            self.assertEqual((s["red"], s["green"]), expected)
-            self.assertFalse(s["relay"])
-            self.field.advance(2)
+        token = self.post(self.field, action="ledSequence")["token"]
+        for index, expected in enumerate([(False, False), (False, True), (True, False), (True, True)]):
+            state = self.field.status()
+            self.assertEqual((state["red"], state["green"]), expected)
+            self.assertFalse(state["relay"])
             self.post(self.field, "heartbeat", token=token)
+            self.field.advance(2)
         self.assertFalse(self.field.status()["running"])
         self.assertEqual(self.full.phase, "idle")
 
@@ -335,12 +336,12 @@ class HttpTests(unittest.TestCase):
     def test_json_errors_and_beacon_stop(self):
         self.assertEqual(self.request("/full/api/command", raw=b"{")[0], 400)
         self.assertEqual(self.request("/field-test/api/command", body={"action": []})[0], 400)
-        code, _, payload = self.request("/field-test/api/command", body={"action": "arm", "loadsDisconnected": True})
+        code, _, payload = self.request("/field-test/api/command", body={"action": "relayPulse", "durationMs": 30000})
         self.assertEqual(code, 200)
         token = json.loads(payload)["token"]
         self.assertEqual(self.request("/field-test/api/heartbeat", body={"token": token})[0], 204)
         self.assertEqual(self.request("/field-test/api/command", raw=b'{"action":"stop"}')[0], 200)
-        self.assertFalse(self.server.devices["field-test"].armed)
+        self.assertFalse(self.server.devices["field-test"].status()["running"])
 
 
 if __name__ == "__main__":

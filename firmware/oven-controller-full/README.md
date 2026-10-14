@@ -237,7 +237,185 @@ pio run -d oven-controller-full -e esp32-s3-n16r8-ota -t upload --upload-port 19
 
 Per il primo passaggio Wi-Fi da field-test a full, usa `--upload-port oven-field-test.local` oppure l'IP dell'ESP; dopo il riavvio usa `oven-full.local`. Lo script di upload legge la password dal file locale, senza inserirla nei comandi. Il firewall del PC deve consentire la connessione di ritorno dell'uploader sulla rete locale.
 
-All'avvio dell'aggiornamento autenticato si fermano ciclo e prove; tutte le uscite restano spente fino al riavvio. Anche un aggiornamento fallito o un errore di autenticazione arresta ciclo/prove, senza ripresa automatica. Dashboard e firmware sono aggiornati insieme nelle partizioni OTA già previste. Per cambiare password, usa un caricamento USB.
+All'avvio dell'aggiornamento autenticato si fermano ciclo e prove; tutte le uscite restano spente fino al riavvio. Anche un aggiornamento fallito o un errore di autenticazione arresta ciclo/prove, senza ripresa automatica. Dashboard e firmware sono aggiornati insieme nelle partizioni OTA già previste.
+
+**Cambio della password OTA:** la password è compilata nel firmware. Modificare soltanto `include/ota_config.h` non cambia né l'ESP né un `firmware.bin` già preparato. Conserva la password attualmente installata, imposta quella nuova nel file (16..64 lettere, numeri, `_` o `-`), ricompila e sostituisci il binario sul PC Windows. Nel caricamento con `espota.py` descritto sotto, al prompt inserisci la **vecchia password**, che autentica l'aggiornamento sul firmware ancora installato. Dopo un aggiornamento riuscito e il riavvio, l'ESP usa la **nuova password**. Non usare il normale `pio ... -t upload` dopo aver cambiato il file: lo script locale usa già la nuova password per l'autenticazione. Se non conosci la vecchia password, serve un caricamento USB.
+
+### Upload da casa tramite VPN / Tailscale
+
+**Prima dell'upload, ferma Programmi, Manuale e TEST e scarica i dati che vuoi conservare:** l'aggiornamento riavvia l'ESP, svuota lo storico in RAM e non riprende il controllo precedente. Una compilazione con `pio run` senza `-t upload` prepara soltanto il firmware e non contatta il forno. Tailscale non viene installato sull'ESP: il collegamento passa da un router VPN oppure da un PC/Raspberry Pi/NAS al capannone. La VPN deve essere già configurata; questi comandi non la installano né modificano la rete.
+
+Gli esempi usano **`192.168.1.190` come IP LAN del forno**: sostituiscilo con quello attuale e, se possibile, riservalo nel DHCP del router. **`pc-capannone`** è il nome Tailscale del computer al capannone, oppure il suo IP VPN `100.x.y.z`; **`utente`** è l'utente SSH di quel computer. Il nome/IP Tailscale del computer ponte non è l'indirizzo dell'ESP.
+
+#### Aprire la dashboard dal Mac tramite il PC Windows
+
+Se `http://192.168.1.190/` funziona dal PC del capannone ma non dal Mac, puoi usare un **tunnel SSH per la dashboard**, senza configurare un subnet router. Occorre che entrambi i computer siano online in Tailscale e che OpenSSH Server sia già attivo e raggiungibile sul PC Windows. L'utente SSH deve essere autorizzato all'inoltro TCP; la configurazione standard OpenSSH lo permette, mentre una policy aziendale può limitarlo.
+
+**Procedura da seguire ogni volta, per il setup attuale:**
+
+1. Verifica che **Tailscale sia connesso sul Mac e sul PC del capannone**. Il PC Windows deve essere acceso, collegato alla rete del forno e non in sospensione. OpenSSH Server deve essere attivo; non serve reinstallarlo a ogni collegamento.
+2. Sul Mac apri Terminale ed esegui il comando seguente. L'utente Windows corretto è **`oriana`** e l'IP Tailscale del PC è **`100.89.40.5`**:
+
+   ```sh
+   ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8085:192.168.1.190:80 oriana@100.89.40.5
+   ```
+
+3. Inserisci la **password dell'account locale Windows `oriana`**, non il PIN di sblocco né la password Tailscale. Mentre la scrivi non vengono mostrati caratteri o asterischi: è normale. Premi Invio. Se la connessione riesce, il terminale resta in attesa senza mostrare un nuovo prompt: **lascialo aperto**.
+4. Apri sul Mac **<http://127.0.0.1:8085/>**. Puoi salvare questo indirizzo nei preferiti; funziona mentre il tunnel è aperto.
+5. Quando hai finito, premi **Ctrl+C** nel terminale. Si chiude soltanto il tunnel: **il ciclo del forno continua**. Alla prossima connessione ripeti questi passaggi.
+
+La pagina mostra la dashboard reale dell'ESP, con gli stessi comandi del collegamento locale. Non è l'anteprima Python. Il collegamento passa da Mac → Tailscale/SSH → PC Windows → ESP; non riavvia né aggiorna il forno. Il tunnel ascolta solo sul Mac, sull'indirizzo di loopback. Se cambiano l'utente Windows, l'IP Tailscale del PC o l'IP LAN dell'ESP, aggiorna i rispettivi valori nel comando; `192.168.1.190` è l'indirizzo del forno, non del PC.
+
+Se la porta 8085 è già occupata, scegline un'altra nel comando e nel link. `Connection refused`/timeout sulla porta 22 indicano un problema nell'accesso SSH al PC; `administratively prohibited` indica un divieto di inoltro TCP sul server SSH. `Permission denied` richiede di verificare nome utente, password e autorizzazioni SSH. Se compare `channel ... open failed: connect failed` oppure il browser mostra una connessione reimpostata, il tunnel non riesce a raggiungere la destinazione: verifica di nuovo dal PC Windows che `http://192.168.1.190/` si apra e controlla con PowerShell `Test-NetConnection 192.168.1.190 -Port 80`. `ExitOnForwardFailure=yes` non garantisce che il forno sia raggiungibile: controlla l'apertura iniziale dell'inoltro. Per aprire direttamente `http://192.168.1.190/` dal Mac, senza tunnel, serve invece l'accesso tramite subnet router descritto sotto.
+
+Questo tunnel inoltra la **dashboard HTTP**, non il protocollo ArduinoOTA: per caricare il firmware usa la procedura Windows seguente. Riferimenti: [inoltro locale OpenSSH](https://man.openbsd.org/ssh.1#L) e [configurazione OpenSSH su Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration).
+
+#### Metodo consigliato per il tuo setup: progetto sul Mac, solo upload sul PC Windows
+
+Il progetto e tutte le configurazioni restano sul Mac. **Sul PC Windows non servono il repository o PlatformIO:** bastano Python 3 e due file, il firmware già compilato e l'uploader ufficiale ESP32 `espota.py`. Wi-Fi, Telegram e gli altri parametri compilati sono già inclusi nel binario; trattalo come un file privato.
+
+Tailscale deve essere attivo sui due computer e consentire il loro collegamento. Per eseguire comandi sul PC Windows da casa serve anche **un desktop remoto già configurato oppure OpenSSH Server per Windows**; accedere allo stesso account Tailscale non apre automaticamente un terminale o un desktop. Vedi [connessioni ai dispositivi Tailscale](https://tailscale.com/docs/how-to/connect-to-devices) e [OpenSSH Server su Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse).
+
+**1. Compila sul Mac e prepara i due file**, senza contattare l'ESP:
+
+```sh
+cd "/Users/gigi/Documents/PROJECTS/Forno oriana/firmware/oven-controller-full"
+pio run -e esp32-s3-n16r8-ota
+mkdir -p output/ota-upload
+cp .pio/build/esp32-s3-n16r8-ota/firmware.bin output/ota-upload/firmware.bin
+cp "$HOME/.platformio/packages/framework-arduinoespressif32/tools/espota.py" output/ota-upload/espota.py
+shasum -a 256 output/ota-upload/firmware.bin
+```
+
+I file privati locali devono essere quelli effettivamente usati dal forno. La password OTA richiesta all'upload deve corrispondere al firmware **attualmente installato** sull'ESP. Se hai personalizzato la cartella PlatformIO, adatta il percorso di `espota.py`. Non usare `bootloader.bin`, `partitions.bin` o un'immagine combinata al posto di `firmware.bin`.
+
+**2. Trasferisci `firmware.bin` e `espota.py` al PC Windows** tramite [Taildrop](https://tailscale.com/docs/features/taildrop?tab=windows) oppure SCP. Con OpenSSH Server già abilitato sul PC, dal Mac puoi copiarli nella cartella Downloads dell'utente remoto:
+
+```sh
+scp output/ota-upload/firmware.bin output/ota-upload/espota.py utente@pc-capannone:Downloads/
+ssh -t utente@pc-capannone
+```
+
+Con Taildrop seleziona e invia i due file da `output/ota-upload`; su Windows verifica dove sono stati ricevuti. I comandi successivi assumono che siano in `$HOME\Downloads`. **SSH/SCP sono un'alternativa a Taildrop più desktop remoto**, non un requisito aggiuntivo quando hai già accesso al desktop Windows. Su Windows usa **PowerShell**; se SSH apre `cmd.exe`, esegui prima `powershell`.
+
+**3. Sul PC Windows**, nella sessione PowerShell raggiunta da casa, prepara la cartella e verifica lo stato del forno:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\oven-upload"
+Copy-Item "$HOME\Downloads\firmware.bin" "$HOME\oven-upload\firmware.bin" -Force
+Copy-Item "$HOME\Downloads\espota.py" "$HOME\oven-upload\espota.py" -Force
+Set-Location "$HOME\oven-upload"
+$ovenPython = (py -3 -c "import sys; print(sys.executable)").Trim()
+& $ovenPython --version
+Get-FileHash .\firmware.bin -Algorithm SHA256
+Invoke-RestMethod -Uri "http://192.168.1.190/api/status" -TimeoutSec 10 | Select-Object firmware, phase, relay, otaUpdating, manual, test
+```
+
+Confronta l'hash con quello del Mac per verificare di avere lo stesso binario. Se `py` non è disponibile ma `python --version` mostra Python 3, imposta `$ovenPython = "python"`. Se Python non è installato, nella PowerShell Windows puoi installarlo per l'utente corrente con [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/install):
+
+```powershell
+winget install --exact --id Python.Python.3.13 --source winget --scope user --silent --location "$env:LOCALAPPDATA\Programs\Python\Python313" --accept-package-agreements --accept-source-agreements
+```
+
+Aspetta il completamento, poi usa il percorso completo per evitare problemi con il PATH della sessione SSH già aperta:
+
+```powershell
+$ovenPython = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
+& $ovenPython --version
+```
+
+Se WinGet non è disponibile, installa [Python 3 su Windows](https://docs.python.org/3/using/windows.html) dal PC e imposta `$ovenPython` al percorso del suo `python.exe`. Non servono pacchetti Python aggiuntivi. `$ovenPython` va impostato di nuovo se apri una nuova PowerShell.
+
+Prima di continuare, il controllo deve essere fermo: `phase` diversa da `running` e `paused`, `relay: false`, `manual.active: false`, `test.running: false` e `otaUpdating: false`. Se è attivo, fermalo dalla dashboard e scarica i dati prima dell'aggiornamento.
+
+**4. Avvia solo l'upload, dal PC Windows**, usando l'IP LAN dell'ESP:
+
+```powershell
+& $ovenPython -c "import getpass,sys,espota; sys.exit(espota.main(['-i','192.168.1.190','-p','3232','-P','3233','-r','-a',getpass.getpass('Password OTA: '),'-f','firmware.bin']))"
+```
+
+Il comando usa l'uploader ufficiale copiato dal Mac e chiede la password senza inserirla nella riga di comando o nella cronologia. Non abilitare `--debug`, perché l'uploader può stampare la password. Se la sessione avvisa che la password non può essere nascosta, interrompi prima di inserirla e usa una console PowerShell interattiva via desktop remoto.
+
+Il **firewall Windows deve consentire a Python di ricevere TCP 3233 dall'IP LAN dell'ESP**, sul profilo di rete appropriato del capannone; UDP 3232 deve raggiungere l'ESP. La porta 3233 deve essere libera. Il trasferimento OTA e la connessione di ritorno restano sulla LAN del forno: **non serve modificare SNAT o creare una rotta ESP → Mac di casa**. Per questo metodo basta raggiungere il PC Windows tramite Tailscale; per la dashboard sul Mac usa il tunnel SSH descritto sopra oppure il subnet router/VPN descritto sotto.
+
+Se compare **`Authenticating...OK` seguito da `No response from device`**, la password è corretta ma l'uploader non ha ricevuto la connessione TCP di ritorno dall'ESP: il trasferimento del firmware non è ancora iniziato. Nel setup Windows questa condizione è stata risolta con la seguente regola firewall, limitata al programma Python, alla porta 3233 e all'IP del forno. Eseguila **una sola volta in PowerShell con privilegi di amministratore** sul PC del capannone, poi ripeti l'upload:
+
+```powershell
+New-NetFirewallRule -Name "OvenControl-OTA-TCP3233" -DisplayName "OvenControl OTA dal forno" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3233 -RemoteAddress 192.168.1.190 -Program "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -Profile Any
+```
+
+Il percorso è quello dell'installazione Python 3.13 per l'utente corrente: adattalo se usi un altro interprete. La regola vale anche se la LAN Windows è classificata come pubblica, mantenendo i vincoli su programma, porta e IP remoto. Non disabilitare il firewall. Se cambia l'IP del forno o il percorso di Python, aggiorna la regola. Riferimento: [New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule).
+
+Per gli aggiornamenti successivi ricompila sul Mac, trasferisci il nuovo `firmware.bin` sostituendo quello precedente, verifica l'hash e ripeti il comando sul PC Windows. `espota.py` può restare sul PC; ricopialo quando aggiorni la piattaforma ESP32. Dopo l'upload controlla versione e uscita spenta come descritto in fondo a questa sezione.
+
+#### Alternativa: progetto e PlatformIO anche sul computer al capannone
+
+Da casa accedi via SSH o desktop remoto a un computer collegato alla stessa LAN dell'ESP. Il computer deve avere PlatformIO, una copia aggiornata del progetto e i suoi file privati locali di configurazione. Questi file sono esclusi da Git: un clone o `git pull` non recupera password Wi-Fi/OTA o token Telegram. La password in `include/ota_config.h` deve corrispondere a quella del firmware già sul forno; per compilare conserva anche le configurazioni Wi-Fi e Telegram effettivamente usate. Non inserire credenziali nei comandi o nel repository.
+
+Dal Mac di casa, con Tailscale connesso e accesso SSH già autorizzato:
+
+```sh
+ssh utente@pc-capannone
+```
+
+**Nel terminale del computer al capannone**, entra nella sua copia del progetto (qui un esempio di percorso Linux), verifica che `/api/status` riporti il controllo fermo e compila:
+
+```sh
+cd "$HOME/OvenControl/firmware/oven-controller-full"
+curl --fail --connect-timeout 5 --max-time 10 http://192.168.1.190/api/status
+pio run -e esp32-s3-n16r8-ota
+```
+
+Quando il forno è fermo e hai salvato i dati, avvia l'upload **da quello stesso terminale remoto**:
+
+```sh
+pio run -e esp32-s3-n16r8-ota -t upload --upload-port 192.168.1.190
+```
+
+L'autenticazione è letta dal file privato locale sul computer al capannone. Il trasferimento OTA e la connessione TCP di ritorno restano sulla LAN del forno; non richiedono di modificare il NAT di Tailscale. Serve comunque che il firewall locale consenta quella connessione. Per questo metodo basta poter accedere al computer via VPN: non serve una rotta verso l'ESP dal Mac di casa.
+
+#### Upload diretto dal Mac attraverso la VPN
+
+Questo metodo richiede una **VPN con instradamento bidirezionale** verso la LAN del capannone. Per Tailscale, la rotta del subnet router deve essere pubblicizzata, approvata e accettata dal client, e le regole di accesso devono consentire il traffico. Per la dashboard usa l'IP LAN dell'ESP; non fare affidamento su `oven-full.local`/mDNS attraverso la VPN. Una VPN con solo un exit node non configura automaticamente l'accesso alla LAN del forno. Vedi [subnet router Tailscale](https://tailscale.com/docs/features/subnet-routers).
+
+**Aprire la dashboard non basta a garantire l'OTA.** L'uploader invia l'invito via **UDP 3232**; poi l'ESP apre una **nuova connessione TCP** verso l'IP sorgente dell'invito e la porta dell'uploader. Il subnet router Tailscale normalmente applica SNAT: l'ESP vede come sorgente il computer ponte, non il Mac di casa, e tenta il collegamento TCP verso quel ponte. È una limitazione dell'OTA diretto in questa configurazione, non della password o della compilazione. Cambiare `--upload-port` o l'indirizzo di ascolto `--host_ip` non risolve da solo il percorso di ritorno.
+
+Per l'OTA diretto occorre una configurazione senza SNAT per questo percorso, una rotta di ritorno dalla LAN dell'ESP verso l'IP VPN del Mac tramite il subnet router, e regole VPN/firewall che consentano la connessione ESP → Mac. Disabilitare SNAT da solo non crea la rotta di ritorno. La configurazione dipende dal router e dal sistema operativo: consulta [SNAT e rotte di ritorno Tailscale](https://tailscale.com/docs/reference/troubleshooting/network-configuration/disable-subnet-route-masquerading). Se queste condizioni non sono già verificate, usa il metodo dal computer al capannone.
+
+Sul Mac, una volta configurato il percorso VPN in entrambe le direzioni:
+
+```sh
+cd "/Users/gigi/Documents/PROJECTS/Forno oriana/firmware/oven-controller-full"
+curl --fail --connect-timeout 5 --max-time 10 http://192.168.1.190/api/status
+pio run -e esp32-s3-n16r8-ota
+```
+
+Soltanto con forno fermo e dati scaricati:
+
+```sh
+pio run -e esp32-s3-n16r8-ota -t upload --upload-port 192.168.1.190
+```
+
+Di default `espota` sceglie una porta TCP di ascolto fra **10000 e 60000**. Per avere una porta precisa da autorizzare nel firewall, aggiungi **solo questa voce all'ambiente OTA esistente** `[env:esp32-s3-n16r8-ota]` in `platformio.ini`, conservando le altre impostazioni:
+
+```ini
+upload_flags =
+    --host_port=3233
+```
+
+Lo script `scripts/configure_ota.py` conserva questo flag e aggiunge password e porta UDP 3232. Il firewall del Mac e le regole VPN devono consentire **TCP 3233 dall'ESP verso il Mac**; UDP 3232 deve raggiungere l'ESP. La porta 3233 è solo un esempio e deve essere libera. Non occorre pubblicare dashboard o OTA su Internet né usare Tailscale Funnel: la dashboard non ha login e deve restare nella rete privata/VPN.
+
+#### Dopo l'upload e diagnosi dei problemi
+
+Attendi che l'ESP torni raggiungibile, ricarica la dashboard e controlla la **versione firmware in basso a sinistra**, l'uscita spenta e le letture delle sonde. Se compare un blocco da riconoscere, usa **RESET ERRORI** dopo aver ripristinato le condizioni richieste. Nessun nuovo controllo parte automaticamente. In caso di upload fallito, verifica la versione effettivamente in esecuzione prima di riprovare.
+
+| Sintomo | Verifica |
+|---|---|
+| Dashboard/IP non raggiungibile | ESP e ponte accesi, IP attuale, rotte VPN approvate, permessi e possibili conflitti fra le subnet di casa e capannone. |
+| `No response from the ESP` | Raggiungibilità UDP 3232, OTA abilitato nel firmware e IP corretto; la porta HTTP 80 può funzionare anche con OTA non raggiungibile. |
+| `Authentication Failed` | Password locale diversa da quella installata: il file privato non arriva da Git. |
+| `Waiting for device...` / timeout di ritorno con dashboard funzionante | Percorso TCP ESP → uploader: SNAT, rotta di ritorno e firewall. Esegui l'upload dal computer al capannone se la VPN non consente quel percorso. |
+| `Listen Failed` | Porta TCP scelta occupata o indirizzo di ascolto non disponibile sul computer che esegue l'upload. |
 
 ## Prima prova completa
 
@@ -351,7 +529,11 @@ Nella Dashboard e in Manuale il riquadro principale **ΔT media PT100 − target
 
 Le letture sono campionate circa ogni **500 ms** e considerate valide senza fault, con RAW non agli estremi e temperatura tra **−20 e 430 °C**. Una lettura valida non certifica accuratezza, posizione della sonda o continuità di tutti i componenti del circuito.
 
-Durante ciclo o pausa, il solo fault **`0x04` (sovra/sottotensione)** permette una verifica con **due nuove conversioni consecutive** della sonda interessata, a riscaldamento spento. Ogni conferma deve essere valida, sotto il limite termico e, durante il riscaldamento, entro il limite di sovratemperatura rispetto al setpoint. Si prosegue soltanto dopo conferma e normali controlli su entrambe le sonde. Una conferma non valida o fuori dai limiti interrompe subito la verifica e causa l'arresto, anche se il bit di fault è rientrato. Un altro `0x04` entro **60 s sulla stessa sonda**, altri fault o combinazioni di bit non vengono ritentati e causano l'arresto. Il limite di 60 s è una scelta software prudenziale, non una specifica del sensore. La verifica non riattiva direttamente l'uscita e non cancella blocchi del supervisore. Gli eventi riportano fault/RAW originali ed esito; il report termico usa le coppie finali, mentre i fault recuperati sono documentati nel log. L'intervallo di verifica interrompe il conteggio hold in banda. Nessun recupero si applica alle prove manuali TEST. La modifica richiede collaudo sul forno e non risolve la causa elettrica del disturbo.
+Da **full-1.13**, il solo fault **`0x04` (sovra/sottotensione)** permette recuperi ripetuti in **Programmi, Manuale, pausa, TEST e lettura a riposo**, senza il vecchio limite di un recupero al minuto. La stessa sonda deve fornire **due nuove conversioni consecutive valide e sicure** prima di riprendere; le uscite rimangono spente durante l'intera verifica, anche se il task GPIO esegue un TEST. Con **10 letture `0x04` consecutive**, contando quella iniziale, il recupero fallisce. Una lettura valida interrompe la serie di fault, ma una sola non basta a confermare il recupero. Anche l'alternanza indefinita fault/valido viene fermata: massimo **12 nuove conversioni** per verifica. Con la libreria attuale ogni conversione attende circa 75 ms; il ciclo di verifica è limitato, senza attese di un minuto. Il limite si cambia in `src/sensor_recovery.h`, costante `kMaxConsecutiveFaults`; `kMaxConfirmationReads` limita la durata dei tentativi instabili.
+
+Altri fault, combinazioni di bit, RAW/temperature non valide e conferme termiche fuori limite interrompono subito la verifica. Le conferme devono restare sotto il limite assoluto e, quando viene richiesto riscaldamento, sotto il limite di sovratemperatura rispetto al setpoint. Si prosegue soltanto dopo conferma e normali controlli su entrambe le sonde. Nei TEST la durata e l'heartbeat continuano durante la verifica: un recupero non prolunga né riavvia una prova scaduta; un recupero fallito termina il TEST e lascia l'allarme da riconoscere. Le normali prove diagnostiche restano possibili con sonde assenti dopo il ripristino dei blocchi applicabili. La verifica non cancella blocchi del supervisore. Gli eventi riportano fault/RAW originali ed esito; il report termico usa le coppie finali. La verifica interrompe il conteggio hold in banda. Il software non risolve la causa elettrica del disturbo: il comportamento va collaudato sul forno reale.
+
+**RESET ERRORI** è nella barra sotto le schede, visibile anche in Manuale, TEST, Programmi e Report e mantenuta in vista durante lo scorrimento. In presenza di allarme, emergenza, interruzione o blocco del supervisore, barra e pulsante diventano rossi e spiegano perché l'avvio è bloccato. L'avviso resta anche dopo il ritorno delle letture valide e si elimina soltanto dopo il riconoscimento riuscito. Il reset richiede il controllo fermo, letture valide e registrazione dello sblocco in memoria; termina eventuali TEST, lascia tutte le uscite spente e non riavvia alcun controllo. Non cancella log, report o la registrazione storica del blackout. Senza collegamento rimane visibile l'ultimo blocco noto e il pulsante è disabilitato. `/api/status.resetRequired` indica il blocco da riconoscere. Per i colori modifica `--error-reset-bg`, `--error-reset-active-bg` e `--error-banner-bg` in `data/style.css`.
 
 La finestra ON/OFF viene eseguita da un **task indipendente**, con verifica circa ogni **10 ms**. Una richiesta HTTP lenta o un blocco del controllo non tengono acceso il riscaldamento oltre il limite di freschezza. Il blocco del supervisore **non si cancella quando ricompaiono letture valide**: devi riconoscere l'allarme a ciclo fermo, con sonde nuovamente valide e nei limiti.
 

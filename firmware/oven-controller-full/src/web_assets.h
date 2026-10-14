@@ -15,6 +15,10 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
   <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
+  <section id="errorResetBar" class="error-reset-bar" aria-label="Stato blocco e reset errori">
+    <div><strong id="errorResetTitle">Stato errori</strong><p id="errorResetText" role="status" aria-live="polite">In attesa del controllore.</p></div>
+    <button id="resetBtn" class="error-reset-button" disabled>RESET ERRORI</button>
+  </section>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
   <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo, manuale e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
   <main id="dashboardView" class="layout">
@@ -42,7 +46,6 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
       <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
       <div class="recipe-summary"><div><span>Fase</span><strong id="stepPosition">—</strong></div><div><span>Target finale step</span><strong id="finalTarget">—</strong></div><div><span>Rate / mantenimento</span><strong id="rateInfo">—</strong></div></div>
       <div class="buttons site-buttons"><button id="startBtn" class="primary">AVVIA CICLO</button><button id="pauseBtn">PAUSA</button><button id="resumeBtn">RIPRENDI</button><button id="stopBtn" class="danger">STOP</button></div>
-      <button id="resetBtn" class="ghost full">Riconosci allarme / interruzione</button>
       <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo totale</span><strong id="cycleDuration">—</strong></div><div><span>Tempo rimanente step attivo</span><strong id="stepDuration">—</strong><small id="stepTimeHint" class="hint"></small></div></div>
       <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>PAUSA mantiene la temperatura attuale e sospende lo step; RIPRENDI continua da lì.<br>STOP spegne l’uscita e termina il ciclo.<br>Dopo un reset non c'è ripresa automatica.</p>
       <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
@@ -58,7 +61,6 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
         <div class="buttons manual-buttons"><button id="manualStart" class="primary">AVVIA MANUALE</button><button id="manualApply">APPLICA TARGET</button><button id="manualCooldown" class="manual-cooldown">COOLDOWN</button><button id="manualStop" class="danger">STOP MANUALE</button></div>
         <div class="recipe-summary manual-summary"><div><span>Target applicato</span><strong id="manualAppliedTarget">—</strong></div><div><span>Rate applicato</span><strong id="manualAppliedRate">—</strong></div><div><span>Tempo manuale totale</span><strong id="manualDuration">00:00:00</strong></div></div>
         <p id="manualHint" class="hint">COOLDOWN segue la discesa con il PID. STOP spegne il riscaldamento e chiude il manuale. Dopo un reset non riparte da solo.</p>
-        <button id="manualReset" class="ghost full">Riconosci allarme / interruzione</button>
         <div id="manualMessage" class="notice hidden" role="status"></div>
       </section>
       <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><p id="wifiDiagnostics" class="hint" hidden></p><div class="network-line"><span>Rete diretta OvenController-Full</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>
@@ -201,11 +203,24 @@ const char WEB_CSS[] PROGMEM = R"OVEN_ASSET_2026(:root {
   --manual-control-border: #34576b;
   --test-enter-bg: #215b83;
   --test-exit-bg: #805c24;
+  --error-reset-bg: #28577c;
+  --error-reset-active-bg: #c62838;
+  --error-banner-bg: #42232b;
   --emergency-red: #e92632;
   --emergency-yellow: #f7c843;
 }
 
 * { box-sizing: border-box; }
+
+.error-reset-bar { position: sticky; top: 8px; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 18px; max-width: 1532px; margin: 0 auto 20px; padding: 14px 18px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
+.error-reset-bar p { margin-top: 4px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.error-reset-bar.reset-required { background: var(--error-banner-bg); border: 2px solid var(--danger); }
+.error-reset-bar.reset-required strong { color: #ffbec6; }
+button.error-reset-button { flex-shrink: 0; padding: 14px 20px; background: var(--error-reset-bg); border: 2px solid #649ac3; color: #fff; font-weight: 800; }
+button.error-reset-button.reset-required { background: var(--error-reset-active-bg); border-color: #ff9ba6; box-shadow: 0 0 0 3px rgba(255,94,108,.15); }
+.error-reset-bar.reset-required button:disabled { opacity: .8; }
+@media (max-width: 1600px) { .error-reset-bar { margin-left: 34px; margin-right: 34px; } }
+@media (max-width: 680px) { .error-reset-bar { margin-left: 16px; margin-right: 16px; flex-direction: column; align-items: stretch; gap: 10px; top: 4px; } .error-reset-button { width: 100%; } }
 
 body {
   margin: 0;
@@ -961,10 +976,29 @@ function display(s) {
   }
 }
 
+function needsErrorReset(s = latest) {
+  return !!s && (!!s.resetRequired || ['fault', 'interrupted'].includes(s.phase) || !!s.emergency ||
+    !!s.lastInterruption?.pending || !!s.supervisorFault);
+}
+function updateErrorReset() {
+  const required = needsErrorReset(), s = latest;
+  $('errorResetBar').classList.toggle('reset-required', required);
+  $('resetBtn').classList.toggle('reset-required', required);
+  put('errorResetTitle', required ? 'AVVIO BLOCCATO · RESET ERRORI RICHIESTO' : 'Nessun errore da resettare');
+  const invalid = s?.sensors?.some(sensor => !sensor.valid), active = ['running', 'paused'].includes(s?.phase);
+  const reason = s?.fault || (s?.emergency ? 'Emergenza attiva.' : s?.lastInterruption?.pending || s?.phase === 'interrupted' ?
+    'Interruzione/blackout registrato: ripartenza bloccata.' : 'Allarme o blocco del supervisore registrato.');
+  put('errorResetText', required ? `${reason} ` + (active ? 'Ferma prima il controllo, poi premi RESET ERRORI.' :
+    invalid ? 'Sonde non valide: ripristina le letture, poi premi RESET ERRORI. Il reset non riavvia il forno.' :
+    'Premi RESET ERRORI per riconoscere il blocco. Il forno resta spento; avvia poi esplicitamente un nuovo controllo.') :
+    !s ? 'In attesa del controllore.' : invalid ? 'Sonde non valide: avvio bloccato finché le letture non tornano valide.' :
+    'Il reset riconosce allarmi, emergenze e interruzioni; non cancella log/report e non avvia il forno.');
+  if (required && !connected) put('errorResetText', `${reason} Connessione assente: il blocco resta attivo. Ricollegati per usare RESET ERRORI.`);
+}
 function updateControls() {
   const active = latest?.phase === "running" || latest?.phase === "paused";
   const blocked = active || !!latest?.test?.enabled || !!latest?.otaUpdating || testCommandBusy;
-  $("startBtn").disabled = !connected || commandBusy || !latest?.ready || blocked || latest?.phase === "interrupted" ||
+  $("startBtn").disabled = !connected || commandBusy || !latest?.ready || needsErrorReset() || blocked || latest?.phase === "interrupted" ||
                             !recipesLoaded || recipesDirty || !recipes.length || !$("hardwareReady").checked;
   $("hardwareReady").disabled = active;
   const manualActive = !!latest?.manual?.active, supported = !!latest?.manual;
@@ -976,7 +1010,7 @@ function updateControls() {
   const validCooldown = Number.isFinite(cooldownTarget) && cooldownTarget >= 0 && cooldownTarget <= 400 &&
     Number.isFinite(latest?.target) && cooldownTarget <= latest.target;
   $('manualHardwareReady').disabled = active || !connected;
-  $('manualStart').disabled = !supported || !connected || commandBusy || blocked || !latest?.ready ||
+  $('manualStart').disabled = !supported || !connected || commandBusy || blocked || !latest?.ready || needsErrorReset() ||
     !validManualTarget || !validRate || !$('manualHardwareReady').checked || latest?.phase === 'interrupted';
   $('manualApply').disabled = !supported || !connected || commandBusy || !manualActive || !latest?.ready || !validManualTarget || !validRate;
   $('manualCooldown').disabled = !connected || !manualActive || latest?.manual?.mode === 'cooldown' || !!latest?.otaUpdating || !validRate || !validCooldown;
@@ -994,9 +1028,9 @@ function updateControls() {
     if (el.id !== "exportRecipes") el.disabled = active || !connected;
   });
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
-  $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || latest?.phase !== "paused";
-  $("resetBtn").disabled = !connected || commandBusy || blocked || !["fault", "interrupted"].includes(latest?.phase);
-  $('manualReset').disabled = $('resetBtn').disabled;
+  $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || needsErrorReset() || latest?.phase !== "paused";
+  $("resetBtn").disabled = !connected || commandBusy || testCommandBusy || active || !!latest?.otaUpdating || !needsErrorReset();
+  updateErrorReset();
   $("stopBtn").disabled = !latest;
 }
 function markDirty() { recipesDirty = true; updateControls(); }
@@ -1092,7 +1126,7 @@ async function command(action) {
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
+    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Errori riconosciuti. Uscite spente: scegli e avvia esplicitamente un nuovo controllo." })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -1513,7 +1547,6 @@ $("globalStop").onclick = () => command("emergency");
 $('manualTarget').oninput = () => { manualTargetDirty = true; updateControls(); };
 $('manualRate').oninput = $('manualTarget').oninput;
 $('manualCooldownTarget').oninput = $('manualTarget').oninput;
-$('manualReset').onclick = () => command('reset');
 $('manualHardwareReady').onchange = () => updateControls();
 $('manualStart').onclick = () => manualCommand('start');
 $('manualApply').onclick = () => manualCommand('target');
@@ -1630,10 +1663,10 @@ function setControls() {
   $('stopBtn').disabled = !state;
   $('pulseDuration').disabled = !online || !!state?.running;
   document.querySelectorAll('#testView [data-action]').forEach(button => {
-    button.disabled = !online || testCommandBusy || commandBusy || !!state?.running || !!state?.otaUpdating || !!state?.emergency || ['running', 'paused'].includes(state?.phase);
+    button.disabled = !online || testCommandBusy || commandBusy || !!state?.running || !!state?.otaUpdating || !!state?.emergency || needsErrorReset(latest) || ['running', 'paused'].includes(state?.phase);
   });
   const cycle = ['running', 'paused'].includes(state?.phase);
-  $('enter').disabled = !online || testCommandBusy || commandBusy || cycle || !!state?.enabled || !!state?.otaUpdating || !!state?.emergency;
+  $('enter').disabled = !online || testCommandBusy || commandBusy || cycle || !!state?.enabled || !!state?.otaUpdating || !!state?.emergency || needsErrorReset(latest);
   $('exit').disabled = !online || testCommandBusy || commandBusy || !state?.enabled || !!state?.otaUpdating;
   $('exportSamples').disabled = !online || historyBusy;
   $('refreshLogs').disabled = !online || logsBusy;

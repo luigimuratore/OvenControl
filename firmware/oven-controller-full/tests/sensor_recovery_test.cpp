@@ -1,11 +1,11 @@
 #include <cassert>
-#include <cstdint>
 #include <iostream>
 #include "../src/sensor_recovery.h"
 #include "../src/output_supervisor.h"
 
 int main() {
   using probes::RecoveryResult;
+  using probes::Confirmation;
   probes::Recovery recovery;
   OutputSupervisor outputs;
   heater::Plan plan;
@@ -15,42 +15,72 @@ int main() {
   outputs.publish(plan); outputs.tick(100, true, false);
   assert(outputs.relay);
   int inhibited = 0, reads = 0;
-  auto inhibit = [&] { ++inhibited; outputs.guard.inhibit(); outputs.tick(101, true, false); };
-  auto safeRead = [&] { assert(!outputs.relay); ++reads; return true; };
-  // No retry for ordinary readings, open/short faults, combined flags or TEST/idle.
+  auto inhibit = [&] { ++inhibited; outputs.beginSensorCheck(); assert(!outputs.relay); };
+  auto safeRead = [&] { assert(!outputs.relay); ++reads; return Confirmation::Safe; };
   for (uint8_t fault : {uint8_t(0), uint8_t(0x08), uint8_t(0x24), uint8_t(0xff)})
-    assert(recovery.verify(fault, 100, true, inhibit, safeRead) == RecoveryResult::NotAttempted);
-  assert(recovery.verify(0x04, 100, false, inhibit, safeRead) == RecoveryResult::NotAttempted);
+    assert(recovery.verify(fault, true, inhibit, safeRead) == RecoveryResult::NotAttempted);
+  assert(recovery.verify(0x04, false, inhibit, safeRead) == RecoveryResult::NotAttempted);
   assert(reads == 0 && inhibited == 0);
-  assert(recovery.verify(0x04, 100, true, inhibit, safeRead) == RecoveryResult::Confirmed);
+  assert(recovery.verify(0x04, true, inhibit, safeRead) == RecoveryResult::Confirmed);
   assert(reads == 2 && inhibited == 1 && !outputs.relay);
-  // Recovery itself cannot republish the old heating plan.
-  outputs.tick(200, true, false); assert(!outputs.relay);
-  assert(recovery.verify(0x04, 60099, true, inhibit, safeRead) == RecoveryResult::NotAttempted);
-  assert(reads == 2);
-  assert(recovery.verify(0x04, 60100, true, inhibit, safeRead) == RecoveryResult::Confirmed);
-  assert(reads == 4);
-
-  probes::Recovery persistent;
+  outputs.endSensorCheck(); outputs.tick(200, true, false); assert(!outputs.relay);
+  // Isolated recovered events may repeat: no one-minute lockout remains.
+  for (unsigned i = 0; i < 100; ++i) {
+    assert(recovery.verify(0x04, true, inhibit, safeRead) == RecoveryResult::Confirmed);
+    outputs.endSensorCheck();
+  }
+  assert(reads == 202);
+  // Original fault plus eight further faults can still recover: only nine in a row.
   reads = 0;
-  assert(persistent.verify(0x04, 0, true, inhibit, [&] { ++reads; return false; }) == RecoveryResult::Failed);
-  assert(reads == 1 && !outputs.relay);
-  // One healthy conversion followed by another fault is not recovery.
-  probes::Recovery intermittent;
+  assert(recovery.verify(0x04, true, inhibit, [&] {
+    assert(!outputs.relay);
+    return ++reads <= 8 ? Confirmation::OvUv : Confirmation::Safe;
+  }) == RecoveryResult::Confirmed);
+  assert(reads == 10);
+  outputs.endSensorCheck();
   reads = 0;
-  assert(intermittent.verify(0x04, 0, true, inhibit, [&] { return ++reads == 1; }) == RecoveryResult::Failed);
-  assert(reads == 2 && !outputs.relay);
-  // Each probe has its own budget, including near millis() rollover.
-  probes::Recovery wrap;
-  const uint32_t start = UINT32_MAX - 1000;
-  assert(wrap.verify(0x04, start, true, inhibit, safeRead) == RecoveryResult::Confirmed);
-  assert(wrap.verify(0x04, uint32_t(start + 59999), true, inhibit, safeRead) == RecoveryResult::NotAttempted);
-  assert(wrap.verify(0x04, uint32_t(start + 60000), true, inhibit, safeRead) == RecoveryResult::Confirmed);
-  // Fresh readings never clear a latched supervisor fault.
+  assert(recovery.verify(0x04, true, inhibit, [&] { ++reads; return Confirmation::OvUv; }) == RecoveryResult::Failed);
+  assert(reads == 9 && recovery.failure == probes::RecoveryFailure::ConsecutiveFaults);
+  outputs.endSensorCheck();
+  // One good reading breaks the fault streak, but two good readings are required.
+  reads = 0;
+  assert(recovery.verify(0x04, true, inhibit, [&] {
+    ++reads; return reads == 1 || reads >= 10 ? Confirmation::Safe : Confirmation::OvUv;
+  }) == RecoveryResult::Confirmed);
+  assert(reads == 11);
+  outputs.endSensorCheck();
+  reads = 0;
+  assert(recovery.verify(0x04, true, inhibit, [&] {
+    return ++reads % 2 ? Confirmation::Safe : Confirmation::OvUv;
+  }) == RecoveryResult::Failed);
+  assert(reads == probes::Recovery::kMaxConfirmationReads && recovery.failure == probes::RecoveryFailure::Unstable);
+  outputs.endSensorCheck();
+  reads = 0;
+  assert(recovery.verify(0x04, true, inhibit, [&] {
+    ++reads; return Confirmation::Unsafe; // Other fault, invalid RAW, nonfinite or unsafe temperature.
+  }) == RecoveryResult::Failed);
+  assert(reads == 1 && recovery.failure == probes::RecoveryFailure::Unsafe);
+  outputs.endSensorCheck();
+  // TEST stays inhibited across GPIO ticks; recovery itself cannot extend the pulse.
+  assert(outputs.startTest(TestMode::RelayPulse, 500, 1000, false));
+  outputs.tick(500, true, false); assert(outputs.relay);
+  reads = 0;
+  assert(recovery.verify(0x04, true, inhibit, [&] {
+    outputs.tick(600, true, false); assert(!outputs.relay && !outputs.red && !outputs.green);
+    return ++reads < 4 ? Confirmation::OvUv : Confirmation::Safe;
+  }) == RecoveryResult::Confirmed);
+  outputs.endSensorCheck(); outputs.tick(700, true, false); assert(outputs.relay);
+  outputs.beginSensorCheck();
+  assert(outputs.tick(1500, true, false) == TestEvent::Completed);
+  outputs.endSensorCheck(); outputs.tick(1501, true, false); assert(!outputs.relay);
+  // A failed check cannot leave a diagnostic pulse waiting to restart.
+  assert(outputs.startTest(TestMode::RelayPulse, 2000, 1000, false));
+  assert(recovery.verify(0x04, true, inhibit, [] { return Confirmation::Unsafe; }) == RecoveryResult::Failed);
+  outputs.stopTest(true); outputs.endSensorCheck(); outputs.tick(2100, true, true);
+  assert(!outputs.relay && !outputs.diagnostic && outputs.test.mode == TestMode::Idle);
   outputs.guard.fault = heater::Fault::StaleControl;
-  probes::Recovery latched;
-  assert(latched.verify(0x04, 0, true, inhibit, safeRead) == RecoveryResult::Confirmed);
-  outputs.publish(plan); outputs.tick(100, true, false);
+  assert(recovery.verify(0x04, true, inhibit, safeRead) == RecoveryResult::Confirmed);
+  outputs.endSensorCheck(); outputs.publish(plan); outputs.tick(100, true, false);
   assert(!outputs.relay && outputs.guard.fault == heater::Fault::StaleControl);
-  std::cout << "OK: isolated OV/UV, two confirmations, heater inhibited, persistent/recurrent faults, timer wrap, supervisor latch\n";
+  std::cout << "OK: repeated recoveries, 10 consecutive faults, two safe confirmations, unstable/unsafe rejection, PID and TEST inhibition, expiry and fault latch\n";
 }

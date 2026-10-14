@@ -429,22 +429,35 @@ void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
   readSensorConversion(rtd, sensor);
   const uint8_t initialFault = sensor.fault;
   const uint16_t initialRaw = sensor.raw;
-  const auto recovery = sensorRecovery[index].verify(initialFault, millis(), cycleActive(),
+  const bool wasDiagnostic = diagnosticMode();
+  const auto recovery = sensorRecovery[index].verify(initialFault, true,
     [] {
-      inhibitHeater();
+      portENTER_CRITICAL(&heaterMux); outputs.beginSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
       // A fault/recheck interval must not count toward an in-band hold.
       holdTimer.update(millis(), false, false);
     },
     [&] {
       readSensorConversion(rtd, sensor);
-      if (!sensor.valid || !thermal::belowHardLimit(sensor.c)) return false;
+      if (sensor.fault == probes::Recovery::kOvUv) return probes::Confirmation::OvUv;
+      if (!sensor.valid || !thermal::belowHardLimit(sensor.c)) return probes::Confirmation::Unsafe;
       // Do not discard an unsafe but otherwise valid confirmation by reading again.
-      return !heatingOperation() || sensor.c < setpointC + MAX_TARGET_OVERSHOOT;
+      return !heatingOperation() || sensor.c < setpointC + MAX_TARGET_OVERSHOOT ?
+        probes::Confirmation::Safe : probes::Confirmation::Unsafe;
     });
   sensor.recoveryFailed = recovery == probes::RecoveryResult::Failed;
   // Preserve rejection even if the final conversion has no hardware fault bit:
   // a failed safety check must not become acceptable after reading the other probe.
   if (sensor.recoveryFailed) sensor.valid = false;
+  // A persistent/unsafe verification must also stop diagnostic outputs.
+  if (sensor.recoveryFailed && wasDiagnostic) {
+    stopTests("Fault PT100 persistente/non sicuro: TEST fermato", true);
+    const String reason = "PT100 #" + String(index + 1) + ": " + sensorMessage(sensor);
+    trip(reason);
+    telegramNotice("ALLARME · TEST", reason, true);
+  }
+  if (recovery != probes::RecoveryResult::NotAttempted) {
+    portENTER_CRITICAL(&heaterMux); outputs.endSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+  }
   if (recovery != probes::RecoveryResult::NotAttempted)
     logEvent("SONDA", "PT100 #" + String(index + 1) + ": Fault 0x" + String(initialFault, HEX) +
       " · RAW " + String(initialRaw) +
@@ -453,7 +466,7 @@ void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
        " · verifica non confermata; arresto e allarme"));
   if (recovery == probes::RecoveryResult::Confirmed)
     telegramBot.notify("⚠️ AVVISO SONDA · PT100 #" + String(index + 1) +
-      "\nFault 0x04 transitorio recuperato con due nuove letture valide.\nComando riscaldamento spento durante la verifica; ciclo prosegue.\nEvento a uptime " + String(millis() / 1000) + " s.", true);
+      "\nFault 0x04 transitorio recuperato con due nuove letture valide.\nUscite spente durante la verifica. Letture ripristinate; nessun nuovo avvio automatico.\nEvento a uptime " + String(millis() / 1000) + " s.", true);
   if (sensor.valid != wasValid || sensor.fault != previousFault)
     logEvent(sensor.valid ? "PT100" : "SONDA", String(&sensor == &sensors[0] ? "PT100 #1: " : "PT100 #2: ") + sensorMessage(sensor) +
       " · Fault 0x" + String(sensor.fault, HEX) + " · RAW " + String(sensor.raw) + " · " + String(sensor.ohms, 2) + " ohm");
@@ -461,7 +474,14 @@ void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
 String sensorMessage(const Sensor &sensor) {
   if (sensor.valid) return "Lettura valida";
   String text;
-  if (sensor.recoveryFailed) text += "Verifica del fault 0x04 non confermata entro i limiti di sicurezza; ";
+  if (sensor.recoveryFailed) {
+    const auto failure = sensorRecovery[&sensor == &sensors[0] ? 0 : 1].failure;
+    if (failure == probes::RecoveryFailure::ConsecutiveFaults)
+      text += String(probes::Recovery::kMaxConsecutiveFaults) + " fault 0x04 consecutivi: recupero fallito; ";
+    else if (failure == probes::RecoveryFailure::Unstable)
+      text += "Letture instabili: due conferme valide non ottenute entro la verifica limitata; ";
+    else text += "Conferma non valida o fuori dai limiti di sicurezza: recupero interrotto; ";
+  }
   if (sensor.fault & MAX31865_FAULT_HIGHTHRESH) text += "RTD oltre soglia alta; ";
   if (sensor.fault & MAX31865_FAULT_LOWTHRESH) text += "RTD sotto soglia bassa; ";
   if (sensor.fault & MAX31865_FAULT_REFINLOW) text += "REFIN- > 85% VBIAS; ";
@@ -1010,7 +1030,10 @@ void statusApi(uint32_t testToken = 0) {
   manualState["rateCMin"] = manualSession.rateCMin;
   if (std::isfinite(manualSession.reference)) manualState["setpointC"] = manualSession.reference; else manualState["setpointC"] = nullptr;
   doc["emergency"] = output.emergency;
-  doc["ready"] = !output.diagnostic && !output.updating && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault &&
+  doc["resetRequired"] = phase == Phase::Fault || phase == Phase::Interrupted || output.emergency ||
+    output.recoveryBlocked || recoveryJournal.data.pending || output.guard.fault != heater::Fault::None;
+  doc["supervisorFault"] = static_cast<unsigned>(output.guard.fault);
+  doc["ready"] = !output.diagnostic && !output.updating && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault && phase != Phase::Interrupted &&
                  !output.emergency && !output.recoveryBlocked && !recoveryJournal.data.pending &&
                  heaterFault() == heater::Fault::None && uint32_t(millis() - sampleAtMs) < heater::Guard::kStaleMs;
   doc["actuator"] = controlSettings.ssr ? "ssr" : "relay";
@@ -1184,9 +1207,9 @@ void commandApi() {
     statusApi(); return;
   }
   if (outputSnapshot().updating) { error(503, "Aggiornamento OTA in corso"); return; }
-  if (action != "stop" && diagnosticMode()) { error(409, "Esci dalla modalita TEST prima di comandare il ciclo"); return; }
   if (action == "reset") {
     if (phase == Phase::Running || phase == Phase::Paused) { error(409, "Ferma prima il ciclo"); return; }
+    stopTests("RESET ERRORI: TEST fermato e uscite spente", true);
     readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
     if (!sensorsHealthy()) { error(409, "Sonde o temperature fuori limite"); return; }
     if (prefs.putBool("active", false) != sizeof(bool) || !recoveryJournal.acknowledge(recoveryStore)) {
@@ -1199,6 +1222,7 @@ void commandApi() {
     phase = Phase::Idle; faultText = "";
     logEvent("INFO", "Allarme/interruzione riconosciuti dall'operatore"); statusApi(); return;
   }
+  if (action != "stop" && diagnosticMode()) { error(409, "Esci dalla modalita TEST prima di comandare il ciclo"); return; }
   if (action == "pause") {
     if (manualOperation && cycleActive()) { error(409, "Nel manuale usa COOLDOWN o STOP"); return; }
     if (phase != Phase::Running) { error(409, "Nessun ciclo da mettere in pausa"); return; }
@@ -1449,6 +1473,7 @@ void testCommandApi() {
     statusApi(); return;
   }
   if (cycleActive()) { error(409, "Ferma il ciclo prima di usare TEST (anche in pausa)"); return; }
+  if (phase == Phase::Fault || phase == Phase::Interrupted) { error(409, "Premi RESET ERRORI prima di avviare TEST"); return; }
   if (outputSnapshot().emergency) { error(409, "Emergenza attiva: riconosci il blocco prima di usare TEST"); return; }
   if (recoveryJournal.data.pending || outputSnapshot().recoveryBlocked) {
     error(409, "Interruzione registrata: riconosci il blocco prima di usare TEST"); return;

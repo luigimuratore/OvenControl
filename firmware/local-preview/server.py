@@ -433,7 +433,8 @@ class DemoDevice:
                         remaining = math.ceil(max(0, reference, distance) * 60 / step["rate"])
             base.update(cooldownRegulated=True, pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
                         stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
-                        emergency=self.emergency, lastCycleError=self.last_cycle_error)
+                        emergency=self.emergency, lastCycleError=self.last_cycle_error,
+                        resetRequired=self.emergency or self.phase in ("fault", "interrupted"), supervisorFault=0)
             base.update(self.control)
             manual_active = self.manual_mode != "idle" and self.phase == "running"
             base.update(operation=self.operation, manual=dict(active=manual_active, mode=self.manual_mode,
@@ -565,8 +566,10 @@ class DemoDevice:
                 self.phase, self.target = "idle", None
                 self.record(marker=32)
         elif action == "reset":
-            require(not self.test_enabled, "Esci da TEST prima di riconoscere allarmi", 409)
-            require(self.phase not in ("running", "paused") and not self.missing, "Ferma il ciclo e ripristina le sonde", 409)
+            require(self.phase not in ("running", "paused"), "Ferma il controllo prima di RESET ERRORI", 409)
+            self.stop_field()
+            self.test_enabled = False
+            require(not self.missing, "Ferma il ciclo e ripristina le sonde", 409)
             self.phase, self.fault, self.target = "idle", "", None
             self.emergency = False
         elif action == "start":
@@ -619,6 +622,7 @@ class DemoDevice:
             return self.status()
         require(not self.emergency, "Emergenza attiva: riconosci prima il blocco", 409)
         require(self.phase not in ("running", "paused"), "Ferma il ciclo prima di usare TEST", 409)
+        require(self.phase not in ("fault", "interrupted"), "Premi RESET ERRORI prima di avviare TEST", 409)
         if action == "enter":
             self.test_enabled = True
             return self.status()

@@ -8,10 +8,11 @@ class OutputSupervisor {
   heater::Guard guard;
   OutputTest test;
   bool diagnostic = false, updating = false, emergency = false, recoveryBlocked = false;
+  bool sensorChecking = false;
   bool relay = false, red = false, green = false;
 
   bool enterTest(bool cycleActive) {
-    if (cycleActive || updating || emergency || recoveryBlocked) return false;
+    if (cycleActive || updating || emergency || recoveryBlocked || sensorChecking) return false;
     guard.inhibit(); diagnostic = true;
     return true;
   }
@@ -22,7 +23,7 @@ class OutputSupervisor {
     return test.start(mode, now, duration);
   }
   bool publish(const heater::Plan &plan) {
-    if (diagnostic || updating || emergency || recoveryBlocked) { guard.inhibit(); return false; }
+    if (diagnostic || updating || emergency || recoveryBlocked || sensorChecking) { guard.inhibit(); return false; }
     guard.publish(plan); return true;
   }
   void stopTest(bool leave = false) {
@@ -36,6 +37,8 @@ class OutputSupervisor {
   void acknowledgeEmergency() { stopAll(); emergency = false; }
   void blockRecovery() { recoveryBlocked = true; stopAll(); diagnostic = false; }
   void acknowledgeRecovery() { stopAll(); recoveryBlocked = false; }
+  void beginSensorCheck() { sensorChecking = true; guard.inhibit(); relay = red = green = false; }
+  void endSensorCheck() { sensorChecking = false; }
   void beginUpdate() {
     updating = true; stopAll(); diagnostic = false;
   }
@@ -44,10 +47,11 @@ class OutputSupervisor {
     if (diagnostic) {
       guard.inhibit();
       const auto event = test.tick(now, serverReady);
-      relay = test.relay; red = test.red; green = test.green;
+      relay = !sensorChecking && test.relay; red = !sensorChecking && test.red; green = !sensorChecking && test.green;
       return event;
     }
-    relay = guard.tick(now); red = relay; green = serverReady && !alarm && guard.fault == heater::Fault::None;
+    relay = !sensorChecking && guard.tick(now); red = relay;
+    green = !sensorChecking && serverReady && !alarm && guard.fault == heater::Fault::None;
     return TestEvent::None;
   }
 };

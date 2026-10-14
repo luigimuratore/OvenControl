@@ -29,6 +29,10 @@ int main() {
   s.stopTest(true); s.tick(2801, true, true); assert(!s.relay && !s.green);
   s.guard.clear(); assert(s.publish(heating(3000)));
   s.tick(3000, true, false); assert(s.relay);
+  s.beginSensorCheck(); s.tick(3001, true, false); assert(!s.relay && !s.red && !s.green);
+  assert(!s.publish(heating(3001)) && !s.enterTest(false));
+  s.endSensorCheck(); s.tick(3002, true, false); assert(!s.relay);
+  assert(s.publish(heating(3002))); s.tick(3002, true, false); assert(s.relay);
   s.beginUpdate(); assert(!s.relay && !s.red && !s.green);
   assert(!s.publish(heating(3000)));
   assert(!s.enterTest(false));

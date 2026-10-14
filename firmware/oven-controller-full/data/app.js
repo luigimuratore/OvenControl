@@ -317,10 +317,29 @@ function display(s) {
   }
 }
 
+function needsErrorReset(s = latest) {
+  return !!s && (!!s.resetRequired || ['fault', 'interrupted'].includes(s.phase) || !!s.emergency ||
+    !!s.lastInterruption?.pending || !!s.supervisorFault);
+}
+function updateErrorReset() {
+  const required = needsErrorReset(), s = latest;
+  $('errorResetBar').classList.toggle('reset-required', required);
+  $('resetBtn').classList.toggle('reset-required', required);
+  put('errorResetTitle', required ? 'AVVIO BLOCCATO · RESET ERRORI RICHIESTO' : 'Nessun errore da resettare');
+  const invalid = s?.sensors?.some(sensor => !sensor.valid), active = ['running', 'paused'].includes(s?.phase);
+  const reason = s?.fault || (s?.emergency ? 'Emergenza attiva.' : s?.lastInterruption?.pending || s?.phase === 'interrupted' ?
+    'Interruzione/blackout registrato: ripartenza bloccata.' : 'Allarme o blocco del supervisore registrato.');
+  put('errorResetText', required ? `${reason} ` + (active ? 'Ferma prima il controllo, poi premi RESET ERRORI.' :
+    invalid ? 'Sonde non valide: ripristina le letture, poi premi RESET ERRORI. Il reset non riavvia il forno.' :
+    'Premi RESET ERRORI per riconoscere il blocco. Il forno resta spento; avvia poi esplicitamente un nuovo controllo.') :
+    !s ? 'In attesa del controllore.' : invalid ? 'Sonde non valide: avvio bloccato finché le letture non tornano valide.' :
+    'Il reset riconosce allarmi, emergenze e interruzioni; non cancella log/report e non avvia il forno.');
+  if (required && !connected) put('errorResetText', `${reason} Connessione assente: il blocco resta attivo. Ricollegati per usare RESET ERRORI.`);
+}
 function updateControls() {
   const active = latest?.phase === "running" || latest?.phase === "paused";
   const blocked = active || !!latest?.test?.enabled || !!latest?.otaUpdating || testCommandBusy;
-  $("startBtn").disabled = !connected || commandBusy || !latest?.ready || blocked || latest?.phase === "interrupted" ||
+  $("startBtn").disabled = !connected || commandBusy || !latest?.ready || needsErrorReset() || blocked || latest?.phase === "interrupted" ||
                             !recipesLoaded || recipesDirty || !recipes.length || !$("hardwareReady").checked;
   $("hardwareReady").disabled = active;
   const manualActive = !!latest?.manual?.active, supported = !!latest?.manual;
@@ -332,7 +351,7 @@ function updateControls() {
   const validCooldown = Number.isFinite(cooldownTarget) && cooldownTarget >= 0 && cooldownTarget <= 400 &&
     Number.isFinite(latest?.target) && cooldownTarget <= latest.target;
   $('manualHardwareReady').disabled = active || !connected;
-  $('manualStart').disabled = !supported || !connected || commandBusy || blocked || !latest?.ready ||
+  $('manualStart').disabled = !supported || !connected || commandBusy || blocked || !latest?.ready || needsErrorReset() ||
     !validManualTarget || !validRate || !$('manualHardwareReady').checked || latest?.phase === 'interrupted';
   $('manualApply').disabled = !supported || !connected || commandBusy || !manualActive || !latest?.ready || !validManualTarget || !validRate;
   $('manualCooldown').disabled = !connected || !manualActive || latest?.manual?.mode === 'cooldown' || !!latest?.otaUpdating || !validRate || !validCooldown;
@@ -350,9 +369,9 @@ function updateControls() {
     if (el.id !== "exportRecipes") el.disabled = active || !connected;
   });
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
-  $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || latest?.phase !== "paused";
-  $("resetBtn").disabled = !connected || commandBusy || blocked || !["fault", "interrupted"].includes(latest?.phase);
-  $('manualReset').disabled = $('resetBtn').disabled;
+  $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || needsErrorReset() || latest?.phase !== "paused";
+  $("resetBtn").disabled = !connected || commandBusy || testCommandBusy || active || !!latest?.otaUpdating || !needsErrorReset();
+  updateErrorReset();
   $("stopBtn").disabled = !latest;
 }
 function markDirty() { recipesDirty = true; updateControls(); }
@@ -448,7 +467,7 @@ async function command(action) {
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Allarme/interruzione riconosciuti." })[action];
+    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Errori riconosciuti. Uscite spente: scegli e avvia esplicitamente un nuovo controllo." })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -869,7 +888,6 @@ $("globalStop").onclick = () => command("emergency");
 $('manualTarget').oninput = () => { manualTargetDirty = true; updateControls(); };
 $('manualRate').oninput = $('manualTarget').oninput;
 $('manualCooldownTarget').oninput = $('manualTarget').oninput;
-$('manualReset').onclick = () => command('reset');
 $('manualHardwareReady').onchange = () => updateControls();
 $('manualStart').onclick = () => manualCommand('start');
 $('manualApply').onclick = () => manualCommand('target');
@@ -986,10 +1004,10 @@ function setControls() {
   $('stopBtn').disabled = !state;
   $('pulseDuration').disabled = !online || !!state?.running;
   document.querySelectorAll('#testView [data-action]').forEach(button => {
-    button.disabled = !online || testCommandBusy || commandBusy || !!state?.running || !!state?.otaUpdating || !!state?.emergency || ['running', 'paused'].includes(state?.phase);
+    button.disabled = !online || testCommandBusy || commandBusy || !!state?.running || !!state?.otaUpdating || !!state?.emergency || needsErrorReset(latest) || ['running', 'paused'].includes(state?.phase);
   });
   const cycle = ['running', 'paused'].includes(state?.phase);
-  $('enter').disabled = !online || testCommandBusy || commandBusy || cycle || !!state?.enabled || !!state?.otaUpdating || !!state?.emergency;
+  $('enter').disabled = !online || testCommandBusy || commandBusy || cycle || !!state?.enabled || !!state?.otaUpdating || !!state?.emergency || needsErrorReset(latest);
   $('exit').disabled = !online || testCommandBusy || commandBusy || !state?.enabled || !!state?.otaUpdating;
   $('exportSamples').disabled = !online || historyBusy;
   $('refreshLogs').disabled = !online || logsBusy;

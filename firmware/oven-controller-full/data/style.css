@@ -28,11 +28,24 @@
   --manual-control-border: #34576b;
   --test-enter-bg: #215b83;
   --test-exit-bg: #805c24;
+  --error-reset-bg: #28577c;
+  --error-reset-active-bg: #c62838;
+  --error-banner-bg: #42232b;
   --emergency-red: #e92632;
   --emergency-yellow: #f7c843;
 }
 
 * { box-sizing: border-box; }
+
+.error-reset-bar { position: sticky; top: 8px; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 18px; max-width: 1532px; margin: 0 auto 20px; padding: 14px 18px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); }
+.error-reset-bar p { margin-top: 4px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.error-reset-bar.reset-required { background: var(--error-banner-bg); border: 2px solid var(--danger); }
+.error-reset-bar.reset-required strong { color: #ffbec6; }
+button.error-reset-button { flex-shrink: 0; padding: 14px 20px; background: var(--error-reset-bg); border: 2px solid #649ac3; color: #fff; font-weight: 800; }
+button.error-reset-button.reset-required { background: var(--error-reset-active-bg); border-color: #ff9ba6; box-shadow: 0 0 0 3px rgba(255,94,108,.15); }
+.error-reset-bar.reset-required button:disabled { opacity: .8; }
+@media (max-width: 1600px) { .error-reset-bar { margin-left: 34px; margin-right: 34px; } }
+@media (max-width: 680px) { .error-reset-bar { margin-left: 16px; margin-right: 16px; flex-direction: column; align-items: stretch; gap: 10px; top: 4px; } .error-reset-button { width: 100%; } }
 
 body {
   margin: 0;

@@ -11,6 +11,10 @@
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
   <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
+  <section id="errorResetBar" class="error-reset-bar" aria-label="Stato blocco e reset errori">
+    <div><strong id="errorResetTitle">Stato errori</strong><p id="errorResetText" role="status" aria-live="polite">In attesa del controllore.</p></div>
+    <button id="resetBtn" class="error-reset-button" disabled>RESET ERRORI</button>
+  </section>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
   <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo, manuale e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
   <main id="dashboardView" class="layout">
@@ -38,7 +42,6 @@
       <label class="hardware-ready"><input id="hardwareReady" type="checkbox"> CHECK HARDWARE/AMBIENTE EFFETTUATO</label>
       <div class="recipe-summary"><div><span>Fase</span><strong id="stepPosition">—</strong></div><div><span>Target finale step</span><strong id="finalTarget">—</strong></div><div><span>Rate / mantenimento</span><strong id="rateInfo">—</strong></div></div>
       <div class="buttons site-buttons"><button id="startBtn" class="primary">AVVIA CICLO</button><button id="pauseBtn">PAUSA</button><button id="resumeBtn">RIPRENDI</button><button id="stopBtn" class="danger">STOP</button></div>
-      <button id="resetBtn" class="ghost full">Riconosci allarme / interruzione</button>
       <div class="recipe-summary cycle-timing"><div><span>Tempo ciclo totale</span><strong id="cycleDuration">—</strong></div><div><span>Tempo rimanente step attivo</span><strong id="stepDuration">—</strong><small id="stepTimeHint" class="hint"></small></div></div>
       <p class="hint">Il ciclo continua anche se chiudi la pagina o perdi il Wi-Fi.<br>PAUSA mantiene la temperatura attuale e sospende lo step; RIPRENDI continua da lì.<br>STOP spegne l’uscita e termina il ciclo.<br>Dopo un reset non c'è ripresa automatica.</p>
       <div id="alarmBox" class="alarm hidden"><strong>Attenzione</strong><span id="alarmText"></span></div><div id="messageBox" class="notice hidden"></div>
@@ -54,7 +57,6 @@
         <div class="buttons manual-buttons"><button id="manualStart" class="primary">AVVIA MANUALE</button><button id="manualApply">APPLICA TARGET</button><button id="manualCooldown" class="manual-cooldown">COOLDOWN</button><button id="manualStop" class="danger">STOP MANUALE</button></div>
         <div class="recipe-summary manual-summary"><div><span>Target applicato</span><strong id="manualAppliedTarget">—</strong></div><div><span>Rate applicato</span><strong id="manualAppliedRate">—</strong></div><div><span>Tempo manuale totale</span><strong id="manualDuration">00:00:00</strong></div></div>
         <p id="manualHint" class="hint">COOLDOWN segue la discesa con il PID. STOP spegne il riscaldamento e chiude il manuale. Dopo un reset non riparte da solo.</p>
-        <button id="manualReset" class="ghost full">Riconosci allarme / interruzione</button>
         <div id="manualMessage" class="notice hidden" role="status"></div>
       </section>
       <hr><h2>Accesso alla dashboard</h2><div class="network-box"><div class="network-line"><span>Wi-Fi capannone</span><strong id="workshopState">—</strong></div><a id="workshopAddress" class="network-address" hidden></a><a id="localAddress" class="network-address" hidden></a><p id="wifiDiagnostics" class="hint" hidden></p><div class="network-line"><span>Rete diretta OvenController-Full</span><strong id="apState">—</strong></div><span id="apAddress" class="network-address"></span></div>

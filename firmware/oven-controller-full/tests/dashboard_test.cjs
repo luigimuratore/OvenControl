@@ -64,6 +64,34 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run(`validateRecipes(${JSON.stringify(highRecipe(400))})`);
   assert.throws(() => run(`validateRecipes(${JSON.stringify(highRecipe(400.1))})`), /0–400/);
   assert.equal(elements.get('avgTemp').textContent, '30.1');
+  // A latched error remains prominent after valid readings return, in every tab.
+  const clean = {...status, phase:'idle', emergency:false, resetRequired:false, supervisorFault:0,
+    fault:'', lastInterruption:{pending:false}, manual:{active:false,mode:'idle'}, ready:true};
+  for (const blocked of [
+    {phase:'fault',fault:'PT100 in errore'}, {phase:'interrupted'}, {emergency:true},
+    {supervisorFault:1}, {resetRequired:true}, {lastInterruption:{pending:true}},
+  ]) {
+    run(`display(${JSON.stringify({...clean,...blocked})})`);
+    assert(elements.get('errorResetBar').classList.contains('reset-required'));
+    assert(elements.get('resetBtn').classList.contains('reset-required'));
+    assert(!elements.get('resetBtn').disabled);
+    assert(elements.get('errorResetText').textContent.includes('RESET ERRORI'));
+    for (const tab of ['Dashboard','Manual','Test','Recipes']) {
+      run(`show('${tab}')`);
+      assert(!elements.get('errorResetBar').hidden);
+    }
+  }
+  run(`display(${JSON.stringify({...clean,phase:'fault',sensors:clean.sensors.map(s=>({...s,valid:false}))})})`);
+  assert(elements.get('errorResetText').textContent.includes('ripristina le letture'));
+  run('connected=false;updateControls()');
+  assert(elements.get('resetBtn').disabled);
+  assert(elements.get('errorResetBar').classList.contains('reset-required'));
+  assert(elements.get('errorResetText').textContent.includes('Connessione assente'));
+  run(`connected=true;show('Dashboard');display(${JSON.stringify(clean)})`);
+  assert(!elements.get('errorResetBar').classList.contains('reset-required'));
+  assert(elements.get('resetBtn').disabled);
+  assert(!html.includes('Riconosci allarme / interruzione'));
+  run(`display(${JSON.stringify(status)})`);
   assert.equal(elements.get('targetDeltaTemp').textContent, '-0.9');
   for (const [mean, expected] of [[32, '+1.0'], [31, '0.0'], [30.99, '0.0'], [29, '-2.0']]) {
     run(`display({...latest,target:31,sensors:[${mean},${mean}].map((c,i)=>({...latest.sensors[i],c,valid:true}))})`);
@@ -117,7 +145,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(elements.get('outageInfo').textContent.includes('Riavvio durante'));
   assert(!elements.get('outageInfo').textContent.includes('BLACKOUT'));
   assert(elements.get('outageInfo').textContent.includes('Durata sconosciuta'));
-  run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120})`);
+  run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120,lastInterruption:{pending:false}})`);
   assert.equal(elements.get('stepDuration').textContent, '00:02:00');
   assert(elements.get('stepTimeHint').textContent.includes('pausa'));
   run(`display({...latest,phase:'paused',pauseMaintainsTemperature:true,pauseTargetC:174.2,target:174.2,duty:8,relay:true})`);

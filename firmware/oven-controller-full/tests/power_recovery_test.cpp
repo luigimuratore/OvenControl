@@ -11,6 +11,35 @@ struct Store {
   bool save(const recovery::Record &record) { if (fail) return false; committed = record; exists = true; return true; }
 };
 int main() {
+  // Cold starts and software restarts at rest are ordinary, silent events.
+  recovery::BootState boot;
+  for (const auto cause : {recovery::Cause::PowerOn, recovery::Cause::Other}) {
+    boot.cause = cause;
+    const auto notice = recovery::bootNotice(boot);
+    assert(!notice.critical && !notice.power && !strcmp(notice.title, "ESP AVVIATO"));
+  }
+  // Brownout is an actual supply fault; it is not an ordinary switch-on.
+  boot.cause = recovery::Cause::Brownout;
+  assert(recovery::bootNotice(boot).critical && recovery::bootNotice(boot).power);
+  boot.cause = recovery::Cause::PowerOn;
+  boot.interrupted = true; boot.interruptionCause = recovery::Cause::PowerOn;
+  assert(recovery::bootNotice(boot).critical && recovery::bootNotice(boot).power);
+  boot.interruptionCause = recovery::Cause::Other;
+  assert(recovery::bootNotice(boot).critical && !recovery::bootNotice(boot).power);
+  // Rebooting with an existing latch is not a second blackout.
+  boot.interruptionCause = recovery::Cause::PowerOn; boot.alreadyPending = true;
+  assert(recovery::bootNotice(boot).critical && !recovery::bootNotice(boot).power);
+  assert(strstr(recovery::bootNotice(boot).title, "PRECEDENTE NON RICONOSCIUTA"));
+  // An old latch acknowledged before NTP must not become an alarm again.
+  boot.interrupted = false;
+  assert(!recovery::bootNotice(boot).critical && !recovery::bootNotice(boot).power);
+  boot.interrupted = boot.alreadyPending = false; boot.testInterrupted = true;
+  assert(recovery::bootNotice(boot).critical && recovery::bootNotice(boot).power);
+  boot.cause = recovery::Cause::Other;
+  assert(recovery::bootNotice(boot).critical && !recovery::bootNotice(boot).power);
+  boot.testInterrupted = false; boot.cause = recovery::Cause::PowerOn; boot.emergency = true;
+  assert(recovery::bootNotice(boot).critical && !recovery::bootNotice(boot).power);
+  assert(strstr(recovery::bootNotice(boot).title, "EMERGENZA PERSISTENTE"));
   Store nvs; recovery::Journal live;
   assert(live.load(nvs)); assert(live.boot(nvs, false, 0, 1));
   assert(!live.data.pending && !live.data.active);
@@ -45,6 +74,16 @@ int main() {
   assert(acknowledged.finish(nvs));
   recovery::Journal normalStop; assert(normalStop.load(nvs)); assert(normalStop.boot(nvs, false, 0, 1));
   assert(!normalStop.data.pending);
+  // Repeated switch-offs after a completed/STOPped program or manual control
+  // must not manufacture a new interruption or require acknowledgement.
+  for (unsigned i = 0; i < 5; ++i) {
+    recovery::Journal idleBoot; assert(idleBoot.load(nvs));
+    assert(idleBoot.boot(nvs, false, 0, 1));
+    assert(!idleBoot.data.pending && !idleBoot.data.active);
+    recovery::BootState state; state.cause = recovery::Cause::PowerOn;
+    state.interrupted = idleBoot.data.pending;
+    assert(!recovery::bootNotice(state).critical);
+  }
   // Initial start is committed before energizing; even a cut between legacy
   // keys must block conservatively. Failed STOP writes retain the same block.
   assert(normalStop.begin(nvs, "Avvio appena richiesto", 1791545000));

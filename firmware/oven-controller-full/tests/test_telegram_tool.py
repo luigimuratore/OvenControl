@@ -524,6 +524,16 @@ class PreviewTest(unittest.TestCase):
         status["lastInterruption"].update(estimateKnown=True, upperBoundSec=0)
         self.assertIn("max stimato): 00:00:00", tool.format_status(status))
 
+    def test_acknowledged_interruption_is_history_not_an_active_alarm(self):
+        status = self.device.status()
+        status["lastInterruption"] = dict(recorded=True, pending=False, powerRelated=True,
+            resetReason=1, programName="Vecchio programma", estimateKnown=True, upperBoundSec=300)
+        text = tool.format_status(status)
+        self.assertTrue(text.startswith("Stato: 💤 IDLE"))
+        self.assertIn("ℹ️ Storico · BLACKOUT", text)
+        self.assertIn("Interruzione già riconosciuta: nessun blocco da questo evento.", text)
+        self.assertNotIn("Uscite bloccate", text)
+
     def test_status_starts_with_state_without_redundant_header(self):
         for action in (None, "start", "pause", "stop", "emergency"):
             with self.subTest(action=action):

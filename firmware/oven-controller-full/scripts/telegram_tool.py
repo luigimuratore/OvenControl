@@ -539,7 +539,8 @@ def format_status(status, mode="sintetica"):
             lines.append("Ultimo errore di ciclo: " + historical_error[:240])
         if interruption.get("recorded"):
             power = interruption.get("powerRelated", interruption.get("resetReason") in (1, 9))
-            lines.append(f"🚨 {'BLACKOUT / alimentazione ESP' if power else 'Interruzione da riavvio'} · reset {interruption.get('resetReason')}")
+            prefix = "🚨 " if interruption.get("pending") else "ℹ️ Storico · "
+            lines.append(f"{prefix}{'BLACKOUT / alimentazione ESP' if power else 'Interruzione da riavvio'} · reset {interruption.get('resetReason')}")
             if interruption.get("programName"):
                 lines.append("Programma interrotto: " + interruption["programName"])
             bound = interruption.get("upperBoundSec", 0)
@@ -547,6 +548,8 @@ def format_status(status, mode="sintetica"):
             lines.append("Intervallo fino al riavvio (max stimato): " + (duration(bound) if known else "durata sconosciuta"))
             if interruption.get("pending"):
                 lines.append("Uscite bloccate; riconoscimento e nuovo avvio manuale richiesti.")
+            else:
+                lines.append("Interruzione già riconosciuta: nessun blocco da questo evento.")
     lines += ["", "🧠 SISTEMA", "Uptime simulato: " + duration(status.get("uptimeMs", 0) / 1000),
               "Modalità notifiche: " + MODE_LABELS[mode],
               f"Avvio: #{status.get('bootCount', 0)}",

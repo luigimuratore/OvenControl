@@ -145,6 +145,13 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(elements.get('outageInfo').textContent.includes('Riavvio durante'));
   assert(!elements.get('outageInfo').textContent.includes('BLACKOUT'));
   assert(elements.get('outageInfo').textContent.includes('Durata sconosciuta'));
+  run(`display(${JSON.stringify({...clean, lastInterruption:{recorded:true, resetReason:1,
+    upperBoundSec:300, estimateKnown:true, pending:false, programName:'Vecchio programma'}})})`);
+  assert(elements.get('outageInfo').textContent.includes('ℹ️ Storico'));
+  assert(elements.get('outageInfo').textContent.includes('già riconosciuta'));
+  assert(!elements.get('outageInfo').textContent.includes('Uscite bloccate'));
+  assert(!elements.get('errorResetBar').classList.contains('reset-required'));
+  assert(elements.get('resetBtn').disabled);
   run(`display({...latest, phase:'paused', stepType:'hold', stepRemainingSec:120,lastInterruption:{pending:false}})`);
   assert.equal(elements.get('stepDuration').textContent, '00:02:00');
   assert(elements.get('stepTimeHint').textContent.includes('pausa'));

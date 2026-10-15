@@ -6,6 +6,25 @@ namespace recovery {
 constexpr uint32_t kVersion = 1;
 enum class Cause : uint8_t { Other, PowerOn, Brownout };
 inline bool powerRelated(Cause cause) { return cause == Cause::PowerOn || cause == Cause::Brownout; }
+struct BootState {
+  Cause cause = Cause::Other, interruptionCause = Cause::Other;
+  bool interrupted = false, alreadyPending = false, testInterrupted = false, emergency = false;
+};
+struct BootNotice { const char *title; bool critical, power; };
+inline BootNotice bootNotice(const BootState &state) {
+  if (state.emergency) return {"EMERGENZA PERSISTENTE · ESP AVVIATO", true, false};
+  if (state.interrupted) {
+    if (state.alreadyPending) return {"ALLARME · INTERRUZIONE PRECEDENTE NON RICONOSCIUTA", true, false};
+    if (powerRelated(state.interruptionCause)) return {"BLACKOUT · ALIMENTAZIONE RIPRISTINATA", true, true};
+    return {"ALLARME · RIAVVIO CON CICLO INTERROTTO", true, false};
+  }
+  if (state.testInterrupted) return {powerRelated(state.cause) ?
+    "BLACKOUT · TEST INTERROTTO" : "ALLARME · RIAVVIO CON TEST INTERROTTO", true, powerRelated(state.cause)};
+  // A brownout signals a supply problem even at rest. A normal power-on alone
+  // cannot distinguish an intentional switch-on from a mains outage.
+  if (state.cause == Cause::Brownout) return {"ALLARME ALIMENTAZIONE · BROWNOUT", true, true};
+  return {"ESP AVVIATO", false, false};
+}
 struct Record {
   uint32_t version = kVersion, resetReason = 0;
   uint64_t checkpointUtc = 0, rebootUtc = 0;

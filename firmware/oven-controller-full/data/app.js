@@ -292,11 +292,12 @@ function display(s) {
     s.lastCycleError ? `Ultimo ciclo interrotto per errore: ${s.lastCycleError}` : 'Nessuna interruzione per errore registrata.');
   const interruption = s.lastInterruption || {recorded: s.interrupted, resetReason: s.resetReason, upperBoundSec: s.outageUpperBoundSec};
   const powerReset = [1, 9].includes(Number(interruption.resetReason));
-  put("outageInfo", interruption.recorded ? `${powerReset ? '🚨 BLACKOUT / possibile interruzione di alimentazione' : '🚨 Riavvio durante un ciclo attivo'} registrato. ` +
+  put("outageInfo", interruption.recorded ? `${interruption.pending ? '🚨' : 'ℹ️ Storico ·'} ${powerReset ? 'BLACKOUT / possibile interruzione di alimentazione' : 'Riavvio durante un ciclo attivo'} registrato. ` +
     ((interruption.estimateKnown ?? !!interruption.upperBoundSec) ? `Intervallo senza controllo fino al riavvio, massimo stimato: ${clock(interruption.upperBoundSec)}; durata esatta non misurata.` :
     'Durata sconosciuta: ora NTP o checkpoint non disponibili.') +
     (interruption.programName ? ` Programma interrotto: ${interruption.programName}.` : '') +
-    (interruption.pending ? ' Uscite bloccate: riconoscimento e nuovo avvio manuale richiesti.' : '') : 'Nessuna interruzione da blackout/reset durante un ciclo attivo registrata.');
+    (interruption.pending ? ' Uscite bloccate: riconoscimento e nuovo avvio manuale richiesti.' :
+      ' Interruzione già riconosciuta: nessun blocco da questo evento.') : 'Nessuna interruzione da blackout/reset durante un ciclo attivo registrata.');
   updateReportStatus(s);
   renderTestStatus(s);
   updateControls();

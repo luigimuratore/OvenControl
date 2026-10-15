@@ -128,7 +128,7 @@ std::atomic<unsigned> wifiLastReason{0};
 std::atomic<bool> wifiLastRetryAccepted{true};
 uint32_t wifiLoggedReasonSeq = 0, wifiLoggedRetryCount = 0, lastNtpAttempt = 0;
 bool hadInterrupted = false, checkpointWriteFaultLogged = false;
-bool powerRestored = false, bootNoticePending = false;
+bool interruptionAlreadyPending = false, bootNoticePending = false;
 recovery::Cause bootCause = recovery::Cause::Other;
 struct TestSample { uint32_t seq, ms; float t1, t2; uint16_t raw1, raw2; uint8_t fault1, fault2, flags; };
 TestSample *testHistory = nullptr;
@@ -464,9 +464,8 @@ void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
       (recovery == probes::RecoveryResult::Confirmed ?
        " · transitorio recuperato con due nuove conversioni valide; uscita spenta durante verifica" :
        " · verifica non confermata; arresto e allarme"));
-  if (recovery == probes::RecoveryResult::Confirmed)
-    telegramBot.notify("⚠️ AVVISO SONDA · PT100 #" + String(index + 1) +
-      "\nFault 0x04 transitorio recuperato con due nuove letture valide.\nUscite spente durante la verifica. Letture ripristinate; nessun nuovo avvio automatico.\nEvento a uptime " + String(millis() / 1000) + " s.", true);
+  // Successful recoveries stay in the local log; only failed checks raise a
+  // Telegram alarm through the normal stop/trip paths.
   if (sensor.valid != wasValid || sensor.fault != previousFault)
     logEvent(sensor.valid ? "PT100" : "SONDA", String(&sensor == &sensors[0] ? "PT100 #1: " : "PT100 #2: ") + sensorMessage(sensor) +
       " · Fault 0x" + String(sensor.fault, HEX) + " · RAW " + String(sensor.raw) + " · " + String(sensor.ohms, 2) + " ohm");
@@ -605,13 +604,15 @@ String telegramStatus() {
   if (lastCycleError.length() && lastCycleError != faultText) text += "Ultimo errore di ciclo: " + lastCycleError.substring(0, 240) + "\n";
   if (interruptionRecorded) {
     const bool power = lastInterruption.resetReason == ESP_RST_POWERON || lastInterruption.resetReason == ESP_RST_BROWNOUT;
-    text += String(power ? "🚨 BLACKOUT / alimentazione ESP" : "🚨 Interruzione da riavvio") +
+    const bool pending = recoveryJournal.data.pending || output.recoveryBlocked;
+    text += String(pending ? "🚨 " : "ℹ️ Storico · ") + (power ? "BLACKOUT / alimentazione ESP" : "Interruzione da riavvio") +
       " · reset " + String(lastInterruption.resetReason);
     if (interruptedProgram.length()) text += "\nProgramma interrotto: " + interruptedProgram;
     if (lastInterruption.checkpointUtc && lastInterruption.rebootUtc >= lastInterruption.checkpointUtc)
       text += "\nIntervallo fino al riavvio (max stimato): " + telegramTime(uint32_t(lastInterruption.rebootUtc - lastInterruption.checkpointUtc));
     else text += "\nIntervallo massimo: durata sconosciuta";
-    text += "\n";
+    text += pending ? "\nInterruzione da riconoscere: premi RESET ERRORI.\n" :
+      "\nInterruzione già riconosciuta: nessun blocco da questo evento.\n";
   }
   text += "\n🧠 SISTEMA\nUptime: " + telegramTime(now / 1000) + "\nAvvio: #" + String(bootCount) + "\n";
   text += "RAM libera/min: " + String(ESP.getFreeHeap()) + " / " + String(ESP.getMinFreeHeap()) + " B\n";
@@ -1097,6 +1098,7 @@ void statusApi(uint32_t testToken = 0) {
   interruption["recorded"] = interruptionRecorded;
   interruption["resetReason"] = lastInterruption.resetReason;
   interruption["pending"] = recoveryJournal.data.pending || outputSnapshot().recoveryBlocked;
+  interruption["pendingAtBoot"] = interruptionAlreadyPending;
   interruption["powerRelated"] = lastInterruption.resetReason == ESP_RST_POWERON || lastInterruption.resetReason == ESP_RST_BROWNOUT;
   interruption["programName"] = interruptedProgram;
   interruption["estimateKnown"] = recovery::estimate(lastInterruption.checkpointUtc, lastInterruption.rebootUtc).known;
@@ -1599,12 +1601,24 @@ void updateNetwork() {
   }
   if (ntpSynced && bootNoticePending) {
     bootNoticePending = false;
-    const bool oldPowerInterruption = hadInterrupted &&
-      (lastInterruption.resetReason == ESP_RST_POWERON || lastInterruption.resetReason == ESP_RST_BROWNOUT);
-    const bool power = powerRestored || oldPowerInterruption;
+    recovery::BootState state;
+    state.cause = bootCause;
+    state.interrupted = hadInterrupted;
+    state.interruptionCause = lastInterruption.resetReason == ESP_RST_POWERON ? recovery::Cause::PowerOn :
+      lastInterruption.resetReason == ESP_RST_BROWNOUT ? recovery::Cause::Brownout : recovery::Cause::Other;
+    state.alreadyPending = interruptionAlreadyPending;
+    state.testInterrupted = testInterrupted;
+    state.emergency = outputSnapshot().emergency;
+    // NTP may arrive after the operator has acknowledged an old latch. Do not
+    // announce that old event as still pending once it has been cleared.
+    if (interruptionAlreadyPending && !recoveryJournal.data.pending && !outputSnapshot().recoveryBlocked)
+      state.interrupted = false;
+    const auto notice = recovery::bootNotice(state);
     String reason = "Causa reset ESP: " + resetReason + ".\nAl riavvio: comando riscaldamento SPENTO. Ripresa automatica: DISABILITATA.";
-    if (power) reason += "\nRipristino/calo dell'alimentazione ESP rilevato; può essere un blackout o una riaccensione manuale.";
+    if (notice.power) reason += "\nRipristino/calo dell'alimentazione ESP rilevato; può essere un blackout o una riaccensione manuale.";
     if (hadInterrupted) {
+      if (interruptionAlreadyPending)
+        reason += "\nInterruzione precedente già presente all'avvio: questo riavvio non indica un nuovo blackout durante il controllo.";
       reason += "\nProgramma interrotto: " + (interruptedProgram.length() ? interruptedProgram : String("non disponibile (registro precedente)"));
       const auto estimate = recovery::estimate(lastInterruption.checkpointUtc, lastInterruption.rebootUtc);
       if (estimate.known) {
@@ -1615,11 +1629,10 @@ void updateNetwork() {
       reason += outputSnapshot().recoveryBlocked || recoveryJournal.data.pending ?
         "\nUscite bloccate fino al riconoscimento locale. Per ripartire serve un nuovo avvio manuale dall'inizio." :
         "\nInterruzione già riconosciuta localmente dall'operatore. Nessuna ripresa automatica è stata eseguita.";
-    } else if (power) reason += "\nNessun ciclo attivo registrato. Durata blackout non disponibile.";
+    } else if (testInterrupted) reason += "\nTEST interrotto: uscite spente, nessuna ripresa automatica. Durata dell'interruzione non disponibile.";
+    else reason += "\nNessun controllo attivo interrotto. L'accensione non richiede RESET ERRORI, salvo altri blocchi presenti.";
     if (outputSnapshot().emergency) reason += "\nEMERGENZA PERSISTENTE: riconoscimento locale richiesto.";
-    telegramNotice(power ? "BLACKOUT · ALIMENTAZIONE RIPRISTINATA" : hadInterrupted ?
-      "ALLARME · RIAVVIO CON CICLO INTERROTTO" : outputSnapshot().emergency ? "EMERGENZA PERSISTENTE · ESP AVVIATO" : "ESP AVVIATO",
-      reason, power || hadInterrupted || outputSnapshot().emergency);
+    telegramNotice(notice.title, reason, notice.critical);
   }
 }
 void loadRecipes() {
@@ -1663,8 +1676,8 @@ void setup() {
   resetReason = String(bootReset);
   bootCause = bootReset == ESP_RST_POWERON ? recovery::Cause::PowerOn :
     bootReset == ESP_RST_BROWNOUT ? recovery::Cause::Brownout : recovery::Cause::Other;
-  powerRestored = recovery::powerRelated(bootCause) && (bootCount > 1 || bootCause == recovery::Cause::Brownout);
   const bool journalLoaded = recoveryJournal.load(recoveryStore);
+  interruptionAlreadyPending = journalLoaded && recoveryJournal.data.pending;
   const bool blockSaved = recoveryJournal.boot(recoveryStore, wasActive,
     prefs.getULong64("checkpoint", 0), bootReset);
   hadInterrupted = recoveryJournal.data.pending;

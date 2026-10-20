@@ -3,9 +3,10 @@ from test_telegram_tool import preview, tool
 
 
 class CooldownPreviewTest(unittest.TestCase):
-    def device(self, manual, rate=1, target=50):
+    def device(self, manual, rate=1, target=50, mean_block=True):
         d = preview.DemoDevice("full", speed=1)
         d.temperature = 175
+        d.request('POST','protections',body={**d.protections,'meanOvershootEnabled':mean_block})
         d.control.update(actuator="ssr", windowSec=5, maxPower=60)
         if manual:
             d.request("POST", "manual", body=dict(action="start", targetC=175, rateCMin=1, hardwareReady=True))
@@ -28,17 +29,17 @@ class CooldownPreviewTest(unittest.TestCase):
                 self.assertEqual(d.phase, "running")
                 self.assertTrue(d.status()["cooldownRegulated"])
 
-    def test_equal_or_above_reference_is_always_off_and_large_natural_lag_is_not_fault(self):
+    def test_natural_lag_is_allowed_when_mean_block_is_disabled(self):
         for manual in (False, True):
             with self.subTest(manual=manual):
-                d = self.device(manual, rate=30)
+                d = self.device(manual, rate=30, mean_block=False)
                 for offset in (0, 1, 10, 40):
                     d.temperature = d.target + offset
                     d.advance_full(0)
                     self.assertEqual(d.duty, 0)
                     self.assertFalse(d.relay)
                     self.assertEqual(d.phase, "running")
-                d = self.device(manual, rate=30)
+                d = self.device(manual, rate=30, mean_block=False)
                 d.advance(300)
                 self.assertGreater(d.temperature, d.target + 8)
                 self.assertEqual(d.duty, 0)
@@ -46,7 +47,7 @@ class CooldownPreviewTest(unittest.TestCase):
                 self.assertEqual(d.phase, "running")
 
     def test_curve_endpoint_and_probe_temperature_are_both_required(self):
-        d = self.device(True, rate=30)
+        d = self.device(True, rate=30, mean_block=False)
         d.temperature = 49
         d.advance_full(0)
         self.assertFalse(d.status()["manual"]["cooldownComplete"])
@@ -63,7 +64,7 @@ class CooldownPreviewTest(unittest.TestCase):
         self.assertFalse(d.relay)
 
     def test_final_program_step_completes_and_outputs_stay_off(self):
-        d = self.device(False, rate=30)
+        d = self.device(False, rate=30, mean_block=False)
         d.advance(3800)
         self.assertEqual(d.phase, "complete")
         self.assertEqual(d.duty, 0)

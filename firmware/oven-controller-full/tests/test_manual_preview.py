@@ -34,6 +34,7 @@ class ManualPreviewTest(unittest.TestCase):
     def test_lower_target_passively_cools_then_regulates(self):
         self.start()
         self.device.temperature = 90
+        self.device.target = 90  # The simulated oven has reached this reference before lowering it.
         self.manual("target", targetC=60)
         self.device.advance_full(0)
         self.assertTrue(self.device.status()["manual"]["coolingToTarget"])
@@ -141,7 +142,7 @@ class ManualPreviewTest(unittest.TestCase):
         self.assertIn("Target finale: 100.00", text)
         self.assertNotIn(status["recipeName"], text)
         self.assertNotIn("CICLO ATTIVO", text)
-        self.assertIsNone(tool.format_notice(notices[0][0], notices[0][2], status, mode="essenziale"))
+        self.assertIn("MANUALE AVVIATO", tool.format_notice(notices[0][0], notices[0][2], status, mode="essenziale"))
         brief = tool.format_notice(notices[0][0], notices[0][2], status)
         self.assertTrue(brief.startswith("🚀"))
         self.assertIn("100", brief)

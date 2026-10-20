@@ -11,6 +11,8 @@
 #include "telegram_delivery.h"
 #include "telegram_runtime.h"
 #include "report_pdf.h"
+#include "plot_png.h"
+#include "plot_snapshot.h"
 
 // Arduino's WiFiClientSecure library shadows the SDK's esp_crt_bundle.h.
 // Use the native IDF bundle (built into this SDK), not its Arduino replacement.
@@ -19,12 +21,12 @@ extern "C" esp_err_t esp_crt_bundle_attach(void *conf);
 // The worker owns all HTTPS/JSON state. The loop only copies fixed-size messages
 // into PSRAM queues with zero wait. No sensor, PID, Preferences or GPIO access here.
 class TelegramService {
-  struct Message { uint32_t created; bool pin = false, menu = false, event = false; char text[telegram::kMessageBytes]; };
+  struct Message { uint32_t created; bool pin = false, menu = false, event = false; telegram::EventScope scope = telegram::EventScope::Selected; char text[telegram::kMessageBytes]; };
   struct ReportJob {
     reports::Snapshot report;
     reportpdf::Point *points = nullptr;
     size_t count = 0;
-    bool partial = false;
+    bool partial = false, plot = false;
     uint32_t created = 0;
   };
   struct Worker {
@@ -39,7 +41,8 @@ class TelegramService {
     uint32_t lastSend = 0;
     unsigned serverRetry = 0;
     std::atomic<bool> tlsConnected{false};
-    telegram::RetryLane messages, polling, attachments;
+    telegram::RetryLane messages, polling, attachments, setup;
+    bool commandsSet = false;
     ReportJob *document = nullptr;
     char *pdf = nullptr;
     size_t pdfBytes = 0;
@@ -59,10 +62,11 @@ class TelegramService {
   StaticQueue_t documentControl{};
   uint8_t documentStorage[3 * sizeof(ReportJob *)]{};
   uint8_t *alarmStorage = nullptr, *noticeStorage = nullptr, *replyStorage = nullptr;
-  std::atomic<bool> available{false}, statusRequest{false}, running{false};
+  std::atomic<bool> available{false}, statusRequest{false}, plotRequest{false}, running{false};
   std::atomic<int> modeValue{int(telegram::Mode::Brief)}, requestedMode{-1};
   std::atomic<uint32_t> sent{0}, failed{0}, dropped{0}, lastSuccess{0};
   std::atomic<int> lastHttp{0};
+  std::atomic<uint32_t> plotsSent{0}, plotsDropped{0}, plotsPending{0};
   std::atomic<uint32_t> reportsSent{0}, reportsDropped{0}, reportsPending{0};
   std::atomic<uint32_t> reportsUnconfirmed{0}, duplicateReportsSkipped{0};
   std::atomic<uint32_t> internalFree{0}, largestInternalBlock{0}, memoryDeferrals{0};
@@ -82,10 +86,11 @@ class TelegramService {
     free(job->points); job->~ReportJob(); free(job);
   }
   void finishDocument(bool success) {
+    const bool plot = worker->document->plot;
     releaseReport(worker->document); worker->document = nullptr;
     free(worker->pdf); worker->pdf = nullptr; worker->pdfBytes = 0;
-    --reportsPending;
-    if (success) ++reportsSent; else ++reportsDropped;
+    if (plot) { --plotsPending; if (success) ++plotsSent; else ++plotsDropped; }
+    else { --reportsPending; if (success) ++reportsSent; else ++reportsDropped; }
   }
   static void renderYield() { vTaskDelay(pdMS_TO_TICKS(1)); }
 
@@ -177,7 +182,7 @@ class TelegramService {
     lane.fail(millis(), worker->serverRetry);
   }
   bool sendMessage(const Message &message, bool critical) {
-    if (message.event && !telegram::allowEvent(mode(), critical)) return true;
+    if (message.event && !telegram::allowEvent(mode(), critical, message.scope)) return true;
     JsonDocument body(&allocator), response(&allocator);
     body["chat_id"] = chatId; body["text"] = message.text;
     body["disable_notification"] = !critical;
@@ -187,7 +192,7 @@ class TelegramService {
       JsonArray rows = markup["keyboard"].to<JsonArray>();
       JsonArray first = rows.add<JsonArray>(); first.add(telegram::kEssentialButton); first.add(telegram::kBriefButton);
       JsonArray second = rows.add<JsonArray>(); second.add(telegram::kDetailedButton); second.add("/status");
-      rows.add<JsonArray>().add("/modalita");
+      JsonArray third = rows.add<JsonArray>(); third.add("/plot"); third.add("/modalita");
     }
     String payload; serializeJson(body, payload);
     if (!request("sendMessage", payload, response)) { backoff(worker->messages); return false; }
@@ -207,33 +212,54 @@ class TelegramService {
     }
     worker->pinMessageId = 0; worker->messages.success(millis());
   }
+  void registerCommands() {
+    JsonDocument body(&allocator), response(&allocator);
+    body["scope"]["type"] = "chat"; body["scope"]["chat_id"] = chatId;
+    const char *names[] = {"status", "plot", "modalita", "help", "start", "essenziale", "sintetica", "dettagliata"};
+    const char *descriptions[] = {"Stato completo del forno", "Grafico attuale target e media PT100", "Scegli le notifiche", "Guida ai comandi", "Mostra e fissa la guida", "Allarmi e report", "Eventi brevi e report", "Tutti i dettagli e avvisi sonde"};
+    auto commands = body["commands"].to<JsonArray>();
+    for (unsigned i = 0; i < 8; ++i) { auto item = commands.add<JsonObject>(); item["command"] = names[i]; item["description"] = descriptions[i]; }
+    String payload; serializeJson(body, payload);
+    if (request("setMyCommands", payload, response)) { worker->commandsSet = true; worker->setup.success(millis()); }
+    else backoff(worker->setup);
+  }
   bool sendDocument() {
     auto &w = *worker;
+    const bool plot = w.document->plot;
     w.serverRetry = 0;
     if (!w.pdf) {
       w.pdf = static_cast<char *>(ps_malloc(reportpdf::kCapacity));
-      if (w.pdf) w.pdfBytes = reportpdf::generate(w.pdf, reportpdf::kCapacity, w.document->report,
+      if (w.pdf && plot) {
+        auto *raster = static_cast<uint8_t *>(ps_malloc(plotpng::kRasterBytes));
+        if (raster) w.pdfBytes = plotpng::generate(w.pdf, reportpdf::kCapacity, raster, plotpng::kRasterBytes,
+          w.document->points, w.document->count, w.document->report.startMs, w.document->report.endMs, renderYield);
+        free(raster);
+      } else if (w.pdf) w.pdfBytes = reportpdf::generate(w.pdf, reportpdf::kCapacity, w.document->report,
         w.document->points, w.document->count, w.document->partial, renderYield);
       if (!w.pdfBytes) {
         finishDocument(false);
-        notify("⚠️ PDF NON GENERATO\nMemoria report insufficiente. Il riepilogo resta disponibile dalla dashboard.", true);
+        notify(plot ? "⚠️ Grafico non generato: memoria insufficiente. Riprova /plot." : "⚠️ PDF NON GENERATO\nMemoria report insufficiente. Il riepilogo resta disponibile dalla dashboard.");
         return false;
       }
     }
     // Release the polling TLS session before opening the streaming upload.
     closeHttp();
     if (!available || !tlsRoom()) { backoff(w.attachments); return false; }
-    char name[128]; reportpdf::filename(w.document->report, name, sizeof(name));
+    char name[128], stamp[64]; reportpdf::date(w.document->report.endUtc, stamp, sizeof(stamp));
+    if (plot) snprintf(name, sizeof(name), "Plot_%u.png", unsigned(w.document->created));
+    else reportpdf::filename(w.document->report, name, sizeof(name));
+    const String caption = plot ? String("📈 TARGET / MEDIA PT100\nAggiornato: ") + stamp +
+      "\nUltimi 30 minuti disponibili · " + String(w.document->count) + " campioni. Nuova immagine con /plot." :
+      String("📄 REPORT DI FINE CICLO\n") + w.document->report.recipeName + "\n" + reportpdf::outcome(w.document->report.outcome);
     const String boundary = "OvenPdf" + String(esp_random(), HEX) + String(esp_random(), HEX);
     const String prefix = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
       String(static_cast<long long>(chatId)) + "\r\n--" + boundary +
       "\r\nContent-Disposition: form-data; name=\"disable_notification\"\r\n\r\ntrue\r\n--" + boundary +
-      "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n📄 Report di fine ciclo · " +
-      reportpdf::outcome(w.document->report.outcome) + "\r\n--" + boundary +
-      "\r\nContent-Disposition: form-data; name=\"document\"; filename=\"" + name +
-      "\"\r\nContent-Type: application/pdf\r\n\r\n";
+      "\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n" + caption + "\r\n--" + boundary +
+      "\r\nContent-Disposition: form-data; name=\"" + (plot ? "photo" : "document") + "\"; filename=\"" + name +
+      "\"\r\nContent-Type: " + (plot ? "image/png" : "application/pdf") + "\r\n\r\n";
     const String suffix = "\r\n--" + boundary + "--\r\n";
-    const String url = String("https://api.telegram.org/bot") + token + "/sendDocument";
+    const String url = String("https://api.telegram.org/bot") + token + (plot ? "/sendPhoto" : "/sendDocument");
     esp_http_client_config_t config{};
     config.url = url.c_str(); config.timeout_ms = 5000;
     config.crt_bundle_attach = esp_crt_bundle_attach; config.disable_auto_redirect = true;
@@ -248,7 +274,7 @@ class TelegramService {
     const auto write = [&](const char *data, size_t bytes, bool finalBoundary = false) {
       size_t at = 0;
       while (at < bytes && available && uint32_t(millis() - began) < 25000) {
-        if (uxQueueMessagesWaiting(alarms)) { interrupted = true; return false; }
+        if (uxQueueMessagesWaiting(alarms) || uxQueueMessagesWaiting(replies)) { interrupted = true; return false; }
         // A failed final write may still have reached the server. Do not repeat
         // an upload with an ambiguous result, even if its reply is lost.
         if (finalBoundary) mayHaveDelivered = true;
@@ -282,10 +308,10 @@ class TelegramService {
     if (result == telegram::DocumentResult::Retry) { backoff(w.attachments); return false; }
     if (result != telegram::DocumentResult::Confirmed) {
       ++failed;
-      if (result == telegram::DocumentResult::Uncertain) ++reportsUnconfirmed;
+      if (!plot && result == telegram::DocumentResult::Uncertain) ++reportsUnconfirmed;
       finishDocument(false); w.attachments.success(millis());
       // Silent, single warning; the attachment itself is no longer queued.
-      notify(result == telegram::DocumentResult::Uncertain ?
+      notify(plot ? "⚠️ Invio grafico non confermato. Richiedi una nuova immagine con /plot." : result == telegram::DocumentResult::Uncertain ?
         "⚠️ Conferma PDF Telegram non ricevuta. Per evitare duplicati il report non verrà reinviato automaticamente; se manca in chat, scaricalo dalla dashboard." :
         "⚠️ PDF rifiutato da Telegram. Scarica il report dalla dashboard e verifica la configurazione del bot.");
       return false;
@@ -315,6 +341,7 @@ class TelegramService {
       if (command != telegram::Command::None) ++commandsReceived;
       switch (command) {
         case telegram::Command::Status: statusRequest = true; break;
+        case telegram::Command::Plot: plotRequest = true; break;
         case telegram::Command::Help:
           notify(String(telegram::kGuideText) + "\n\nModalità attiva: " + telegram::modeName(mode()),
             false, strcmp(message["text"] | "", "/start") == 0, true);
@@ -339,11 +366,14 @@ class TelegramService {
       if (!w.hasReply) w.hasReply = xQueueReceive(replies, &w.reply, 0) == pdTRUE;
       if (!w.hasNotice) w.hasNotice = xQueueReceive(notices, &w.notice, 0) == pdTRUE;
       if (!w.document) xQueueReceive(documents, &w.document, 0);
-      if (w.document && uint32_t(now - w.document->created) > 86400000) finishDocument(false);
+      if (w.document && uint32_t(now - w.document->created) > (w.document->plot ? 60000u : 86400000u)) {
+        const bool plot = w.document->plot; finishDocument(false);
+        if (plot) reply("📈 Richiesta grafico scaduta durante l'attesa. Riprova /plot.");
+      }
       if (w.hasReply && telegram::expired(now, w.reply.created, true, false)) { w.hasReply = false; ++dropped; }
       if (w.hasNotice && telegram::expired(now, w.notice.created, false, false)) { w.hasNotice = false; ++dropped; }
       // A selection also suppresses old routine events still waiting in the queue.
-      if (w.hasNotice && w.notice.event && !telegram::allowEvent(mode(), false)) w.hasNotice = false;
+      if (w.hasNotice && w.notice.event && !telegram::allowEvent(mode(), false, w.notice.scope)) w.hasNotice = false;
       Message *out = w.hasCritical ? &w.critical : w.hasReply ? &w.reply : w.hasNotice ? &w.notice : nullptr;
       if (out && w.messages.ready(now) && uint32_t(now - w.lastSend) >= 1100) {
         if (sendMessage(*out, out == &w.critical)) {
@@ -358,6 +388,7 @@ class TelegramService {
         sendDocument();
       // Polling has its own retry deadline, independent of messages and PDFs.
       if (w.polling.ready(millis())) poll();
+      if (!out && !w.commandsSet && w.setup.ready(millis())) registerCommands();
       vTaskDelay(pdMS_TO_TICKS(100));
     }
   }
@@ -408,19 +439,20 @@ public:
   void setMode(telegram::Mode selected) { modeValue = int(selected); }
   int takeModeRequest() { return requestedMode.exchange(-1); }
   bool takeStatusRequest() { return running && statusRequest.exchange(false); }
-  bool notify(const String &text, bool critical = false, bool pin = false, bool menu = false, bool event = false) {
+  bool takePlotRequest() { return running && plotRequest.exchange(false); }
+  bool notify(const String &text, bool critical = false, bool pin = false, bool menu = false, bool event = false, telegram::EventScope scope = telegram::EventScope::Selected) {
     if (!running) return false;
-    if (event && !telegram::allowEvent(mode(), critical)) return true;
-    Message message{}; copyText(message, text); message.pin = pin; message.menu = menu; message.event = event;
+    if (event && !telegram::allowEvent(mode(), critical, scope)) return true;
+    Message message{}; copyText(message, text); message.pin = pin; message.menu = menu; message.event = event; message.scope = scope;
     const bool queued = xQueueSend(critical ? alarms : notices, &message, 0) == pdTRUE;
     if (!queued) ++dropped;
     return queued;
   }
-  bool notifyEvent(const String &text, bool critical = false) { return notify(text, critical, false, false, true); }
+  bool notifyEvent(const String &text, bool critical = false, telegram::EventScope scope = telegram::EventScope::Selected) { return notify(text, critical, false, false, true, scope); }
   template <typename Sample>
   bool report(const reports::Snapshot &snapshot, const Sample *curve, size_t count, bool partial) {
     if (!running) return false;
-    if (queuedCycles.contains(snapshot.boot, snapshot.startMs)) { ++duplicateReportsSkipped; return true; }
+    if (queuedCycles.contains(snapshot.boot, snapshot.startMs, snapshot.endMs)) { ++duplicateReportsSkipped; return true; }
     if (reportsPending >= 4 || count > 4321 || (count && !curve)) { ++reportsDropped; return false; }
     auto *job = static_cast<ReportJob *>(ps_malloc(sizeof(ReportJob)));
     if (!job) { ++reportsDropped; return false; }
@@ -430,10 +462,26 @@ public:
     job->count = count;
     for (size_t i = 0; i < count; ++i) job->points[i] = {curve[i].ms,
       (curve[i].flags & 3) == 3 ? (curve[i].t1 + curve[i].t2) * 0.5f : NAN,
-      curve[i].flags & 8 ? curve[i].setpoint : NAN};
+      curve[i].flags & 8 ? curve[i].setpoint : NAN, curve[i].step, curve[i].flags};
     ++reportsPending;
     if (xQueueSend(documents, &job, 0) != pdTRUE) { --reportsPending; releaseReport(job); ++reportsDropped; return false; }
-    queuedCycles.remember(snapshot.boot, snapshot.startMs);
+    queuedCycles.remember(snapshot.boot, snapshot.startMs, snapshot.endMs);
+    return true;
+  }
+  template <typename Sample>
+  bool plot(const Sample *curve, size_t capacity, size_t head, size_t count, const Sample &current) {
+    if (!running || plotsPending || !curve || !capacity || count > capacity) return false;
+    auto *job = static_cast<ReportJob *>(ps_malloc(sizeof(ReportJob)));
+    if (!job) return false;
+    new (job) ReportJob(); job->plot = true; job->created = millis();
+    job->points = static_cast<reportpdf::Point *>(ps_malloc(257 * sizeof(reportpdf::Point)));
+    if (!job->points) { releaseReport(job); return false; }
+    job->count = plotpng::snapshot(curve, capacity, head, count, current, job->points, 257);
+    if (!job->count) { releaseReport(job); return false; }
+    job->report.startMs = job->points[0].ms; job->report.endMs = current.ms;
+    const auto epoch = time(nullptr); job->report.endUtc = epoch >= 1700000000 ? uint64_t(epoch) : 0;
+    ++plotsPending;
+    if (xQueueSend(documents, &job, 0) != pdTRUE) { --plotsPending; releaseReport(job); ++plotsDropped; return false; }
     return true;
   }
   void reply(const String &text, bool menu = false) {
@@ -446,6 +494,7 @@ public:
     object["networkReady"] = available.load(); object["sent"] = sent.load();
     object["failedAttempts"] = failed.load(); object["dropped"] = dropped.load();
     object["lastHttpCode"] = lastHttp.load(); object["lastSentAtMs"] = lastSuccess.load();
+    object["plotsSent"] = plotsSent.load(); object["plotsPending"] = plotsPending.load(); object["plotsDropped"] = plotsDropped.load();
     object["reportsSent"] = reportsSent.load(); object["reportsPending"] = reportsPending.load();
     object["reportsDropped"] = reportsDropped.load();
     object["reportsUnconfirmed"] = reportsUnconfirmed.load();

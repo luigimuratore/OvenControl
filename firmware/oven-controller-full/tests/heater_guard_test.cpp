@@ -27,8 +27,8 @@ int main() {
   p.windowAt = 3200; guard.publish(p); assert(guard.tick(3200));
   guard.inhibit(); assert(!guard.tick(3201));
   assert(!guard.tick(200000) && guard.fault == heater::Fault::None); // STOP does not leave an active lease.
-  guard.clear(); p.heatingAllowed = true; p.sampleAt = 43200100; guard.publish(p);
-  assert(!guard.tick(43200100) && guard.fault == heater::Fault::CycleTimeout);
+  guard.clear(); p.heatingAllowed = true; p.sampleAt = p.windowAt = 43200100; guard.publish(p);
+  assert(guard.tick(43200100) && guard.fault == heater::Fault::None);
   guard.clear(); p.sampleAt = p.cycleAt = p.windowAt = 0; p.duty = std::numeric_limits<float>::quiet_NaN(); guard.publish(p);
   assert(!guard.tick(0) && guard.fault == heater::Fault::InvalidPlan);
   guard.clear(); p.duty = 100; p.healthy = false; guard.publish(p);
@@ -52,5 +52,5 @@ int main() {
   assert(hold.elapsedMs == 500);
   assert(profile::inBand(45, 55, 50)); assert(!profile::inBand(44.9, 50, 50));
   assert(!profile::inBand(50, std::numeric_limits<float>::quiet_NaN(), 50));
-  puts("OK: PWM, pause/cooldown/STOP, stale control latch, cycle timeout, invalid plans, hold accounting, timer wrap");
+  puts("OK: PWM, pause/cooldown/STOP, stale control latch, prolonged programs, invalid plans, hold accounting, timer wrap");
 }

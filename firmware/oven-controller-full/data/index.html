@@ -10,10 +10,16 @@
 <body>
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
-  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
+  <nav class="view-tabs" aria-label="Sezioni del forno">
+    <button id="tabDashboard" class="active">Dashboard</button>
+    <div class="tab-group" role="group" aria-label="Controllo del forno"><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button></div>
+    <button id="tabParameters">Parameters</button>
+    <div class="tab-group" role="group" aria-label="Diagnostica"><button id="tabTest">TEST</button><button id="tabLogs">Log</button></div>
+    <button id="tabReport">Report</button>
+  </nav>
   <section id="errorResetBar" class="error-reset-bar" aria-label="Stato blocco e reset errori">
     <div><strong id="errorResetTitle">Stato errori</strong><p id="errorResetText" role="status" aria-live="polite">In attesa del controllore.</p></div>
-    <button id="resetBtn" class="error-reset-button" disabled>RESET ERRORI</button>
+    <div class="error-reset-actions"><button id="resetBtn" class="error-reset-button" disabled>RESET &amp; BLOCK</button><button id="resetContinueBtn" class="error-reset-button error-continue-button" disabled>RESET &amp; CONTINUE</button></div>
   </section>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
   <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo, manuale e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
@@ -71,12 +77,34 @@
     <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina programma</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
     <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: il PID frena il raffreddamento sotto il setpoint; sopra la curva raffredda naturalmente. Non può raffreddare più velocemente del forno.</p><div id="recipeMessage" class="notice hidden"></div>
     </div>
+
+  </section>
+  <section id="parametersView" class="logs-view panel" hidden>
+    <div class="panel-title-row"><div><div class="eyebrow">REGOLAZIONE E BLOCCHI</div><h2>Parameters</h2><p>Impostazioni condivise da Programmi e Manuale. Modifica e salva con il controllo fermo.</p></div></div>
     <section class="control-settings-section"><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
     <div class="pid-fields"><label class="field"><span>Kp</span><input id="kp" type="number" min="0" max="50" step="0.1"></label><label class="field"><span>Ki</span><input id="ki" type="number" min="0" max="0.5" step="0.001"></label><label class="field"><span>Kd</span><input id="kd" type="number" min="0" max="200" step="0.1"></label></div><button id="savePid" class="ghost full">Salva PID sull'ESP</button>
     <hr><h2>Attuatore e limite potenza</h2><p>Seleziona l'attuatore realmente installato. Il limite è la percentuale di tempo ON richiesta, senza misura della potenza elettrica.</p>
     <div class="pid-fields"><label class="field"><span>Tipo attuatore</span><select id="actuator"><option value="relay">Relè meccanico</option><option value="ssr">SSR</option></select></label><label class="field"><span>Finestra comando · s</span><input id="windowSec" type="number" min="60" max="300" step="1"></label><label class="field"><span>Limite comando · %</span><input id="maxPower" type="number" min="1" max="100" step="1"></label></div>
     <button id="saveControl" class="ghost full">Salva comando sull'ESP</button><p class="hint">Default: relè meccanico, finestra 60 s, comando massimo 30%. SSR: finestra 1–300 s; relè: 60–300 s. Questi valori iniziali e il PID richiedono taratura sul forno. Il firmware non rileva il tipo di attuatore.</p>
     </section>
+    <section class="control-settings-section protection-settings-section" aria-labelledby="protectionSettingsTitle">
+      <h2 id="protectionSettingsTitle">Blocchi termici configurabili</h2>
+      <p>Ogni blocco è indipendente. Le soglie si applicano a rampa, mantenimento, pausa e cooldown di Programmi e Manuale. Scattano solo quando il valore è maggiore della soglia. Il target è il riferimento istantaneo mostrato nel grafico.</p>
+      <div class="protection-grid">
+        <article class="protection-card"><h3>Differenza tra le sonde</h3><p class="hint">ΔT = valore assoluto di PT100 #1 − PT100 #2.</p>
+          <label class="protection-toggle"><input id="probeDeltaEnabled" type="checkbox"><span>Abilita blocco ΔT sonde</span></label>
+          <label class="field"><span>Soglia ΔT sonde · °C</span><input id="maxProbeDeltaC" type="number" min="0.1" max="430" step="0.1" value="30"></label>
+        </article>
+        <article class="protection-card"><h3>Media sopra il target</h3><p class="hint">ΔT = media PT100 − target. Un valore negativo indica una temperatura sotto il target.</p>
+          <label class="protection-toggle"><input id="meanOvershootEnabled" type="checkbox"><span>Abilita blocco media − target</span></label>
+          <label class="field"><span>Soglia sopra il target · °C</span><input id="maxMeanOvershootC" type="number" min="0.1" max="430" step="0.1" value="10"></label>
+        </article>
+      </div>
+      <p id="appliedProtections" class="protection-applied" role="status">In attesa delle impostazioni applicate sull'ESP.</p>
+      <button id="saveProtections" class="ghost full" disabled>Salva blocchi sull'ESP</button>
+      <p class="hint">Le modifiche si applicano dopo il salvataggio e restano memorizzate al riavvio. Le letture valide e fresche, l'emergenza e il limite assoluto individuale di 415 °C restano attivi. TEST mantiene la sua diagnostica separata.</p>
+    </section>
+    <div id="parametersMessage" class="notice hidden" role="status"></div>
   </section>
   <section id="logsView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2><p>Avvio/fine ciclo, step, PID, allarmi, rete e interruzioni.</p></div><div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div></div><p id="logRetention" class="hint">Caricamento…</p><div id="logList" class="log-list"></div></section>
 <section id="testView" hidden>

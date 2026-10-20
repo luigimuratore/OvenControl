@@ -101,70 +101,116 @@ const OvenExport = (() => {
   }
   // jsPDF's standard font supports Italian accents; normalize extra symbols.
   const pdfText = v => String(v).replace(/[–—−]/g,'-').replace(/→/g,' > ').replace(/Δ/g,'Delta ').replace(/Ω/g,'ohm').replace(/’/g,"'");
+  function summaryGroups(summary) {
+    return [
+      ['Ciclo e tempi', 0, 7], ['Impostazioni di regolazione', 7, 10],
+      ['Temperature delle sonde', 10, 15], ['Precisione della media rispetto al target', 15, 18],
+      ['Comando PID', 18, 20], ['Qualità delle letture', 20, 22]
+    ].map(([title,start,end])=>({title,pairs:summary.slice(start,end)}));
+  }
+  function phaseCurve(report, points, index) {
+    const step=report.steps[index];
+    const before=report.steps.slice(0,index).reduce((n,s)=>n+(Number(s.activeMs)||0)+(Number(s.pausedMs)||0),0);
+    const startMs=(report.startUptimeMs+before)>>>0;
+    const durationMs=(Number(step.activeMs)||0)+(Number(step.pausedMs)||0);
+    return {startMs,durationMs,points:step.started ? points.filter(p=>elapsed(p.ms,startMs)<=durationMs &&
+      (!Number.isInteger(p.step)||p.step===255||p.step===index)) : []};
+  }
   function pdf({report:r, points, summary, stepRows, explanation, curveMessage}) {
     if (!globalThis.jspdf?.jsPDF) throw Error('Generatore PDF non disponibile: ricarica la pagina.');
     const doc=new globalThis.jspdf.jsPDF({unit:'mm',format:'a4',compress:true});
     doc.setProperties({title:`Report ciclo - ${r.recipeName}`,subject:r.key,creator:'OvenController Full'});
     const color=(hex,stroke=false)=>{const v=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16));doc[stroke?'setDrawColor':'setTextColor'](...v);};
+    const tones={white:'#ffffff',blue:'#edf5ff',mint:'#edf9f3',slate:'#f0f4f9',green:'#e9f7ee',amber:'#fff5df',red:'#fff0f0'};
     let y=0;
     const text=(value,x,at,size=10,bold=false)=>{doc.setFont('helvetica',bold?'bold':'normal');doc.setFontSize(size);color(palette.ink);doc.text(Array.isArray(value)?value.map(pdfText):pdfText(value),x,at);};
     const lines=(value,width,size=10,bold=false)=>{doc.setFont('helvetica',bold?'bold':'normal');doc.setFontSize(size);return doc.splitTextToSize(pdfText(value),width);};
+    const fill=hex=>doc.setFillColor(...[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16)));
     function header(title,first=false) {
       if(!first)doc.addPage();
-      doc.setFillColor(32,52,66);doc.rect(0,0,210,3,'F');
+      fill('#f4f7fa');doc.rect(0,0,210,297,'F');
+      fill('#ffffff');doc.rect(0,0,210,43,'F');
+      fill('#387ba8');doc.rect(0,0,210,1.4,'F');
       text('OVEN CONTROLLER / REPORT DI CICLO',16,15,8,true);
       const titleLines=lines(title,178,first?21:17,true);text(titleLines,16,28,first?21:17,true);
       y=31+titleLines.length*(first?7:6);
       color(palette.grid,true);doc.line(16,y,194,y);y+=9;
     }
-    const ensure=h=>{if(y+h>275)header('Dettaglio degli step');};
-    const pair=(label,value,x,width=83)=>{
-      const labelLines=lines(label,width,8), valueLines=lines(value,width,10,true);
-      text(labelLines,x,y,8);text(valueLines,x,y+labelLines.length*3.2+2,10,true);
-      return labelLines.length*3.2+valueLines.length*4+7;
-    };
-    header(r.recipeName,true);
-    const outcomes={completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
-    text(outcomes[r.outcome]||r.outcome,16,y,11,true);y+=7;
-    const reason=lines(r.reason,178,9);text(reason,16,y,9);y+=reason.length*4+7;
-    for(const indices of [[1,2],[3,6],[7,8]]) {
-      const height=Math.max(...indices.map((index,i)=>pair(...summary[index],16+i*92)));y+=height;
+    const pairHeight=([label,value])=>lines(label,77,8).length*3.2+lines(value,77,10,true).length*4+4;
+    function pairsHeight(pairs) {
+      let height=0;
+      for(let i=0;i<pairs.length;i+=2)height+=Math.max(pairHeight(pairs[i]),pairs[i+1]?pairHeight(pairs[i+1]):0);
+      return height;
     }
-    text('SETPOINT E MEDIA DELLE PT100',16,y,11,true);y+=5;
-    const plotY=y, scale=178/1200;
-    paintChart({
-      line:(a,b,c,d,hex,w)=>{color(hex,true);doc.setLineWidth(w*scale);doc.line(16+a*scale,plotY+b*scale,16+c*scale,plotY+d*scale);},
-      dot:(a,b,hex,rad)=>{const rgb=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16));doc.setFillColor(...rgb);doc.circle(16+a*scale,plotY+b*scale,rad*scale,'F');},
-      text:(a,b,t,hex,size,align)=>{doc.setFont('helvetica','normal');doc.setFontSize(Math.max(8,size*scale*2.83465));color(hex);doc.text(pdfText(t),16+a*scale,plotY+b*scale,{align:align==='right'?'right':align==='center'?'center':'left'});}
-    },points,{startMs:r.startUptimeMs,durationMs:r.durationMs,intervalMs:r.curveIntervalMs});
-    y+=500*scale+7;
-    const curveLines=lines(curveMessage,178,9);text(curveLines,16,y,9);
+    function drawPairs(pairs) {
+      for(let i=0;i<pairs.length;i+=2) {
+        const height=Math.max(pairHeight(pairs[i]),pairs[i+1]?pairHeight(pairs[i+1]):0);
+        for(let col=0;col<2&&pairs[i+col];col++) {
+          const [label,value]=pairs[i+col], x=22+col*89, labels=lines(label,77,8);
+          text(labels,x,y,8);text(lines(value,77,10,true),x,y+labels.length*3.2+2,10,true);
+        }
+        y+=height;
+      }
+    }
+    function panel(title,height,tone,paint) {
+      if(y+height>275)header('Riepilogo / continua');
+      const top=y;
+      fill(tones[tone]||tones.white);color('#d7e2eb',true);doc.setLineWidth(.2);
+      doc.roundedRect(16,top-4,178,height+2,2.5,2.5,'FD');
+      fill('#387ba8');doc.roundedRect(20,top+.5,.9,4,0.4,0.4,'F');
+      text(title.toUpperCase(),24,top+4,9,true);
+      y=top+12;paint();y=top+height+4;
+    }
+    const pairsPanel=(title,pairs,tone='white')=>panel(title,16+pairsHeight(pairs),tone,()=>drawPairs(pairs));
+    function drawPlot(curve,options) {
+      const plotY=y, scale=166/1200;
+      paintChart({
+        line:(a,b,c,d,hex,w)=>{color(hex,true);doc.setLineWidth(w*scale);doc.line(22+a*scale,plotY+b*scale,22+c*scale,plotY+d*scale);},
+        dot:(a,b,hex,rad)=>{fill(hex);doc.circle(22+a*scale,plotY+b*scale,rad*scale,'F');},
+        text:(a,b,t,hex,size,align)=>{doc.setFont('helvetica','normal');doc.setFontSize(Math.max(8,size*scale*2.83465));color(hex);doc.text(pdfText(t),22+a*scale,plotY+b*scale,{align:align==='right'?'right':align==='center'?'center':'left'});}
+      },curve,options);
+      y+=500*scale+2;
+    }
+    function plotPanel(title,curve,options,note='') {
+      const noteLines=note?lines(note,166,8):[];
+      panel(title,16+500*166/1200+(noteLines.length?3+noteLines.length*3.2:0),'white',()=>{
+        drawPlot(curve,options);if(noteLines.length)text(noteLines,22,y+2,8);
+      });
+    }
+    const outcomes={completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
+    const outcomeTone=r.outcome==='completed'?'green':r.outcome==='fault'?'red':'amber';
+    header(r.recipeName,true);
+    const reason=lines(r.reason,166,9);
+    panel(outcomes[r.outcome]||r.outcome,16+reason.length*4,outcomeTone,()=>text(reason,22,y,9));
+    pairsPanel('Il ciclo in sintesi',[summary[1],summary[2],summary[3],summary[6],summary[7],summary[8]],'blue');
+    plotPanel('Andamento completo / target e media PT100',points,{startMs:r.startUptimeMs,durationMs:r.durationMs,intervalMs:r.curveIntervalMs},curveMessage);
 
     header('Riepilogo completo');
-    for(let i=0;i<summary.length;i+=2) {
-      const height=Math.max(pair(...summary[i],16),summary[i+1]?pair(...summary[i+1],108):0);
-      y+=height;
-    }
-    const notes=lines(explanation,178,8);
-    if(y+notes.length*3.4+12>275)header('Note di lettura');
-    text('COME LEGGERE I DATI',16,y,9,true);y+=6;text(notes,16,y,8);
-    header('Dettaglio degli step');
-    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
-    for(const row of stepRows) {
-      const title=lines(`${row[0]} / Target ${row[1]} / ${row[2]}`,178,11,true);
+    for(const [index,group] of summaryGroups(summary).entries())
+      pairsPanel(group.title,group.pairs,['blue','slate','mint','blue','slate','mint'][index]);
+    const notes=lines(explanation,166,8);
+    panel('Come leggere i dati',16+notes.length*3.4,'white',()=>text(notes,22,y,8));
+    const labels=['Tempo attivo','Pause','Mantenimento in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in mantenimento'];
+    for(const [index,row] of stepRows.entries()) {
+      const phase=phaseCurve(r,points,index), step=r.steps[index];
+      header(`Fase ${index+1} / ${row[0].replace(/^\d+\s*·\s*/,'')} / Target ${row[1]}`);
+      text(row[2],17,y,9,true);y+=8;
       const pairs=labels.map((label,i)=>[label,row[i+3]]);
-      const heights=[];
-      for(let i=0;i<pairs.length;i+=2) heights.push(Math.max(...pairs.slice(i,i+2).map(([a,b])=>lines(a,83,8).length*3.2+lines(b,83,10,true).length*4+7)));
-      ensure(title.length*4.5+heights.reduce((a,b)=>a+b,0)+7);
-      text(title,16,y,11,true);y+=title.length*4.5+4;
-      for(let i=0;i<pairs.length;i+=2) {pair(...pairs[i],16);if(pairs[i+1])pair(...pairs[i+1],108);y+=heights[i/2];}
-      color(palette.grid,true);doc.line(16,y-3,194,y-3);y+=4;
+      pairsPanel('Tempi della fase',pairs.slice(0,3),'blue');
+      const plotNote=!phase.points.length?(step.started?'Curva della fase non disponibile nello storico conservato.':'Fase non iniziata: nessun dato termico.'):'';
+      plotPanel('Grafico della fase / target e media',phase.points,{startMs:phase.startMs,durationMs:phase.durationMs,intervalMs:r.curveIntervalMs},plotNote);
+      pairsPanel('Precisione e comando / fase attiva',pairs.slice(3,7),'slate');
+      const temperaturePairs=(step.stats?.sensors||[]).map((sensor,i)=>[`PT100 #${i+1} / minimo - massimo`,
+        Number.isFinite(sensor.minC)&&Number.isFinite(sensor.maxC)?`${sensor.minC.toFixed(2)} - ${sensor.maxC.toFixed(2)} °C`:'Non disponibile']);
+      if(step.type==='hold')temperaturePairs.push(pairs[7]);
+      pairsPanel('Temperature / fase e sue pause',temperaturePairs,'mint');
+      if(r.curvePartial)text('Storico parziale: alcuni campioni della fase potrebbero non essere disponibili.',17,Math.min(y+1,275),8);
     }
     const pages=doc.getNumberOfPages();
     for(let i=1;i<=pages;i++) {doc.setPage(i);color(palette.grid,true);doc.line(16,281,194,281);
       text(`Ciclo ${r.key} | ${r.firmware}`,16,287,8);text(`${i} / ${pages}`,181,287,8);}
     return doc.output('arraybuffer');
   }
-  return {csv,svg,png,zip,pdf,chartModel,paintChart,elapsed};
+  return {csv,svg,png,zip,pdf,chartModel,paintChart,elapsed,summaryGroups,phaseCurve};
 })();
 if(typeof module!=='undefined')module.exports=OvenExport;

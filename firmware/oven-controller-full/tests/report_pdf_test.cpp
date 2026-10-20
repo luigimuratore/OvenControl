@@ -5,6 +5,13 @@
 #include "../src/report_pdf.h"
 
 int main(int argc, char **argv) {
+  // A transition timestamp belongs only to its recorded phase. Legacy points
+  // without a phase ID still use the time window, including across millis wrap.
+  assert(reportpdf::inChart({100, 50, 50, 0}, 0, 100, 0));
+  assert(!reportpdf::inChart({100, 50, 50, 1}, 0, 100, 0));
+  assert(reportpdf::inChart({100, 50, 50}, 0, 100, 0));
+  assert(reportpdf::inChart({100, 50, 50, 1}, UINT32_MAX - 99, 200, 1));
+  assert(!reportpdf::inChart({101, 50, 50, 1}, UINT32_MAX - 99, 200, 1));
   reports::Snapshot report;
   report.boot = 3; report.startMs = 0xffff0000; report.endMs = report.startMs + 43200000;
   report.startUtc = 1791543600; report.endUtc = report.startUtc + 43200;
@@ -27,9 +34,9 @@ int main(int argc, char **argv) {
   }
   std::vector<char> buffer(reportpdf::kCapacity);
   const size_t size = reportpdf::generate(buffer.data(), buffer.size(), report, curve.data(), curve.size(), true);
-  assert(size > 200000 && size < buffer.size());
+  assert(size > 50000 && size < buffer.size());
   const std::string pdf(buffer.data(), size);
-  assert(pdf.find("/Count 6 /Kids") != std::string::npos);
+  assert(pdf.find("/Count 14 /Kids") != std::string::npos);
   assert(pdf.find("CICLO IN ALLARME") != std::string::npos);
   assert(pdf.find("Superamento massimo media") != std::string::npos);
   assert(pdf.find("Superamento massimo sonda") == std::string::npos);

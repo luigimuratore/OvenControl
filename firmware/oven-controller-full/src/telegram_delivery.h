@@ -35,16 +35,16 @@ BodyRead readDocumentBody(char *buffer, size_t capacity, Read read, Complete com
 
 // Accessed only by the producer (Arduino loop), never by the network worker.
 class RecentReportCycles {
-  struct Key { uint32_t boot = 0, start = 0; bool used = false; };
+  struct Key { uint32_t boot = 0, start = 0, end = 0; bool used = false; };
   Key keys[16]{};
   size_t next = 0;
 public:
-  bool contains(uint32_t boot, uint32_t start) const {
-    for (const auto &key : keys) if (key.used && key.boot == boot && key.start == start) return true;
+  bool contains(uint32_t boot, uint32_t start, uint32_t end = 0) const {
+    for (const auto &key : keys) if (key.used && key.boot == boot && key.start == start && key.end == end) return true;
     return false;
   }
-  void remember(uint32_t boot, uint32_t start) {
-    keys[next].boot = boot; keys[next].start = start; keys[next].used = true;
+  void remember(uint32_t boot, uint32_t start, uint32_t end = 0) {
+    keys[next].boot = boot; keys[next].start = start; keys[next].end = end; keys[next].used = true;
     next = (next + 1) % 16;
   }
 };

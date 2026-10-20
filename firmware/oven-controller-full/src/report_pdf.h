@@ -10,7 +10,17 @@
 // no GPIO, sensor, Preferences or shared history access occurs while rendering.
 namespace reportpdf {
 constexpr size_t kCapacity = 768 * 1024;
-struct Point { uint32_t ms; float mean, target; };
+struct Point {
+  uint32_t ms; float mean, target; uint8_t step, flags;
+  Point(uint32_t at = 0, float actual = NAN, float reference = NAN, uint8_t phase = 255, uint8_t markers = 0)
+    : ms(at), mean(actual), target(reference), step(phase), flags(markers) {}
+};
+struct StepRange { uint32_t start, duration; };
+inline StepRange stepRange(const reports::Snapshot &r, unsigned index) {
+  uint32_t start = r.startMs;
+  for (unsigned i = 0; i < index; ++i) start += r.steps[i].activeMs + r.steps[i].pausedMs;
+  return {start, r.steps[index].activeMs + r.steps[index].pausedMs};
+}
 inline const char *outcome(reports::Outcome value) {
   return value == reports::Outcome::Completed ? "CICLO COMPLETATO" :
          value == reports::Outcome::Fault ? "CICLO IN ALLARME" : "CICLO FERMATO";
@@ -53,7 +63,7 @@ inline void filename(const reports::Snapshot &r, char *out, size_t size) {
 class Writer {
   char *buffer; size_t capacity, used = 0;
   bool good = true;
-  size_t offsets[32]{};
+  size_t offsets[64]{};
   unsigned pages = 0, streamId = 0;
   size_t lengthAt = 0, contentAt = 0;
   void append(const char *data, size_t n) {
@@ -66,7 +76,7 @@ class Writer {
     if (n < 0 || size_t(n) >= sizeof(line)) { good = false; return; }
     append(line, n);
   }
-  void object(unsigned id) { offsets[id] = used; put("%u 0 obj\n", id); }
+  void object(unsigned id) { if (id >= 64) { good = false; return; } offsets[id] = used; put("%u 0 obj\n", id); }
   // PDF Helvetica /WinAnsiEncoding, including Italian Latin-1 accents.
   static size_t latin(const char *input, char *out, size_t size) {
     size_t n = 0;
@@ -131,10 +141,20 @@ public:
   void line(float x1, float y1, float x2, float y2, const char *color = "0.86 0.90 0.92", float width = 0.6f) {
     put("%s RG %.1f w %.1f %.1f m %.1f %.1f l S\n", color, width, x1, 842 - y1, x2, 842 - y2);
   }
+  void panel(float x, float y, float width, float height, const char *fill = "1 1 1") {
+    const float top = 842-y, bottom = top-height, right = x+width, radius = 7, bend = 3.87f;
+    put("q %s rg 0.85 0.89 0.93 RG 0.5 w\n", fill);
+    put("%.1f %.1f m %.1f %.1f l %.1f %.1f %.1f %.1f %.1f %.1f c\n", x+radius,top,right-radius,top,right-radius+bend,top,right,top-radius+bend,right,top-radius);
+    put("%.1f %.1f l %.1f %.1f %.1f %.1f %.1f %.1f c\n", right,bottom+radius,right,bottom+radius-bend,right-radius+bend,bottom,right-radius,bottom);
+    put("%.1f %.1f l %.1f %.1f %.1f %.1f %.1f %.1f c\n", x+radius,bottom,x+radius-bend,bottom,x,bottom+radius-bend,x,bottom+radius);
+    put("%.1f %.1f l %.1f %.1f %.1f %.1f %.1f %.1f c h B Q\n", x,top-radius,x,top-radius+bend,x+radius-bend,top,x+radius,top);
+  }
   void page(const char *title, const reports::Snapshot &r, unsigned total) {
     if (pages) endPage();
     streamId = 5 + pages * 2; ++pages;
     object(streamId); put("<< /Length "); lengthAt = used; put("0000000000 >>\nstream\n"); contentAt = used;
+    put("0.957 0.969 0.980 rg 0 0 595 842 re f\n1 1 1 rg 0 732 595 110 re f\n");
+    line(0,2,595,2,"0.22 0.48 0.66",4);
     text(44, 38, "OVEN CONTROLLER / REPORT DI CICLO", 9, true);
     wrap(44, 76, title, 48, 18, false);
     line(44, 109, 551, 109);
@@ -184,9 +204,9 @@ inline void statsPairs(Writer &w, const reports::Stats &s, float y, bool meanOve
     w.pair(44 + i * 264, y, a, b);
   }
   y += 43; value(s.maxDelta, a, sizeof(a)); w.pair(44, y, "Differenza massima sonde", a);
-  snprintf(a, sizeof(a), "%u / %u", unsigned(s.samples), unsigned(s.invalidPairs));
-  w.pair(308, y, "Campioni / coppie non valide", a);
-  y += 43;
+  snprintf(a, sizeof(a), "%u campioni / coppie non valide: %u", unsigned(s.samples), unsigned(s.invalidPairs));
+  w.pair(308, y, "Qualità delle letture", a);
+  y += 69;
   value(s.trackingSamples ? s.absoluteErrorSum / s.trackingSamples : NAN, a, sizeof(a));
   w.pair(44, y, "Errore medio assoluto", a);
   value(s.trackingSamples ? s.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y, meanOvershoot ? "Superamento massimo media" : "Superamento massimo sonda", a);
@@ -196,88 +216,134 @@ inline void statsPairs(Writer &w, const reports::Stats &s, float y, bool meanOve
   y += 43; value(s.trackingSamples ? 100.0f * s.saturatedSamples / s.trackingSamples : NAN, a, sizeof(a), "%");
   w.pair(44, y, "Campioni al limite comando", a);
 }
+inline bool inChart(const Point &point, uint32_t start, uint32_t durationMs, int phase = -1) {
+  return uint32_t(point.ms - start) <= durationMs &&
+    (phase < 0 || point.step == 255 || point.step == phase);
+}
+inline void chart(Writer &w, const Point *points, size_t count, uint32_t start, uint32_t durationMs,
+                  float top, float bottom, bool enabled, char *a, size_t size, void (*yield)(), int phase = -1) {
+  const float left = 79, right = 543;
+  float lo = INFINITY, hi = -INFINITY;
+  size_t selected = 0, lastIndex = 0;
+  for (size_t i = 0; enabled && i < count; ++i) if (inChart(points[i], start, durationMs, phase)) {
+    ++selected; lastIndex = i;
+    for (float v : {points[i].mean, points[i].target}) if (std::isfinite(v)) { lo = fminf(lo, v); hi = fmaxf(hi, v); }
+  }
+  if (!std::isfinite(lo)) { lo = 0; hi = 1; }
+  lo = floorf(lo - 1); hi = ceilf(hi + 1);
+  const float span = fmaxf(1000, durationMs);
+  w.line(308, top - 22, 328, top - 22, "0.29 0.64 1", 2); w.text(334, top - 18, "Target", 9);
+  w.line(427, top - 22, 447, top - 22, "0.21 0.66 0.51", 2); w.text(454, top - 18, "Media PT100", 9);
+  for (unsigned tick = 0; tick <= 5; ++tick) {
+    const float yy = bottom - (bottom - top) * tick / 5;
+    w.line(left, yy, right, yy); snprintf(a, size, "%.1f", double(lo + (hi - lo) * tick / 5)); w.text(44, yy + 3, a, 8);
+    const float xx = left + (right - left) * tick / 5;
+    w.line(xx, top, xx, bottom); snprintf(a, size, "%.1f", double(span * tick / 300000)); w.text(xx - 8, bottom + 19, a, 8);
+  }
+  w.text(44, top - 17, "°C", 9); w.text(233, bottom + 42, "Tempo dall'inizio (min)", 9);
+  const size_t stride = (selected + 799) / 800; // Bound vector size; keep gaps and endpoints.
+  for (unsigned series = 0; series < 2; ++series) {
+    bool previous = false, seen = false; float px = 0, py = 0; uint32_t last = 0; size_t ordinal = 0;
+    for (size_t i = 0; enabled && i < count; ++i) {
+      const uint32_t elapsed = uint32_t(points[i].ms - start);
+      if (!inChart(points[i], start, durationMs, phase)) continue;
+      const float v = series ? points[i].mean : points[i].target;
+      if (!std::isfinite(v)) { previous = seen = false; ++ordinal; continue; }
+      if ((seen && uint32_t(points[i].ms - last) > 25000) || (!series && (points[i].flags & 16))) previous = false;
+      last = points[i].ms; seen = true;
+      if (ordinal++ % (stride ? stride : 1) && i != lastIndex) continue;
+      const float x = left + elapsed / span * (right - left), y = bottom - (v - lo) / (hi - lo) * (bottom - top);
+      const char *color = series ? "0.21 0.66 0.51" : "0.29 0.64 1";
+      if (previous) w.line(px, py, x, y, color, 1.1f);
+      else w.line(x - .5f, y, x + .5f, y, color, 1.4f);
+      previous = true; px = x; py = y;
+      if (yield && !(i % 64)) yield();
+    }
+  }
+  if (!selected) w.text(183, (top + bottom) / 2, enabled ? "Curva di questa fase non disponibile" : "Fase non iniziata: nessuna curva", 11);
+}
 inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r,
                        const Point *points, size_t count, bool partial, void (*yield)() = nullptr) {
   if (!buffer || capacity < 1024 || r.stepCount > reports::kMaxSteps || (count && !points)) return 0;
-  Writer w(buffer, capacity); char a[512], b[100]; const unsigned pages = 2 + (r.stepCount + 2) / 3;
+  Writer w(buffer, capacity); char a[512], b[100]; const unsigned pages = 2 + r.stepCount;
   w.page(r.recipeName, r, pages);
-  w.text(44, 135, outcome(r.outcome), 12, true);
-  w.wrap(44, 158, r.reason, 96, 9);
-  date(r.startUtc, a, sizeof(a)); w.pair(44, 205, "Inizio", a);
-  date(r.endUtc, a, sizeof(a)); w.pair(308, 205, "Fine", a);
-  duration(r.activeMs + r.pausedMs, a, sizeof(a)); w.pair(44, 248, "Tempo ciclo totale", a);
-  snprintf(a, sizeof(a), "%u / %u", r.completedSteps, r.stepCount); w.pair(308, 248, "Step completati", a);
-  w.text(44, 310, "SETPOINT E MEDIA DELLE PT100", 11, true);
-  const float left = 79, right = 543, top = 353, bottom = 609;
-  w.line(330, 328, 350, 328, "0.29 0.64 1", 2); w.text(357, 332, "Setpoint", 9);
-  w.line(427, 328, 447, 328, "0.21 0.66 0.51", 2); w.text(454, 332, "Media PT100", 9);
-  float lo = INFINITY, hi = -INFINITY;
-  for (size_t i = 0; i < count; ++i) for (float v : {points[i].mean, points[i].target})
-    if (std::isfinite(v)) { lo = fminf(lo, v); hi = fmaxf(hi, v); }
-  if (!std::isfinite(lo)) { lo = 0; hi = 1; }
-  lo = floorf(lo - 1); hi = ceilf(hi + 1);
-  const float span = fmaxf(1000, uint32_t(r.endMs - r.startMs));
-  for (unsigned tick = 0; tick <= 5; ++tick) {
-    const float yy = bottom - (bottom - top) * tick / 5;
-    w.line(left, yy, right, yy); snprintf(a, sizeof(a), "%.1f", double(lo + (hi - lo) * tick / 5)); w.text(44, yy + 3, a, 8);
-    const float xx = left + (right - left) * tick / 5;
-    w.line(xx, top, xx, bottom); snprintf(a, sizeof(a), "%.1f", double(span * tick / 300000)); w.text(xx - 8, bottom + 19, a, 8);
-  }
-  w.text(44, 340, "°C", 9); w.text(243, 651, "Tempo dall'inizio (min)", 9);
-  for (unsigned series = 0; series < 2; ++series) {
-    bool previous = false; float px = 0, py = 0; uint32_t last = 0;
-    for (size_t i = 0; i < count; ++i) {
-      const float v = series ? points[i].mean : points[i].target;
-      const uint32_t elapsed = uint32_t(points[i].ms - r.startMs);
-      if (!std::isfinite(v) || elapsed > uint32_t(r.endMs - r.startMs)) { previous = false; continue; }
-      const float x = left + elapsed / span * (right - left), y = bottom - (v - lo) / (hi - lo) * (bottom - top);
-      const char *color = series ? "0.21 0.66 0.51" : "0.29 0.64 1";
-      if (previous && uint32_t(points[i].ms - last) <= 25000) w.line(px, py, x, y, color, 1.1f);
-      else w.line(x - 0.5f, y, x + 0.5f, y, color, 1.4f);
-      previous = true; px = x; py = y; last = points[i].ms;
-      if (yield && !(i % 128)) yield();
-    }
-  }
-  if (!count) w.text(218, 475, "Curva non disponibile", 12);
-  snprintf(a, sizeof(a), "%u campioni. %s", unsigned(count), partial ? "Curva parziale: alcuni campioni non disponibili." : "Curva acquisita durante il ciclo e le pause.");
+  const char *resultFill = r.outcome == reports::Outcome::Completed ? "0.925 0.976 0.949" :
+    r.outcome == reports::Outcome::Fault ? "1 0.937 0.937" : "1 0.969 0.886";
+  w.panel(34, 121, 527, 65, resultFill);
+  w.panel(34, 194, 527, 89, "0.925 0.957 0.992");
+  w.panel(34, 296, 527, 417);
+  w.panel(34, 721, 527, 61, "0.941 0.953 0.969");
+  w.text(44, 141, outcome(r.outcome), 12, true);
+  w.wrap(44, 162, r.reason, 96, 9);
+  date(r.startUtc, a, sizeof(a)); w.pair(44, 205, "Inizio / ora italiana", a);
+  date(r.endUtc, a, sizeof(a)); w.pair(308, 205, "Fine / ora italiana", a);
+  duration(uint32_t(r.endMs - r.startMs), a, sizeof(a)); w.pair(44, 248, "Durata totale, incluse pause", a);
+  snprintf(a, sizeof(a), "%u / %u", r.completedSteps, r.stepCount); w.pair(308, 248, "Fasi completate", a);
+  w.text(44, 310, "ANDAMENTO COMPLETO DEL CICLO", 11, true);
+  chart(w, points, count, r.startMs, uint32_t(r.endMs - r.startMs), 353, 609, true, a, sizeof(a), yield);
+  snprintf(a, sizeof(a), "%u campioni. %s", unsigned(count), partial ? "Curva parziale: alcuni campioni non disponibili." : "Curva acquisita durante ciclo e pause.");
   w.wrap(44, 684, a, 96, 9);
-  w.page("Riepilogo completo", r, pages);
-  duration(r.activeMs, a, sizeof(a)); w.pair(44, 135, "Tempo attivo", a);
-  duration(r.pausedMs, b, sizeof(b)); snprintf(a, sizeof(a), "%u / %s", unsigned(r.pauseCount), b); w.pair(308, 135, "Pause / durata", a);
-  snprintf(a, sizeof(a), "Kp %.3f / Ki %.4f / Kd %.2f", double(r.kp), double(r.ki), double(r.kd)); w.pair(44, 178, "PID usato", a);
-  snprintf(a, sizeof(a), "%s / %u s / limite %.1f%%", r.ssr ? "SSR" : "Relè", unsigned(r.windowMs / 1000), double(r.maxPower)); w.pair(308, 178, "Comando usato", a);
-  statsPairs(w, r.stats, 230, r.version >= 3);
-  w.text(44, 531, "COME LEGGERE I DATI", 10, true);
-  w.wrap(44, 554, r.version >= 3 ?
-    "Temperature: campioni del ciclo e delle pause. Errore e PID: soli campioni validi di rampa e mantenimento attivi, escluse pause e cooldown. Superamento, ritardo ed errore medio: media delle due PT100 rispetto al target istantaneo." :
-    "Temperature: campioni del ciclo e delle pause. Errore e PID: soli campioni validi di rampa e mantenimento attivi, escluse pause e cooldown. Superamento: sonda più calda rispetto al target istantaneo. Ritardo ed errore medio: media delle due sonde.", 96, 9);
-  snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C, con letture fresche consecutive. Il comando GPIO/PID non misura la potenza elettrica. La curva può avere interruzioni per letture non valide.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
-  w.wrap(44, 624, a, 96, 9);
-  w.wrap(44, 694, "Escursione durante il mantenimento: massimo - minimo di ciascuna sonda, incluse le pause. Gli orari e il nome file usano il fuso italiano; in assenza di NTP l'orario resta non disponibile.", 96, 9);
+  w.wrap(44, 741, "Le pagine seguenti separano tempi, regolazione, temperature e precisione. Ogni fase ha una pagina con il proprio grafico e scala adattata ai suoi dati.", 96, 9);
+  w.page("Riepilogo / dati del ciclo", r, pages);
+  w.panel(34, 125, 527, 113, "0.925 0.957 0.992");
+  w.panel(34, 247, 527, 147, "0.925 0.976 0.957");
+  w.panel(34, 402, 527, 149, "0.941 0.953 0.984");
+  w.panel(34, 560, 527, 180);
+  w.text(44, 143, "TEMPI E REGOLAZIONE", 11, true);
+  duration(r.activeMs, a, sizeof(a)); w.pair(44, 161, "Tempo attivo", a);
+  duration(r.pausedMs, b, sizeof(b)); snprintf(a, sizeof(a), "%u / %s", unsigned(r.pauseCount), b); w.pair(308, 161, "Pause / durata", a);
+  snprintf(a, sizeof(a), "Kp %.3f / Ki %.4f / Kd %.2f", double(r.kp), double(r.ki), double(r.kd)); w.pair(44, 204, "PID usato", a);
+  snprintf(a, sizeof(a), "%s / %u s / limite %.1f%%", r.ssr ? "SSR" : "Relè", unsigned(r.windowMs / 1000), double(r.maxPower)); w.pair(308, 204, "Attuatore / finestra / limite", a);
+  w.text(44, 265, "TEMPERATURE / PT100", 11, true);
+  statsPairs(w, r.stats, 282, r.version >= 3);
+  w.text(44, 420, "PRECISIONE DELLA MEDIA E COMANDO PID", 10, true);
+  w.text(44, 580, "COME LEGGERE I DATI", 10, true);
+  w.wrap(44, 604, r.version >= 3 ?
+    "Errore medio: distanza media dal target. Superamento: massimo della media PT100 sopra il target. Ritardo: massimo della media sotto il target. Questi indici e il PID medio usano solo rampa e mantenimento attivi, escluse pause e cooldown." :
+    "Report precedente: il superamento usa la sonda più calda. Errore e ritardo usano la media. Gli indici e il comando medio escludono pause e cooldown.", 96, 9);
+  snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C. Temperature e differenza sonde comprendono le pause. Campioni non validi interrompono la curva; il comando non misura potenza o energia elettrica.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
+  w.wrap(44, 680, a, 96, 9);
   for (unsigned i = 0; i < r.stepCount; ++i) {
-    if (!(i % 3)) w.page("Dettaglio degli step", r, pages);
-    const auto &s = r.steps[i]; const float y = 140 + (i % 3) * 213;
+    const auto &s = r.steps[i]; const auto range = stepRange(r, i);
     const char *kind = s.requested.type == profile::Type::Ramp ? "Rampa" : s.requested.type == profile::Type::Hold ? "Mantenimento" : "Cooldown";
-    snprintf(a, sizeof(a), "%u / %s / Target %.1f °C", i + 1, kind, double(s.requested.target)); w.text(44, y, a, 11, true);
-    const char *state = s.completed ? "Completato" : s.started ? "Interrotto" : "Non iniziato";
-    if (s.requested.type == profile::Type::Hold) snprintf(a, sizeof(a), "%s / richiesto %u min", state, unsigned(s.requested.minutes));
+    snprintf(a, sizeof(a), "Fase %u / %s / %.1f °C", i + 1, kind, double(s.requested.target)); w.page(a, r, pages);
+    const char *state = s.completed ? "Completata" : s.started ? "Interrotta" : "Non iniziata";
+    if (s.requested.type == profile::Type::Hold) snprintf(a, sizeof(a), "%s / richiesti %u min in banda", state, unsigned(s.requested.minutes));
     else snprintf(a, sizeof(a), "%s / %.2f °C/min", state, double(s.requested.rate));
-    w.text(44, y + 21, a, 9);
-    duration(s.activeMs, a, sizeof(a)); w.pair(44, y + 43, "Tempo attivo", a);
-    duration(s.pausedMs, a, sizeof(a)); w.pair(308, y + 43, "Pause", a);
+    w.panel(34, 124, 527, 114, "0.925 0.957 0.992");
+    w.panel(34, 251, 527, 297);
+    w.panel(34, 552, 527, 113, "0.941 0.953 0.984");
+    w.panel(34, 675, 527, 108, "0.925 0.976 0.957");
+    w.text(44, 143, a, 10, true);
+    duration(s.activeMs, a, sizeof(a)); w.pair(44, 164, "Tempo attivo", a);
+    duration(s.pausedMs, a, sizeof(a)); w.pair(308, 164, "Tempo in pausa", a);
     if (s.requested.type == profile::Type::Hold) {
       duration(s.holdInBandMs, a, sizeof(a)); duration(uint32_t(s.requested.minutes) * 60000, b, sizeof(b));
-      char combined[150]; snprintf(combined, sizeof(combined), "%s / %s", a, b); w.pair(44, y + 81, "Hold in banda / richiesto", combined);
-      if (s.stats.valid[0] && s.stats.valid[1]) snprintf(a, sizeof(a), "%.2f / %.2f °C", double(s.stats.high[0] - s.stats.low[0]), double(s.stats.high[1] - s.stats.low[1]));
-      else snprintf(a, sizeof(a), "Non disponibile");
-      w.pair(308, y + 81, "Escursione PT100 in hold", a);
-    } else { w.pair(44, y + 81, "Hold in banda / richiesto", "Non applicabile"); w.pair(308, y + 81, "Escursione PT100 in hold", "Non applicabile"); }
-    value(s.stats.trackingSamples ? s.stats.absoluteErrorSum / s.stats.trackingSamples : NAN, a, sizeof(a)); w.pair(44, y + 119, "Errore medio assoluto", a);
-    value(s.stats.trackingSamples ? s.stats.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, y + 119, r.version >= 3 ? "Superamento massimo media" : "Superamento massimo sonda", a);
-    value(s.stats.trackingSamples ? s.stats.maxLag : NAN, a, sizeof(a)); w.pair(44, y + 157, "Ritardo massimo", a);
+      char combined[150]; snprintf(combined, sizeof(combined), "%s / %s", a, b); w.pair(44, 207, "Mantenimento in banda / richiesto", combined);
+    } else w.pair(44, 207, "Mantenimento in banda", "Non applicabile");
+    snprintf(a, sizeof(a), "%.1f °C", double(s.requested.target)); w.pair(308, 207, "Target finale della fase", a);
+    w.text(44, 269, "GRAFICO DELLA FASE / TARGET E MEDIA", 11, true);
+    chart(w, points, count, range.start, range.duration, 311, 489, s.started, a, sizeof(a), yield, i);
+    w.text(44, 564, "PRECISIONE E REGOLAZIONE / FASE ATTIVA", 10, true);
+    value(s.stats.trackingSamples ? s.stats.absoluteErrorSum / s.stats.trackingSamples : NAN, a, sizeof(a)); w.pair(44, 590, "Errore medio assoluto", a);
+    value(s.stats.trackingSamples ? s.stats.maxOvershoot : NAN, a, sizeof(a)); w.pair(308, 590, r.version >= 3 ? "Superamento massimo media" : "Superamento massimo sonda", a);
+    value(s.stats.trackingSamples ? s.stats.maxLag : NAN, a, sizeof(a)); w.pair(44, 633, "Ritardo massimo della media", a);
     if (s.stats.trackingSamples) snprintf(a, sizeof(a), "%.2f%% / %.2f%%", s.stats.dutySum / s.stats.trackingSamples, 100.0 * s.stats.saturatedSamples / s.stats.trackingSamples);
     else snprintf(a, sizeof(a), "Non disponibile");
-    w.pair(308, y + 157, "PID medio / al limite", a); w.line(44, y + 189, 551, y + 189);
+    w.pair(308, 633, "PID medio / campioni al limite", a);
+    w.text(44, 686, "TEMPERATURE / FASE E SUE PAUSE", 10, true);
+    for (unsigned j = 0; j < 2; ++j) {
+      snprintf(a, sizeof(a), "PT100 #%u / minimo - massimo", j + 1);
+      if (s.stats.valid[j]) snprintf(b, sizeof(b), "%.2f - %.2f °C", double(s.stats.low[j]), double(s.stats.high[j]));
+      else snprintf(b, sizeof(b), "Non disponibile");
+      w.pair(44 + j * 264, 712, a, b);
+    }
+    if (s.requested.type == profile::Type::Hold) {
+      if (s.stats.valid[0] && s.stats.valid[1]) snprintf(a, sizeof(a), "%.2f / %.2f °C", double(s.stats.high[0]-s.stats.low[0]), double(s.stats.high[1]-s.stats.low[1]));
+      else snprintf(a, sizeof(a), "Non disponibile");
+      w.pair(44, 756, "Escursione in mantenimento / PT100 #1 e #2", a);
+    }
+    if (partial) w.text(44, 791, "Storico parziale: i dati della fase potrebbero non essere tutti disponibili.", 8);
     if (yield) yield();
   }
   return w.finish();

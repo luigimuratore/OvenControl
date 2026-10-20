@@ -24,6 +24,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+import struct
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "include/telegram_config.h"
@@ -39,7 +41,7 @@ MODE_BUTTONS = {"🛡️ Essenziale": "/essenziale", "🔔 Sintetica": "/sinteti
 
 
 def mode_keyboard():
-    return dict(keyboard=[["🛡️ Essenziale", "🔔 Sintetica"], ["📋 Dettagliata", "/status"], ["/modalita"]],
+    return dict(keyboard=[["🛡️ Essenziale", "🔔 Sintetica"], ["📋 Dettagliata", "/status"], ["/plot", "/modalita"]],
                 resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 
@@ -83,7 +85,7 @@ class NotificationSettings:
 
 def discard_routine_events(pending):
     for item in list(pending):
-        if item[3] and item[0] < 2:
+        if item[3] and item[0] < 2 and not any(title in str(item[2]) for title in ("CICLO AVVIATO", "MANUALE AVVIATO", "ESP AVVIATO", "COLLEGAMENTO ATTIVO")):
             pending.remove(item)
 
 
@@ -192,14 +194,22 @@ class TelegramApi:
     def send_document(self, chat, filename, pdf, caption=""):
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}\.pdf", filename) or not pdf.startswith(b"%PDF-") or len(pdf) > 1048576:
             raise ValueError("Allegato PDF non valido o troppo grande.")
+        return self._send_attachment(chat, filename, pdf, caption, "document", "application/pdf", "sendDocument")
+
+    def send_photo(self, chat, filename, png, caption=""):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,120}\.png", filename) or not png.startswith(b"\x89PNG\r\n\x1a\n") or len(png) > 1048576:
+            raise ValueError("Grafico PNG non valido o troppo grande.")
+        return self._send_attachment(chat, filename, png, caption, "photo", "image/png", "sendPhoto")
+
+    def _send_attachment(self, chat, filename, data, caption, field, mime, method):
         boundary = "OvenPdf" + secrets.token_hex(16)
         prefix = (f'--{boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n{chat}\r\n'
                   f'--{boundary}\r\nContent-Disposition: form-data; name="disable_notification"\r\n\r\ntrue\r\n'
                   f'--{boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n{caption[:1024]}\r\n'
-                  f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\n'
-                  'Content-Type: application/pdf\r\n\r\n').encode()
+                  f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+                  f'Content-Type: {mime}\r\n\r\n').encode()
         try:
-            result = self._request("sendDocument", prefix + pdf + f"\r\n--{boundary}--\r\n".encode(),
+            result = self._request(method, prefix + data + f"\r\n--{boundary}--\r\n".encode(),
                                    "multipart/form-data; boundary=" + boundary, timeout=30)
         except TelegramError as error:
             # urllib does not tell us whether a timed-out POST was accepted.
@@ -218,9 +228,12 @@ def deliver_pending(api, chat, pending, item):
     """Consume each PDF on confirmation or uncertain/permanent failure."""
     payload = item[2]
     document = isinstance(payload, dict) and "pdf" in payload
+    photo = isinstance(payload, dict) and "png" in payload
     try:
         if document:
             api.send_document(chat, **payload)
+        elif photo:
+            api.send_photo(chat, **payload)
         elif isinstance(payload, dict):
             api.send(chat, **payload)
         elif isinstance(payload, GuideMessage):
@@ -228,9 +241,11 @@ def deliver_pending(api, chat, pending, item):
         else:
             api.send(chat, payload, critical=item[0] == 2)
     except TelegramError as error:
-        if not document or (error.retryable and not error.delivery_uncertain):
+        if not (document or photo) or (error.retryable and not error.delivery_uncertain):
             raise
         pending.remove(item)
+        if photo:
+            return "⚠️ Invio grafico non confermato. Richiedi una nuova immagine con /plot."
         if error.delivery_uncertain:
             return "⚠️ Conferma PDF Telegram non ricevuta. Per evitare duplicati il report non verrà reinviato automaticamente; se manca in chat, scaricalo dalla dashboard."
         return "⚠️ PDF rifiutato da Telegram. Scarica il report dalla dashboard e verifica la configurazione del bot."
@@ -342,6 +357,101 @@ def report_filename(report, ended_at=None):
     date = datetime.fromtimestamp(ended, timezone.utc) if ended else ended_at or datetime.now(timezone.utc)
     prefix = {"completed": "Completed", "stopped": "Stopped"}.get(report.get("outcome"), "Error")
     return prefix + "_" + name + "_" + date.astimezone(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d_%H-%M-%S") + ".pdf"
+
+
+def plot_png(points):
+    """Exact chart values in a small PNG; standard library only, same font as ESP."""
+    width, height = 960, 480
+    raster = bytearray((width + 1) * height)
+    header = (ROOT / "src/plot_png.h").read_text()
+    font_block = re.search(r'font\[\]\[7\] = \{(.*?)\n    \};', header, re.S)[1]
+    font = [[int(v) for v in row.split(',')] for row in re.findall(r'\{([0-9,]+)\}', font_block)]
+    palette = bytes(int(v) for v in re.search(r'kPalette\[\] = \{([^}]+)\}', header)[1].split(','))
+
+    def dot(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            raster[y * (width + 1) + x + 1] = color
+
+    def line(x, y, xx, yy, color, thick=False):
+        dx, sx, dy, sy = abs(xx-x), 1 if x < xx else -1, -abs(yy-y), 1 if y < yy else -1
+        error = dx + dy
+        while True:
+            dot(x, y, color)
+            if thick:
+                dot(x+1, y, color); dot(x, y+1, color)
+            if x == xx and y == yy:
+                break
+            e = 2 * error
+            if e >= dy:
+                error += dy; x += sx
+            if e <= dx:
+                error += dx; y += sy
+
+    def text(x, y, value, color=1, scale=2):
+        for c in value.upper():
+            index = ord(c)-48 if '0' <= c <= '9' else ord(c)-65+10 if 'A' <= c <= 'Z' else -1
+            for row in range(7):
+                for col in range(5):
+                    on = index >= 0 and bool(font[index][row] & (1 << (4-col)))
+                    if c == '.': on = row == 6 and col == 2
+                    if c == '-': on = row == 3
+                    if c == '/': on = col == 4-row*4//6
+                    if on:
+                        for a in range(scale):
+                            for b in range(scale): dot(x+col*scale+a,y+row*scale+b,color)
+            x += scale*6
+
+    text(30, 22, 'OVENCONTROL / GRAFICO ATTUALE', scale=3)
+    text(30, 62, 'TEMPERATURA C', 2)
+    for x, label, color in ((560,'TARGET',4),(730,'MEDIA PT100',5)):
+        line(x,70,x+32,70,color,True);text(x+46,62,label)
+    values = [p.get(field) for p in points for field in ('actual','target') if isinstance(p.get(field),(int,float)) and math.isfinite(p[field])]
+    low, high = (min(values),max(values)) if values else (0,1)
+    tick = max(1, math.ceil((high-low+2)/7));low = math.floor((low-1)/tick)*tick;high=math.ceil((high+1)/tick)*tick
+    left,right,top,bottom=84,930,110,400
+    for value in range(low,high+1,tick):
+        y=bottom-int((value-low)/(high-low)*(bottom-top));line(left,y,right,y,3);text(12,y-7,str(value),2)
+    start=points[0]['ms'] if points else 0
+    span=max(1000,((points[-1]['ms']-start)&0xffffffff) if points else 1000)
+    for i in range(7):
+        x=left+(right-left)*i//6;line(x,top,x,bottom,3);text(x-20,418,f'{span*i/360000:.1f}',2)
+    text(318,452,'TEMPO VISUALIZZATO / MIN',2)
+    for field,color in (('target',4),('actual',5)):
+        previous=None
+        for p in points:
+            value=p.get(field)
+            if value is None or not math.isfinite(value):
+                previous=None;continue
+            x=left+int(((p['ms']-start)&0xffffffff)/span*(right-left))
+            y=bottom-int((value-low)/(high-low)*(bottom-top))
+            if previous and ((p['ms']-previous[2])&0xffffffff)<=25000 and (field!='target' or not p.get('marker',0)&16):
+                line(previous[0],previous[1],x,y,color,True)
+            else:
+                dot(x,y,color)
+            previous=(x,y,p['ms'])
+    def chunk(kind,data):
+        return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
+    return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,3,0,0,0))+chunk(b'PLTE',palette)+chunk(b'IDAT',zlib.compress(raster))+chunk(b'IEND',b'')
+
+
+def preview_plot(base):
+    status = local_json(base, "status")
+    history = local_json(base, "history?tail=1")
+    if status.get('bootCount') != history.get('bootCount'):
+        raise ValueError('Anteprima riavviata durante la richiesta. Riprova /plot.')
+    now, points = status['uptimeMs'], []
+    for seq,ms,t1,t2,target,duty,flags,step in history.get('samples',[]):
+        if ((now-ms)&0xffffffff)>1800000: continue
+        points.append(dict(ms=ms, actual=(t1+t2)/2 if flags&3==3 else None,
+                           target=target if flags&8 else None,marker=flags&0xf0))
+    sensors = status.get('sensors',[])
+    mean = sum(s['c'] for s in sensors)/2 if len(sensors)==2 and all(s['valid'] for s in sensors) else None
+    current=dict(ms=now,actual=mean,target=status.get('target'))
+    if points and points[-1]['ms']==now: points[-1]=current
+    else: points.append(current)
+    stamp=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S (Italia)')
+    return dict(filename='Plot_anteprima.png',png=plot_png(points),
+                caption=f'📈 TARGET / MEDIA PT100\nAggiornato: {stamp}\nUltimi 30 minuti disponibili. ANTEPRIMA SIMULATA')
 
 
 def preview_pdf(report, points):
@@ -477,7 +587,8 @@ def notice_icon(title, critical=False):
 
 def format_status(status, mode="sintetica"):
     icon, state = status_style(status)
-    lines = [f"Stato: {icon} {state}", "Aggiornato: " + datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")]
+    stamp = datetime.fromtimestamp(status.get("utcSec") or time.time(), timezone.utc).astimezone(ZoneInfo("Europe/Rome"))
+    lines = [f"Stato: {icon} {state}", "Aggiornato: " + stamp.strftime("%d/%m/%Y %H:%M:%S (Italia)")]
     if status.get("emergency"):
         lines += ["", "🚨 EMERGENZA SIMULATA ATTIVA", "Riconoscimento dalla dashboard richiesto."]
     if status.get("fault"):
@@ -531,6 +642,11 @@ def format_status(status, mode="sintetica"):
               f"Finestra: {status.get('windowSec')} s · limite: {status.get('maxPower')}%"]
     pid = status.get("pid", {})
     lines.append(f"PID: Kp {pid.get('kp')} · Ki {pid.get('ki')} · Kd {pid.get('kd')}")
+    protections = status.get('protections')
+    if protections:
+        lines += ['', '🛡 BLOCCHI TERMICI',
+                  f"Delta sonde: {'ON >' if protections['probeDeltaEnabled'] else 'OFF · soglia '}{protections['maxProbeDeltaC']:g} °C",
+                  f"Media − target: {'ON >' if protections['meanOvershootEnabled'] else 'OFF · soglia '}{protections['maxMeanOvershootC']:g} °C"]
     interruption = status.get("lastInterruption", {})
     historical_error = status.get("lastCycleError")
     if (historical_error and historical_error != status.get("fault")) or interruption.get("recorded"):
@@ -559,7 +675,9 @@ def format_status(status, mode="sintetica"):
 
 
 def format_notice(title, reason="", status=None, critical=False, event_utc=None, mode="sintetica"):
-    if mode == "essenziale" and not critical:
+    if title.startswith("AVVISO SONDA") and mode != "dettagliata":
+        return None
+    if mode == "essenziale" and not critical and title not in ("CICLO AVVIATO", "MANUALE AVVIATO", "ESP AVVIATO", "COLLEGAMENTO ATTIVO"):
         return None
     date = datetime.fromtimestamp(event_utc, timezone.utc) if event_utc else datetime.now(timezone.utc)
     stamp = date.astimezone(ZoneInfo("Europe/Rome")).strftime("%d/%m/%Y %H:%M:%S (Italia)")
@@ -610,7 +728,7 @@ class Commands:
                 continue
             text = message.get("text")
             command = MODE_BUTTONS.get(text, text) if isinstance(text, str) else None
-            if command in ("/status", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
+            if command in ("/status", "/plot", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
                 commands.append(command)
         return commands
 
@@ -622,7 +740,7 @@ class PreviewEvents:
 
     def consume(self, logs, status=None):
         result = []
-        mapping = {"start": "CICLO AVVIATO", "stop": "STOP", "pause": "CICLO IN PAUSA",
+        mapping = {"start": "CICLO AVVIATO", "stop": "STOP", "pause": "CICLO IN PAUSA", "resetContinue": "CICLO RIPRESO",
                    "resume": "CICLO RIPRESO", "emergency": "EMERGENZA"}
         latest = max((e["seq"] for e in logs.get("events", [])), default=0)
         if latest < self.last:  # Preview server restarted: ignore its old baseline.
@@ -653,7 +771,7 @@ class PreviewEvents:
                 if action != "stop" or self.phase in ("running", "paused"):
                     result.append((mapping[action], action == "emergency", message, event_utc))
                 self.phase = {"start": "running", "stop": "idle", "pause": "paused",
-                              "resume": "running", "emergency": "fault"}[action]
+                              "resume": "running", "resetContinue": "running", "emergency": "fault"}[action]
             elif event.get("level") == "ALLARME":
                 result.append(("ALLARME", True, message, event_utc))
             elif message == "Ciclo simulato terminato.":
@@ -678,7 +796,8 @@ def preview(api, chat, url):
     pending = deque(maxlen=32)
 
     def enqueue(text, priority=0, event=False):
-        if text is None or (event and priority < 2 and settings.mode == "essenziale"):
+        if text is None or (event and priority < 2 and settings.mode == "essenziale" and not any(
+                title in str(text) for title in ("CICLO AVVIATO", "MANUALE AVVIATO", "ESP AVVIATO", "COLLEGAMENTO ATTIVO"))):
             return
         if len(pending) == pending.maxlen:
             # Preserve queued alarms when dropping a routine preview message.
@@ -732,6 +851,11 @@ def preview(api, chat, url):
                             except ValueError:
                                 text = format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE", "Nessuno stato aggiornato disponibile.")
                             enqueue(text, 1)
+                        elif command == "/plot":
+                            try:
+                                enqueue(preview_plot(base), -1)
+                            except ValueError as error:
+                                enqueue(str(error), 1)
                         elif command == "/start":
                             enqueue(GuideMessage(settings.mode))
                         elif command == "/help":

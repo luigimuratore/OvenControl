@@ -6,6 +6,7 @@ const types = { ramp: "Ramp", hold: "Hold", cooldown: "Cooldown" };
 const markerNames = { 16: "INIZIO CICLO", 32: "STOP", 64: "FINE CICLO", 128: "ALLARME" };
 let recipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
 let pidLoaded = false;
+let protectionsLoaded = false;
 let manualTargetDirty = false;
 let selectedView = 'Dashboard';
 let settingsLoaded = false, recipesLoaded = false, recipesDirty = false, commandBusy = false, commandGeneration = 0, exportBusy = false;
@@ -147,6 +148,9 @@ function createChartInspector(canvas, tooltip, cursor) {
     const readings = plot.series.filter(s => Number.isFinite(point[s.key]));
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
+    const probeDelta = Number.isFinite(point.t1) && Number.isFinite(point.t2)
+      ? `${temp(Math.abs(point.t1 - point.t2))} °C` : '—';
+    tooltip.textContent += `\nΔT sonde: ${probeDelta}`;
     if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
       const difference = point.actual - point.target;
       const highlight = document.createElement('div');
@@ -184,7 +188,7 @@ function display(s) {
   if (boot !== null && boot !== s.bootCount) {
     history = []; live = []; hasOlder = false; chartAtEnd = true; chartStart = 0; eventKey = "";
     cycleAnchor = cycleKey = null;
-    pidLoaded = settingsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
+    pidLoaded = settingsLoaded = protectionsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     if (!recipesDirty) { recipesLoaded = false; loadRecipes().catch(() => {}); }
   }
   boot = s.bootCount; latest = s; connected = true; lastResponseAt = performance.now(); renderFailed = false;
@@ -300,6 +304,17 @@ function display(s) {
       ' Interruzione già riconosciuta: nessun blocco da questo evento.') : 'Nessuna interruzione da blackout/reset durante un ciclo attivo registrata.');
   updateReportStatus(s);
   renderTestStatus(s);
+  if (s.protections) {
+    const cfg = s.protections;
+    if (!protectionsLoaded) {
+      $('probeDeltaEnabled').checked = cfg.probeDeltaEnabled;
+      $('meanOvershootEnabled').checked = cfg.meanOvershootEnabled;
+      $('maxProbeDeltaC').value = cfg.maxProbeDeltaC;
+      $('maxMeanOvershootC').value = cfg.maxMeanOvershootC;
+      protectionsLoaded = true;
+    }
+    put('appliedProtections', `Impostazioni applicate · ΔT sonde: ${cfg.probeDeltaEnabled ? `blocco oltre ${temp(cfg.maxProbeDeltaC)} °C` : 'blocco disabilitato'} · Media − target: ${cfg.meanOvershootEnabled ? `blocco oltre +${temp(cfg.maxMeanOvershootC)} °C` : 'blocco disabilitato'}`);
+  } else put('appliedProtections','Configurazione dei blocchi non disponibile: aggiorna il firmware per usare Parameters.');
   updateControls();
   if (!pidLoaded && s.pid) {
     $("kp").value = Number(s.pid.kp).toFixed(2);
@@ -330,11 +345,14 @@ function updateErrorReset() {
   const invalid = s?.sensors?.some(sensor => !sensor.valid), active = ['running', 'paused'].includes(s?.phase);
   const reason = s?.fault || (s?.emergency ? 'Emergenza attiva.' : s?.lastInterruption?.pending || s?.phase === 'interrupted' ?
     'Interruzione/blackout registrato: ripartenza bloccata.' : 'Allarme o blocco del supervisore registrato.');
-  put('errorResetText', required ? `${reason} ` + (active ? 'Ferma prima il controllo, poi premi RESET ERRORI.' :
-    invalid ? 'Sonde non valide: ripristina le letture, poi premi RESET ERRORI. Il reset non riavvia il forno.' :
-    'Premi RESET ERRORI per riconoscere il blocco. Il forno resta spento; avvia poi esplicitamente un nuovo controllo.') :
+  const resume = s?.faultResume;
+  put('errorResetText', required ? `RESET ERRORI: ${reason} ` + (active ? 'Ferma prima il controllo.' :
+    invalid ? 'Sonde non valide: ripristina le letture. RESET & BLOCK riconosce il blocco lasciando il forno spento.' :
+    'RESET & BLOCK riconosce il blocco e lascia il forno spento. ' + (resume?.ready ?
+      `RESET & CONTINUE riattiva il controllo dallo stesso punto, con riferimento ${temp(resume.targetC)} °C; le resistenze possono accendersi.` :
+      `Continuazione non disponibile: ${resume?.reason || 'nessun punto di ripresa salvato in questa accensione.'}`)) :
     !s ? 'In attesa del controllore.' : invalid ? 'Sonde non valide: avvio bloccato finché le letture non tornano valide.' :
-    'Il reset riconosce allarmi, emergenze e interruzioni; non cancella log/report e non avvia il forno.');
+    'RESET & BLOCK riconosce gli errori e lascia il forno spento. RESET & CONTINUE è disponibile solo per un controllo interrotto da allarme in questa accensione.');
   if (required && !connected) put('errorResetText', `${reason} Connessione assente: il blocco resta attivo. Ricollegati per usare RESET ERRORI.`);
 }
 function updateControls() {
@@ -365,6 +383,9 @@ function updateControls() {
   $("refreshReport").disabled = !connected || !latest?.reportAvailable || reportBusy;
   updateReportExports();
   for (const id of ["saveRecipes", "savePid", "saveControl"]) $(id).disabled = !connected || active;
+  const parametersBlocked = !connected || active || commandBusy || testCommandBusy || !!latest?.test?.enabled || !!latest?.otaUpdating;
+  for (const id of ['kp','ki','kd','actuator','windowSec','maxPower','probeDeltaEnabled','maxProbeDeltaC','meanOvershootEnabled','maxMeanOvershootC','savePid','saveControl']) $(id).disabled = parametersBlocked;
+  $('saveProtections').disabled = parametersBlocked || !latest?.protections;
   $("exportSamples").disabled = !connected || exportBusy;
   document.querySelectorAll('#recipesView input, #recipesView select, #recipesView button').forEach(el => {
     if (el.id !== "exportRecipes") el.disabled = active || !connected;
@@ -372,6 +393,8 @@ function updateControls() {
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
   $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || needsErrorReset() || latest?.phase !== "paused";
   $("resetBtn").disabled = !connected || commandBusy || testCommandBusy || active || !!latest?.otaUpdating || !needsErrorReset();
+  $('resetContinueBtn').disabled = $('resetBtn').disabled || latest?.phase !== 'fault' || !!latest?.emergency || !!latest?.test?.enabled || !!latest?.lastInterruption?.pending || !latest?.faultResume?.ready;
+  $('resetContinueBtn').title = latest?.faultResume?.ready ? 'Riattiva il controllo interrotto: le resistenze possono accendersi' : latest?.faultResume?.reason || 'Nessun punto di ripresa disponibile';
   updateErrorReset();
   $("stopBtn").disabled = !latest;
 }
@@ -463,12 +486,12 @@ async function command(action) {
   const generation = ++commandGeneration; commandBusy = true; updateControls();
   try {
     const result = await api("/api/command", { action, recipeId: selectedId, hardwareReady: $("hardwareReady").checked });
-    if (generation !== commandGeneration) { if (action === "start") api("/api/command", {action:"stop"}).catch(() => {}); return; }
-    if (["start", "stop", "emergency", "reset"].includes(action)) $("hardwareReady").checked = $("manualHardwareReady").checked = false;
+    if (generation !== commandGeneration) { if (["start", "resetContinue"].includes(action)) api("/api/command", {action:"stop"}).catch(() => {}); return; }
+    if (["start", "stop", "emergency", "reset", "resetContinue"].includes(action)) $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Errori riconosciuti. Uscite spente: scegli e avvia esplicitamente un nuovo controllo." })[action];
+    const text = result.phase === 'fault' && action === 'resetContinue' ? result.fault : ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "RESET & BLOCK: errori riconosciuti, forno fermo. Per ripartire serve un nuovo avvio.", resetContinue: 'RESET & CONTINUE: controllo ripreso dal punto interrotto, con lo stesso target e rate.' })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -673,7 +696,7 @@ async function refresh() {
 }
 function show(view) {
   selectedView = view;
-  for (const name of ["Dashboard", "Manual", "Recipes", "Test", "Logs", "Report"]) {
+  for (const name of ["Dashboard", "Manual", "Recipes", "Parameters", "Test", "Logs", "Report"]) {
     const active = view === name;
     $(`tab${name}`).classList.toggle("active", active);
     if (name !== 'Manual') $(`${name.toLowerCase()}View`).hidden = name === 'Dashboard' ? !['Dashboard','Manual'].includes(view) : !active;
@@ -699,7 +722,7 @@ function reportDefinitions(r, definitions) {
 }
 function reportNumber(value, unit = "", digits = 2) { return Number.isFinite(value) ? `${value.toFixed(digits)}${unit}` : "—"; }
 function reportTime(epoch, uptimeMs, bootCount) {
-  return epoch ? new Date(epoch * 1000).toLocaleString("it-IT") : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
+  return epoch ? new Date(epoch * 1000).toLocaleString("it-IT", {timeZone:"Europe/Rome"}) + " (Italia)" : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
 }
 function reportSummaryPairs(r) {
   const stats = r.stats, cfg = r.settings;
@@ -716,12 +739,12 @@ function reportSummaryPairs(r) {
     ["Comando usato", `${cfg.actuator === "ssr" ? "SSR" : "Relè meccanico"} · ${cfg.windowSec} s · limite ${cfg.maxPower}%`],
     ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
     ...thermal, ["ΔT massimo sonde", reportNumber(stats.maxDeltaC, " °C")],
-    ["Errore medio assoluto · rampa + hold", reportNumber(stats.meanAbsoluteErrorC, " °C")],
+    ["Errore medio assoluto · rampa e mantenimento", reportNumber(stats.meanAbsoluteErrorC, " °C")],
     [reportOvershootLabel(r), reportNumber(stats.maxOvershootC, " °C")],
     ["Ritardo massimo della media", reportNumber(stats.maxLagC, " °C")],
     ["PID medio richiesto", reportNumber(stats.meanCommandPct, "%")],
     ["Campioni al limite di comando", reportNumber(stats.saturationPct, "%")],
-    ["Campioni / coppie non valide", `${stats.samples} / ${stats.invalidPairs}`]
+    ["Campioni acquisiti", `${stats.samples}`], ["Coppie PT100 non valide", `${stats.invalidPairs}`]
   ];
 }
 function reportStepRows(r) {
@@ -730,7 +753,7 @@ function reportStepRows(r) {
     const holdRange = step.type === "hold" ? stats.sensors.map(s => reportNumber(
       s.validSamples ? s.maxC - s.minC : null, " °C")).join(" / ") : "—";
     return [
-      `${step.index + 1} · ${types[step.type] || step.type}${step.type !== "hold" ? ` · ${step.rate} °C/min` : ""}`,
+      `${step.index + 1} · ${({ramp:"Rampa",hold:"Mantenimento",cooldown:"Cooldown"})[step.type] || step.type}${step.type !== "hold" ? ` · ${step.rate} °C/min` : ""}`,
       reportNumber(step.target, " °C", 1), step.completed ? "Completato" : step.started ? "Interrotto" : "Non iniziato",
       clock(step.activeMs / 1000), clock(step.pausedMs / 1000),
       step.type === "hold" ? `${clock(step.holdInBandMs / 1000)} / ${clock(step.durationMin * 60)}` : "—",
@@ -769,9 +792,14 @@ async function loadReport(expectedKey = latest?.reportKey) {
     put("reportReason", r.reason);
     put("reportMessage", r.saved ? "Ultimo report salvato sull'ESP, disponibile anche dopo un riavvio. Un nuovo ciclo lo sostituirà solo quando termina." : "Report disponibile solo in RAM: scaricalo prima di riavviare l'ESP.");
     $("reportSummary").replaceChildren();
-    for (const [label, value] of reportSummaryPairs(r)) {
-      const box = document.createElement("div"), title = document.createElement("span"), item = document.createElement("strong");
-      title.textContent = label; item.textContent = value; box.append(title, item); $("reportSummary").append(box);
+    for (const group of OvenExport.summaryGroups(reportSummaryPairs(r))) {
+      const section=document.createElement('section'), heading=document.createElement('h3'), grid=document.createElement('div');
+      section.className='report-summary-section'; grid.className='report-summary-grid'; heading.textContent=group.title;
+      for (const [label,value] of group.pairs) {
+        const box=document.createElement('div'), title=document.createElement('span'), item=document.createElement('strong');
+        title.textContent=label;item.textContent=value;box.append(title,item);grid.append(box);
+      }
+      section.append(heading,grid);$('reportSummary').append(section);
     }
     $("reportSteps").replaceChildren();
     for (const values of reportStepRows(r)) {
@@ -872,6 +900,7 @@ function validateRecipes(list) {
 $("tabDashboard").onclick = () => show("Dashboard");
 $('tabManual').onclick = () => show('Manual');
 $("tabRecipes").onclick = () => show("Recipes");
+$('tabParameters').onclick = () => show('Parameters');
 $("tabTest").onclick = () => show("Test");
 $("tabLogs").onclick = () => show("Logs");
 $("tabReport").onclick = () => show("Report");
@@ -896,6 +925,7 @@ $('manualCooldown').onclick = () => manualCommand('cooldown');
 $('manualStop').onclick = () => manualCommand('stop');
 $("hardwareReady").onchange = updateControls;
 $("resetBtn").onclick = () => command("reset");
+$('resetContinueBtn').onclick = () => command('resetContinue');
 $("recipeSelect").onchange = e => { selectedId = e.target.value; renderPreview(); };
 $("editRecipeSelect").onchange = e => { saveName(); editId = e.target.value; renderEditor(); };
 $("recipeName").onchange = saveName;
@@ -912,8 +942,8 @@ $("savePid").onclick = async () => {
   try {
     if (["kp", "ki", "kd"].some(id => $(id).value.trim() === "")) throw Error("Inserisci Kp, Ki e Kd.");
     const result = await api("/api/pid", { kp: Number($("kp").value), ki: Number($("ki").value), kd: Number($("kd").value) });
-    display(result); note("recipeMessage", "Coefficienti PID salvati nella memoria dell'ESP.");
-  } catch (e) { note("recipeMessage", e.message, true); }
+    display(result); note("parametersMessage", "Coefficienti PID salvati nella memoria dell'ESP.");
+  } catch (e) { note("parametersMessage", e.message, true); }
 };
 $("actuator").onchange = () => {
   const minimum = $("actuator").value === "ssr" ? 1 : 60;
@@ -924,8 +954,16 @@ $("saveControl").onclick = async () => {
   try {
     if (["windowSec", "maxPower"].some(id => !$(id).value.trim())) throw Error("Inserisci finestra e limite potenza.");
     const result = await api("/api/control", {actuator: $("actuator").value, windowSec: Number($("windowSec").value), maxPower: Number($("maxPower").value)});
-    display(result); note("recipeMessage", "Attuatore e limite comando salvati nella memoria dell'ESP.");
-  } catch (e) { note("recipeMessage", e.message, true); }
+    display(result); note("parametersMessage", "Attuatore e limite comando salvati nella memoria dell'ESP.");
+  } catch (e) { note("parametersMessage", e.message, true); }
+};
+$('saveProtections').onclick = async () => {
+  try {
+    const values = ['maxProbeDeltaC','maxMeanOvershootC'].map(id=>$(id).value.trim() ? Number($(id).value) : NaN);
+    if (values.some(n=>!Number.isFinite(n)||n<.1||n>430)) throw Error('Inserisci entrambe le soglie da 0,1 a 430 °C.');
+    const result = await api('/api/protections',{probeDeltaEnabled:$('probeDeltaEnabled').checked,maxProbeDeltaC:values[0],meanOvershootEnabled:$('meanOvershootEnabled').checked,maxMeanOvershootC:values[1]});
+    protectionsLoaded = false; display(result); note('parametersMessage',"Blocchi salvati nella memoria dell'ESP.");
+  } catch(e) { note('parametersMessage',e.message,true); }
 };
 $("exportRecipes").onclick = () => { saveName(); download("oven-full-programmi.json", JSON.stringify(recipes, null, 2), "application/json"); };
 $("importRecipes").onchange = async e => {

@@ -11,12 +11,13 @@ vm.runInContext(source.slice(source.indexOf('function clock('), source.indexOf('
   source.slice(source.indexOf('const reportOutcomes'), source.indexOf('function updateReportStatus')), context);
 const stats = {samples:300,invalidPairs:1,sensors:[0,1].map(i=>({validSamples:299,startC:30+i*.1,endC:25+i*.1,minC:25,maxC:50+i*.1})),
   maxDeltaC:.5,meanAbsoluteErrorC:.46,maxOvershootC:.29,maxLagC:1.02,meanCommandPct:8.42,saturationPct:0};
-const report = {version:3,key:'example-1-2880000',firmware:'full-1.12',bootCount:1,recipeName:'ESEMPIO - curva dimostrativa',outcome:'completed',
+const report = {version:3,key:'example-1-2880000',firmware:'full-1.16',bootCount:1,recipeName:'ESEMPIO - curva dimostrativa',outcome:'completed',
   reason:'Anteprima di impaginazione con dati dimostrativi. Non rappresenta misure del forno.',
   startUtc:1791469158,endUtc:1791472038,startUptimeMs:0,endUptimeMs:2880000,durationMs:2880000,activeMs:2880000,pausedMs:0,pauseCount:0,
   completedSteps:3,stepCount:3,curveIntervalMs:10000,settings:{kp:12,ki:.015,kd:50,actuator:'ssr',windowSec:5,maxPower:30},stats,
   steps:['ramp','hold','cooldown'].map((type,index)=>({index,type,target:type==='cooldown'?25:50,rate:1,durationMin:3,started:true,completed:true,
-    activeMs:[1200000,180000,1500000][index],pausedMs:0,holdInBandMs:type==='hold'?180000:0,stats}))};
+    activeMs:[1200000,180000,1500000][index],pausedMs:0,holdInBandMs:type==='hold'?180000:0,stats:{...stats,sensors:stats.sensors.map(s=>({...s,
+      startC:type==='ramp'?30:50,endC:type==='cooldown'?25:50,minC:type==='hold'?49.5:type==='ramp'?30:25,maxC:50}))}}))};
 const points = Array.from({length:289},(_,i)=>{
   const m=i/6, target=m<=20?30+m:m<=23?50:Math.max(25,50-(m-23));
   const actual=target-.35+.1*Math.sin(i/8);
@@ -67,6 +68,14 @@ if (require.main === module) (async()=>{
   assert.equal(vm.runInContext('reportOvershootLabel({version:3})',context),'Superamento massimo della media');
   for(const version of [1,2])
     assert.equal(vm.runInContext(`reportOvershootLabel({version:${version}})`,context),'Superamento massimo sonda più calda');
+  context.report=report;
+  const grouped=Export.summaryGroups(vm.runInContext('reportSummaryPairs(report)',context));
+  assert.equal(grouped.flatMap(g=>g.pairs).length,22);
+  assert.equal(grouped.length,6);
+  const phase=Export.phaseCurve(report,points,0);
+  assert(phase.points.length>0 && phase.points.length<points.length);
+  assert(phase.points.every(p=>Export.elapsed(p.ms,phase.startMs)<=phase.durationMs));
+  assert.equal(Export.phaseCurve({...report,steps:report.steps.map((s,i)=>({...s,started:i!==1}))},points,1).points.length,0);
   const pdf=generate(report,points);
   assert.equal(Buffer.from(pdf).subarray(0,4).toString(),'%PDF');
   const longReport={...report,recipeName:'Ricetta di collaudo prolungata con carico completo',reason:'PT100/MAX31865 in errore: uscita spenta · PT100 #2 Fault 0x4, RAW 8303 · #2: Sovra/sottotensione sugli ingressi RTD;',

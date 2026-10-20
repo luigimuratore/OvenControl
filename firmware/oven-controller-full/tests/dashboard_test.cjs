@@ -64,6 +64,32 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run(`validateRecipes(${JSON.stringify(highRecipe(400))})`);
   assert.throws(() => run(`validateRecipes(${JSON.stringify(highRecipe(400.1))})`), /0–400/);
   assert.equal(elements.get('avgTemp').textContent, '30.1');
+  // Parameters owns regulation and optional alarms; Programmi owns only profiles.
+  const programHtml=html.slice(html.indexOf('id="recipesView"'),html.indexOf('id="parametersView"'));
+  assert(!programHtml.includes('id="savePid"') && !programHtml.includes('id="saveControl"'));
+  assert(html.includes('aria-label="Controllo del forno"') && html.includes('aria-label="Diagnostica"'));
+  run("show('Parameters')");
+  assert(!elements.get('parametersView').hidden && elements.get('recipesView').hidden && elements.get('dashboardView').hidden);
+  const limits={probeDeltaEnabled:true,maxProbeDeltaC:30,meanOvershootEnabled:true,maxMeanOvershootC:10};
+  run(`display({...latest,phase:'idle',protections:${JSON.stringify(limits)}})`);
+  assert(elements.get('probeDeltaEnabled').checked && elements.get('meanOvershootEnabled').checked);
+  assert.equal(Number(elements.get('maxProbeDeltaC').value),30);
+  assert.equal(Number(elements.get('maxMeanOvershootC').value),10);
+  assert(!elements.get('saveProtections').disabled);
+  elements.get('probeDeltaEnabled').checked=false;
+  run('display(latest)'); // Polling must not erase an unsaved edit.
+  assert(!elements.get('probeDeltaEnabled').checked);
+  assert(elements.get('appliedProtections').textContent.includes('blocco oltre 30.0'));
+  const previousFetch=fetchImpl;let savedLimits;
+  fetchImpl=async (url,options)=>{savedLimits=JSON.parse(options.body);return response({...status,phase:'idle',protections:savedLimits});};
+  elements.get('maxProbeDeltaC').value='40';elements.get('maxMeanOvershootC').value='12';
+  await run("$('saveProtections').onclick()");
+  assert.deepEqual(savedLimits,{probeDeltaEnabled:false,maxProbeDeltaC:40,meanOvershootEnabled:true,maxMeanOvershootC:12});
+  assert(elements.get('appliedProtections').textContent.includes('blocco disabilitato'));
+  fetchImpl=previousFetch;
+  run("display({...latest,phase:'running'});show('Dashboard')");
+  assert(elements.get('saveProtections').disabled && elements.get('probeDeltaEnabled').disabled && elements.get('kp').disabled);
+  run(`display(${JSON.stringify(status)})`);
   // A latched error remains prominent after valid readings return, in every tab.
   const clean = {...status, phase:'idle', emergency:false, resetRequired:false, supervisorFault:0,
     fault:'', lastInterruption:{pending:false}, manual:{active:false,mode:'idle'}, ready:true};
@@ -91,6 +117,18 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!elements.get('errorResetBar').classList.contains('reset-required'));
   assert(elements.get('resetBtn').disabled);
   assert(!html.includes('Riconosci allarme / interruzione'));
+  assert(html.includes('RESET &amp; BLOCK') && html.includes('RESET &amp; CONTINUE'));
+  run(`display(${JSON.stringify({...clean,phase:'fault',fault:'Allarme',faultResume:{available:true,ready:false,reason:'Sovratemperatura'}})})`);
+  assert(elements.get('resetContinueBtn').disabled && !elements.get('resetBtn').disabled);
+  assert(elements.get('errorResetText').textContent.includes('Sovratemperatura'));
+  const canContinue={...clean,phase:'fault',fault:'Allarme',faultResume:{available:true,ready:true,targetC:175}};
+  run(`display(${JSON.stringify(canContinue)})`);
+  assert(!elements.get('resetContinueBtn').disabled);
+  assert(elements.get('errorResetText').textContent.includes('resistenze possono accendersi'));
+  for(const block of [{emergency:true},{phase:'interrupted'},{lastInterruption:{pending:true}},{test:{enabled:true}}]) {
+    run(`display(${JSON.stringify({...canContinue,...block})})`);
+    assert(elements.get('resetContinueBtn').disabled);
+  }
   run(`display(${JSON.stringify(status)})`);
   assert.equal(elements.get('targetDeltaTemp').textContent, '-0.9');
   for (const [mean, expected] of [[32, '+1.0'], [31, '0.0'], [30.99, '0.0'], [29, '-2.0']]) {
@@ -231,7 +269,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert.equal(elements.get('chartYStep').value, '10');
 
   // Hover uses recorded values and accounts for a canvas displayed at half its logical size.
-  run(`history = [{ms:0,actual:20,target:21}, {ms:10000,actual:22,target:23}]; live=[]; cycleAnchor=null;
+  run(`history = [{ms:0,t1:19,t2:21,actual:20,target:21}, {ms:10000,t1:23.2,t2:20.8,actual:22,target:23}]; live=[]; cycleAnchor=null;
     chartAtEnd=true; $('chartSpan').value='900000'; drawChart();`);
   const requestsBeforeHover = requestCount;
   const chart = elements.get('tempChart'), tooltip = elements.get('chartTooltip');
@@ -239,6 +277,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(!tooltip.hidden);
   assert(tooltip.textContent.includes('Media PT100: 22.0 °C'));
   assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
+  assert(tooltip.textContent.includes('ΔT sonde: 2.4 °C'));
   assert(tooltip.textContent.includes('ΔT (media PT100 − target): -1.0 °C'));
   for (const [actual, label] of [[24, '+1.0'], [23, '0.0'], [23.01, '0.0'], [22.99, '0.0']]) {
     run(`history[1].actual=${actual}; drawChart()`);
@@ -247,6 +286,10 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   run('history[1].target=NaN; drawChart()');
   assert(tooltip.textContent.includes('Media PT100: 23.0 °C'));
   assert(!tooltip.textContent.includes('ΔT (media PT100 − target)'));
+  run('history[1].t1=null; drawChart()');
+  assert(tooltip.textContent.includes('ΔT sonde: —'));
+  run('history[1].t1=23.2; history[1].t2=NaN; drawChart()');
+  assert(tooltip.textContent.includes('ΔT sonde: —'));
   run('history[1].target=23; history[1].actual=NaN; drawChart()');
   assert(tooltip.textContent.includes('Setpoint: 23.0 °C'));
   assert(!tooltip.textContent.includes('ΔT (media PT100 − target)'));
@@ -270,6 +313,7 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   elements.get('testTempChart').listeners.pointermove({clientX: 100 + (48 + 9000 / 300000 * 1140) / 2, clientY:150}); flushFrames();
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #1: 32.0 °C'));
   assert(elements.get('testChartTooltip').textContent.includes('PT100 #2: 33.0 °C'));
+  assert(elements.get('testChartTooltip').textContent.includes('ΔT sonde: 1.0 °C'));
   assert(!elements.get('testChartTooltip').textContent.includes('ΔT (media PT100 − target)'));
   assert.equal(requestCount, testRequests);
   run(`show('Dashboard')`);

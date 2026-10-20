@@ -7,7 +7,7 @@ inline bool validSettings(bool ssr, float maxPower, uint32_t windowMs) {
   return std::isfinite(maxPower) && maxPower >= 1 && maxPower <= 100 &&
          windowMs >= (ssr ? 1000UL : 60000UL) && windowMs <= 300000UL;
 }
-enum class Fault : uint8_t { None, StaleControl, CycleTimeout, InvalidPlan };
+enum class Fault : uint8_t { None, StaleControl, InvalidPlan = 3 };
 struct Plan {
   bool cycleActive = false, heatingAllowed = false, healthy = false;
   bool manual = false; // Manual regulation ends only on operator command or a fault.
@@ -16,7 +16,7 @@ struct Plan {
 };
 class Guard {
  public:
-  static constexpr uint32_t kStaleMs = 3000, kMaxCycleMs = 12UL * 3600000UL;
+  static constexpr uint32_t kStaleMs = 3000;
   Fault fault = Fault::None;
   bool on = false;
   void publish(const Plan &value) { plan = value; }
@@ -25,8 +25,7 @@ class Guard {
   bool tick(uint32_t now) {
     on = false;
     if (fault != Fault::None || !plan.cycleActive) return false;
-    if (!plan.manual && uint32_t(now - plan.cycleAt) >= kMaxCycleMs) fault = Fault::CycleTimeout;
-    else if (uint32_t(now - plan.sampleAt) >= kStaleMs) fault = Fault::StaleControl;
+    if (uint32_t(now - plan.sampleAt) >= kStaleMs) fault = Fault::StaleControl;
     else if (!plan.healthy || !std::isfinite(plan.duty) || plan.duty < 0 || plan.duty > 100 ||
              plan.windowMs < 1000 || plan.windowMs > 300000) fault = Fault::InvalidPlan;
     if (fault != Fault::None || !plan.heatingAllowed) return false;

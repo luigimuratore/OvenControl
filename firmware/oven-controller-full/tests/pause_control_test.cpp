@@ -64,7 +64,7 @@ int main() {
   assert(plan.duty == 0); OutputSupervisor passive; passive.publish(plan);
   passive.tick(65000, true, false); assert(!passive.relay);
 
-  // Bounds, wrap, STOP, restart and the 12-hour safety timeout remain effective.
+  // Bounds, wrap, STOP, restart and prolonged pauses remain supported.
   pause.clear(); assert(!pause.active && !std::isfinite(pause.targetC));
   assert(pause.begin(403, 400000, segmentAt, before) && pause.targetC == 400);
   pause.clear(); assert(pause.begin(-5, 400000, segmentAt, before) && pause.targetC == 0);
@@ -73,8 +73,8 @@ int main() {
   assert(pause.resume(ramp, uint32_t(start + 1000), origin, segmentAt, before));
   assert(before == 1500 && uint32_t(uint32_t(start + 1100) - segmentAt) == 100);
   regulation::ProgramPause afterBoot; assert(!afterBoot.active);
-  heater::Guard timeout; plan.heatingAllowed = true; plan.cycleAt = 0;
-  plan.sampleAt = heater::Guard::kMaxCycleMs; timeout.publish(plan);
-  assert(!timeout.tick(plan.sampleAt) && timeout.fault == heater::Fault::CycleTimeout);
+  heater::Guard timeout; plan.heatingAllowed = true; plan.duty = 30; plan.cycleAt = 0;
+  plan.sampleAt = 13UL * 3600000; plan.windowAt = plan.sampleAt; timeout.publish(plan);
+  assert(timeout.tick(plan.sampleAt) && timeout.fault == heater::Fault::None);
   puts("Pause: PID hold, continuous resume/rate, active times, hold qualification, cooldown, bounds, STOP, safety and wrap passed");
 }

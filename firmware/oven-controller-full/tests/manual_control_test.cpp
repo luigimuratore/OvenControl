@@ -60,8 +60,7 @@ int main() {
   for (uint32_t second = 1; second <= 500; ++second) precise.tick(398, second * 1000);
   assert(fabsf(precise.reference - (398 + 500 * .1f / 60)) < .0001f);
 
-  // Manual maintenance has no program timer; health/freshness and the program
-  // 12-hour timeout continue to operate independently.
+  // Manual and program control have no cycle timeout; health/freshness remain enforced.
   const uint32_t later = 13UL * 3600000;
   heater::Plan plan;
   plan.cycleActive = plan.healthy = plan.heatingAllowed = plan.manual = true;
@@ -69,7 +68,7 @@ int main() {
   heater::Guard manualGuard; manualGuard.publish(plan); assert(manualGuard.tick(later));
   assert(manualGuard.fault == heater::Fault::None);
   plan.manual = false; heater::Guard programGuard; programGuard.publish(plan);
-  assert(!programGuard.tick(later) && programGuard.fault == heater::Fault::CycleTimeout);
+  assert(programGuard.tick(later) && programGuard.fault == heater::Fault::None);
   plan.manual = true; plan.healthy = false; manualGuard.publish(plan);
   assert(!manualGuard.tick(later) && manualGuard.fault == heater::Fault::InvalidPlan);
   heater::Guard stale; plan.healthy = true; stale.publish(plan);

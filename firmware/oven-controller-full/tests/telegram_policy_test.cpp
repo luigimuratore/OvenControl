@@ -14,6 +14,12 @@ int main() {
   assert(authorized(42, 42, 42, "private"));
   assert(fresh(100, 220)); assert(!fresh(100, 221)); assert(!fresh(221, 220));
   assert(command("/status") == Command::Status);
+  assert(command("/plot") == Command::Plot);
+  for (auto mode : {Mode::Essential, Mode::Brief, Mode::Detailed}) {
+    assert(allowEvent(mode, false, EventScope::Always));
+    assert(allowEvent(mode, true, EventScope::DetailedOnly));
+    assert(allowEvent(mode, false, EventScope::DetailedOnly) == (mode == Mode::Detailed));
+  }
   for (auto text : {"/start", "/help"}) assert(command(text) == Command::Help);
   assert(command("/modalita") == Command::ModeMenu);
   for (auto text : {"/essenziale", kEssentialButton}) assert(command(text) == Command::Essential);

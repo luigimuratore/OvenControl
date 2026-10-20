@@ -44,7 +44,7 @@ public:
     if (!((raw >= maxPower && error > 0) || (raw <= 0 && error < 0))) integral = candidate;
     output = clamp(proportional + integral + kd * derivative, 0, maxPower);
     // This is a regulation override on the same measured mean as the PID.
-    // Independent hottest-probe +8 C and absolute cutoffs remain in main.cpp.
+    // Configurable delta/mean alarms and the absolute cutoff remain in main.cpp.
     // Never erase the heat-loss compensation merely because heat is inhibited.
     // A descending reference may ask for heat only below the curve, never
     // above it, even if stored integral or derivative would request heat.

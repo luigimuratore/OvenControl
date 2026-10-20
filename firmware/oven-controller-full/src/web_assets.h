@@ -14,10 +14,16 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
 <body>
   <header class="topbar"><div><div class="eyebrow">ESP32-S3 · VERSIONE COMPLETA</div><h1>Oven Controller</h1></div>
     <div class="status-wrap"><span id="statusDot" class="status-dot idle"></span><span id="statusText">Connessione…</span></div></header>
-  <nav class="view-tabs"><button id="tabDashboard" class="active">Dashboard</button><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button><button id="tabTest">TEST</button><button id="tabLogs">Log</button><button id="tabReport">Report</button></nav>
+  <nav class="view-tabs" aria-label="Sezioni del forno">
+    <button id="tabDashboard" class="active">Dashboard</button>
+    <div class="tab-group" role="group" aria-label="Controllo del forno"><button id="tabManual">Manuale</button><button id="tabRecipes">Programmi</button></div>
+    <button id="tabParameters">Parameters</button>
+    <div class="tab-group" role="group" aria-label="Diagnostica"><button id="tabTest">TEST</button><button id="tabLogs">Log</button></div>
+    <button id="tabReport">Report</button>
+  </nav>
   <section id="errorResetBar" class="error-reset-bar" aria-label="Stato blocco e reset errori">
     <div><strong id="errorResetTitle">Stato errori</strong><p id="errorResetText" role="status" aria-live="polite">In attesa del controllore.</p></div>
-    <button id="resetBtn" class="error-reset-button" disabled>RESET ERRORI</button>
+    <div class="error-reset-actions"><button id="resetBtn" class="error-reset-button" disabled>RESET &amp; BLOCK</button><button id="resetContinueBtn" class="error-reset-button error-continue-button" disabled>RESET &amp; CONTINUE</button></div>
   </section>
   <div id="globalMessage" class="global-message notice hidden" role="status" aria-live="polite"></div>
   <button id="globalStop" class="global-stop" aria-label="Arresto di emergenza software: spegne tutte le uscite e blocca il riavvio" title="Blocca ciclo, manuale e TEST fino al riconoscimento"><span class="emergency-ring" aria-hidden="true"><span class="emergency-cap">STOP</span></span><span class="emergency-label">EMERGENZA</span></button>
@@ -75,12 +81,34 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
     <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina programma</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
     <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: il PID frena il raffreddamento sotto il setpoint; sopra la curva raffredda naturalmente. Non può raffreddare più velocemente del forno.</p><div id="recipeMessage" class="notice hidden"></div>
     </div>
+
+  </section>
+  <section id="parametersView" class="logs-view panel" hidden>
+    <div class="panel-title-row"><div><div class="eyebrow">REGOLAZIONE E BLOCCHI</div><h2>Parameters</h2><p>Impostazioni condivise da Programmi e Manuale. Modifica e salva con il controllo fermo.</p></div></div>
     <section class="control-settings-section"><h2>Tuning PID</h2><p>Valori iniziali prudenziali da tarare sul forno. Modificabili solo a ciclo fermo. Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200.</p>
     <div class="pid-fields"><label class="field"><span>Kp</span><input id="kp" type="number" min="0" max="50" step="0.1"></label><label class="field"><span>Ki</span><input id="ki" type="number" min="0" max="0.5" step="0.001"></label><label class="field"><span>Kd</span><input id="kd" type="number" min="0" max="200" step="0.1"></label></div><button id="savePid" class="ghost full">Salva PID sull'ESP</button>
     <hr><h2>Attuatore e limite potenza</h2><p>Seleziona l'attuatore realmente installato. Il limite è la percentuale di tempo ON richiesta, senza misura della potenza elettrica.</p>
     <div class="pid-fields"><label class="field"><span>Tipo attuatore</span><select id="actuator"><option value="relay">Relè meccanico</option><option value="ssr">SSR</option></select></label><label class="field"><span>Finestra comando · s</span><input id="windowSec" type="number" min="60" max="300" step="1"></label><label class="field"><span>Limite comando · %</span><input id="maxPower" type="number" min="1" max="100" step="1"></label></div>
     <button id="saveControl" class="ghost full">Salva comando sull'ESP</button><p class="hint">Default: relè meccanico, finestra 60 s, comando massimo 30%. SSR: finestra 1–300 s; relè: 60–300 s. Questi valori iniziali e il PID richiedono taratura sul forno. Il firmware non rileva il tipo di attuatore.</p>
     </section>
+    <section class="control-settings-section protection-settings-section" aria-labelledby="protectionSettingsTitle">
+      <h2 id="protectionSettingsTitle">Blocchi termici configurabili</h2>
+      <p>Ogni blocco è indipendente. Le soglie si applicano a rampa, mantenimento, pausa e cooldown di Programmi e Manuale. Scattano solo quando il valore è maggiore della soglia. Il target è il riferimento istantaneo mostrato nel grafico.</p>
+      <div class="protection-grid">
+        <article class="protection-card"><h3>Differenza tra le sonde</h3><p class="hint">ΔT = valore assoluto di PT100 #1 − PT100 #2.</p>
+          <label class="protection-toggle"><input id="probeDeltaEnabled" type="checkbox"><span>Abilita blocco ΔT sonde</span></label>
+          <label class="field"><span>Soglia ΔT sonde · °C</span><input id="maxProbeDeltaC" type="number" min="0.1" max="430" step="0.1" value="30"></label>
+        </article>
+        <article class="protection-card"><h3>Media sopra il target</h3><p class="hint">ΔT = media PT100 − target. Un valore negativo indica una temperatura sotto il target.</p>
+          <label class="protection-toggle"><input id="meanOvershootEnabled" type="checkbox"><span>Abilita blocco media − target</span></label>
+          <label class="field"><span>Soglia sopra il target · °C</span><input id="maxMeanOvershootC" type="number" min="0.1" max="430" step="0.1" value="10"></label>
+        </article>
+      </div>
+      <p id="appliedProtections" class="protection-applied" role="status">In attesa delle impostazioni applicate sull'ESP.</p>
+      <button id="saveProtections" class="ghost full" disabled>Salva blocchi sull'ESP</button>
+      <p class="hint">Le modifiche si applicano dopo il salvataggio e restano memorizzate al riavvio. Le letture valide e fresche, l'emergenza e il limite assoluto individuale di 415 °C restano attivi. TEST mantiene la sua diagnostica separata.</p>
+    </section>
+    <div id="parametersMessage" class="notice hidden" role="status"></div>
   </section>
   <section id="logsView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2><p>Avvio/fine ciclo, step, PID, allarmi, rete e interruzioni.</p></div><div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div></div><p id="logRetention" class="hint">Caricamento…</p><div id="logList" class="log-list"></div></section>
 <section id="testView" hidden>
@@ -205,6 +233,7 @@ const char WEB_CSS[] PROGMEM = R"OVEN_ASSET_2026(:root {
   --test-exit-bg: #805c24;
   --error-reset-bg: #28577c;
   --error-reset-active-bg: #c62838;
+  --error-continue-bg: #ed9632;
   --error-banner-bg: #42232b;
   --emergency-red: #e92632;
   --emergency-yellow: #f7c843;
@@ -216,10 +245,15 @@ const char WEB_CSS[] PROGMEM = R"OVEN_ASSET_2026(:root {
 .error-reset-bar p { margin-top: 4px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
 .error-reset-bar.reset-required { background: var(--error-banner-bg); border: 2px solid var(--danger); }
 .error-reset-bar.reset-required strong { color: #ffbec6; }
-button.error-reset-button { flex-shrink: 0; padding: 14px 20px; background: var(--error-reset-bg); border: 2px solid #649ac3; color: #fff; font-weight: 800; }
+button.error-reset-button { flex-shrink: 0; padding: 14px 20px; background: var(--error-reset-active-bg); border: 2px solid #ff9ba6; color: #fff; font-weight: 800; }
+.error-reset-actions { display: flex; flex-wrap: wrap; flex-shrink: 0; gap: 10px; }
+button.error-continue-button { background: var(--error-continue-bg); border-color: #ffc278; color: #261600; }
+button.error-continue-button:disabled { opacity: .45; }
 button.error-reset-button.reset-required { background: var(--error-reset-active-bg); border-color: #ff9ba6; box-shadow: 0 0 0 3px rgba(255,94,108,.15); }
 .error-reset-bar.reset-required button:disabled { opacity: .8; }
+.error-reset-bar.reset-required button.error-continue-button:disabled { opacity: .45; }
 @media (max-width: 1600px) { .error-reset-bar { margin-left: 34px; margin-right: 34px; } }
+@media (max-width: 1000px) { .error-reset-bar { flex-wrap: wrap; } .error-reset-actions { width: 100%; } .error-reset-actions button { flex: 1; } }
 @media (max-width: 680px) { .error-reset-bar { margin-left: 16px; margin-right: 16px; flex-direction: column; align-items: stretch; gap: 10px; top: 4px; } .error-reset-button { width: 100%; } }
 
 body {
@@ -524,9 +558,19 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 22px 0; }
 .test-buttons { grid-template-columns: 2fr 1fr; }
 .sim-buttons { grid-template-columns: repeat(2, 1fr); }
 .sim-banner { margin-top: 14px; padding: 12px; border: 1px solid rgba(246,185,79,.5); border-radius: 12px; background: rgba(246,185,79,.13); color: #ffd68a; font-size: 12px; line-height: 1.5; font-weight: 700; }
-.view-tabs { max-width: 1600px; margin: 0 auto 18px; padding: 0 34px; display: flex; gap: 8px; }
-.view-tabs button { min-width: 130px; font-size: 14px; }
+.view-tabs { max-width: 1600px; margin: 0 auto 18px; padding: 0 34px; display: flex; align-items: stretch; flex-wrap: wrap; gap: 10px; }
+.view-tabs button { min-width: 110px; font-size: 14px; }
+.tab-group { display: flex; gap: 5px; padding: 5px; border: 1px solid #405466; border-radius: 15px; background: linear-gradient(150deg,rgba(113,146,172,.08),rgba(14,22,30,.3)); box-shadow: inset 0 1px 0 rgba(255,255,255,.04); }
+.tab-group:has(button.active) { border-color: #5a8aab; }
+.tab-group button { border-color: transparent; background: transparent; }
 .view-tabs button.active { border-color: var(--accent); color: var(--accent); background: rgba(54,197,140,.11); }
+.protection-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 18px; margin: 20px 0; }
+.protection-card { padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); }
+.protection-card h3 { margin: 0 0 8px; }
+.protection-card .hint { min-height: 40px; }
+.protection-toggle { display: flex; align-items: center; gap: 12px; margin: 20px 0; font-weight: 600; }
+.protection-toggle input { width: 22px; height: 22px; flex-shrink: 0; accent-color: var(--accent-2); }
+.protection-applied { padding: 14px 18px; border-left: 3px solid var(--accent-2); border-radius: 8px; background: rgba(74,163,255,.07); color: var(--muted); line-height: 1.7; }
 .power-summary { grid-template-columns: repeat(3, 1fr); }
 .heating { color: var(--danger); }
 .notice { margin-top: 12px; padding: 11px; border-radius: 10px; background: rgba(54,197,140,.13); color: #9de6c2; font-size: 12px; }
@@ -591,6 +635,8 @@ footer {
 @media (max-width: 680px) {
   .global-message { margin-left: 16px; margin-right: 16px; }
   .view-tabs button { min-width: 0; flex: 1; }
+  .tab-group { flex: 1 1 auto; }
+  .protection-grid { grid-template-columns: 1fr; }
   .topbar, .layout, .view-tabs, footer { padding-left: 16px; padding-right: 16px; }
   .logs-view { margin-left: 16px; margin-right: 16px; padding: 16px; }
   .topbar { align-items: flex-start; }
@@ -645,12 +691,23 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .report-notice { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-top: 20px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: #0d141c; }
 .report-notice p { margin: 5px 0 0; font-size: 13px; color: var(--muted); }
-.report-result { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 0; }
-.report-summary { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin-bottom: 24px; }
-.report-table-wrap { overflow-x: auto; margin: 14px 0; }
+.report-result { display: flex; flex-direction: column; gap: 8px; margin: 18px 0; padding: 18px 20px; border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 14px; background: var(--panel-2); }
+.report-result span { color: var(--muted); line-height: 1.6; }
+.report-result:has(.log-danger) { border-left-color: var(--danger); background: rgba(255,100,100,.07); }
+.report-result:has(.log-warning) { border-left-color: var(--warning); background: rgba(255,193,77,.07); }
+.report-summary { display: block; margin-bottom: 24px; }
+.report-summary-section { padding: 20px; margin: 16px 0; background: linear-gradient(115deg, rgba(74,163,255,.075), transparent), var(--panel-2); border: 1px solid var(--border); border-radius: 14px; }
+.report-summary-section:nth-child(3), .report-summary-section:nth-child(6) { background: linear-gradient(115deg, rgba(53,190,145,.075), transparent), var(--panel-2); }
+.report-summary-section h3 { margin: 0 0 18px; padding-left: 12px; border-left: 3px solid var(--accent-2); font-size: 14px; letter-spacing: .025em; }
+.report-summary-section:nth-child(3) h3, .report-summary-section:nth-child(6) h3 { border-left-color: #35be91; }
+.report-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 18px; }
+.report-summary-grid span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+.report-summary-grid strong { display: block; font-size: 16px; overflow-wrap: anywhere; }
+.report-table-wrap { overflow-x: auto; margin: 14px 0; background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; }
 .report-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .report-table th, .report-table td { padding: 12px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; min-width: 90px; }
-.report-table th { color: var(--muted); font-weight: 500; }
+.report-table th { color: var(--muted); font-weight: 500; background: rgba(74,163,255,.06); }
+#reportDefinitions { margin-top: 22px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel-2); line-height: 1.7; }
 @media (max-width: 680px) { .report-notice { align-items: flex-start; flex-direction: column; } .view-tabs { flex-wrap: wrap; } }
 
 .report-chart { margin: 18px 0 26px; }
@@ -665,6 +722,7 @@ const types = { ramp: "Ramp", hold: "Hold", cooldown: "Cooldown" };
 const markerNames = { 16: "INIZIO CICLO", 32: "STOP", 64: "FINE CICLO", 128: "ALLARME" };
 let recipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
 let pidLoaded = false;
+let protectionsLoaded = false;
 let manualTargetDirty = false;
 let selectedView = 'Dashboard';
 let settingsLoaded = false, recipesLoaded = false, recipesDirty = false, commandBusy = false, commandGeneration = 0, exportBusy = false;
@@ -806,6 +864,9 @@ function createChartInspector(canvas, tooltip, cursor) {
     const readings = plot.series.filter(s => Number.isFinite(point[s.key]));
     if (!readings.length) { hide(); return; }
     tooltip.textContent = `Campione · ${plot.timeLabel(point.ms)}\n` + readings.map(s => `${s.label}: ${temp(point[s.key])} °C`).join('\n');
+    const probeDelta = Number.isFinite(point.t1) && Number.isFinite(point.t2)
+      ? `${temp(Math.abs(point.t1 - point.t2))} °C` : '—';
+    tooltip.textContent += `\nΔT sonde: ${probeDelta}`;
     if (Number.isFinite(point.target) && Number.isFinite(point.actual)) {
       const difference = point.actual - point.target;
       const highlight = document.createElement('div');
@@ -843,7 +904,7 @@ function display(s) {
   if (boot !== null && boot !== s.bootCount) {
     history = []; live = []; hasOlder = false; chartAtEnd = true; chartStart = 0; eventKey = "";
     cycleAnchor = cycleKey = null;
-    pidLoaded = settingsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
+    pidLoaded = settingsLoaded = protectionsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     if (!recipesDirty) { recipesLoaded = false; loadRecipes().catch(() => {}); }
   }
   boot = s.bootCount; latest = s; connected = true; lastResponseAt = performance.now(); renderFailed = false;
@@ -959,6 +1020,17 @@ function display(s) {
       ' Interruzione già riconosciuta: nessun blocco da questo evento.') : 'Nessuna interruzione da blackout/reset durante un ciclo attivo registrata.');
   updateReportStatus(s);
   renderTestStatus(s);
+  if (s.protections) {
+    const cfg = s.protections;
+    if (!protectionsLoaded) {
+      $('probeDeltaEnabled').checked = cfg.probeDeltaEnabled;
+      $('meanOvershootEnabled').checked = cfg.meanOvershootEnabled;
+      $('maxProbeDeltaC').value = cfg.maxProbeDeltaC;
+      $('maxMeanOvershootC').value = cfg.maxMeanOvershootC;
+      protectionsLoaded = true;
+    }
+    put('appliedProtections', `Impostazioni applicate · ΔT sonde: ${cfg.probeDeltaEnabled ? `blocco oltre ${temp(cfg.maxProbeDeltaC)} °C` : 'blocco disabilitato'} · Media − target: ${cfg.meanOvershootEnabled ? `blocco oltre +${temp(cfg.maxMeanOvershootC)} °C` : 'blocco disabilitato'}`);
+  } else put('appliedProtections','Configurazione dei blocchi non disponibile: aggiorna il firmware per usare Parameters.');
   updateControls();
   if (!pidLoaded && s.pid) {
     $("kp").value = Number(s.pid.kp).toFixed(2);
@@ -989,11 +1061,14 @@ function updateErrorReset() {
   const invalid = s?.sensors?.some(sensor => !sensor.valid), active = ['running', 'paused'].includes(s?.phase);
   const reason = s?.fault || (s?.emergency ? 'Emergenza attiva.' : s?.lastInterruption?.pending || s?.phase === 'interrupted' ?
     'Interruzione/blackout registrato: ripartenza bloccata.' : 'Allarme o blocco del supervisore registrato.');
-  put('errorResetText', required ? `${reason} ` + (active ? 'Ferma prima il controllo, poi premi RESET ERRORI.' :
-    invalid ? 'Sonde non valide: ripristina le letture, poi premi RESET ERRORI. Il reset non riavvia il forno.' :
-    'Premi RESET ERRORI per riconoscere il blocco. Il forno resta spento; avvia poi esplicitamente un nuovo controllo.') :
+  const resume = s?.faultResume;
+  put('errorResetText', required ? `RESET ERRORI: ${reason} ` + (active ? 'Ferma prima il controllo.' :
+    invalid ? 'Sonde non valide: ripristina le letture. RESET & BLOCK riconosce il blocco lasciando il forno spento.' :
+    'RESET & BLOCK riconosce il blocco e lascia il forno spento. ' + (resume?.ready ?
+      `RESET & CONTINUE riattiva il controllo dallo stesso punto, con riferimento ${temp(resume.targetC)} °C; le resistenze possono accendersi.` :
+      `Continuazione non disponibile: ${resume?.reason || 'nessun punto di ripresa salvato in questa accensione.'}`)) :
     !s ? 'In attesa del controllore.' : invalid ? 'Sonde non valide: avvio bloccato finché le letture non tornano valide.' :
-    'Il reset riconosce allarmi, emergenze e interruzioni; non cancella log/report e non avvia il forno.');
+    'RESET & BLOCK riconosce gli errori e lascia il forno spento. RESET & CONTINUE è disponibile solo per un controllo interrotto da allarme in questa accensione.');
   if (required && !connected) put('errorResetText', `${reason} Connessione assente: il blocco resta attivo. Ricollegati per usare RESET ERRORI.`);
 }
 function updateControls() {
@@ -1024,6 +1099,9 @@ function updateControls() {
   $("refreshReport").disabled = !connected || !latest?.reportAvailable || reportBusy;
   updateReportExports();
   for (const id of ["saveRecipes", "savePid", "saveControl"]) $(id).disabled = !connected || active;
+  const parametersBlocked = !connected || active || commandBusy || testCommandBusy || !!latest?.test?.enabled || !!latest?.otaUpdating;
+  for (const id of ['kp','ki','kd','actuator','windowSec','maxPower','probeDeltaEnabled','maxProbeDeltaC','meanOvershootEnabled','maxMeanOvershootC','savePid','saveControl']) $(id).disabled = parametersBlocked;
+  $('saveProtections').disabled = parametersBlocked || !latest?.protections;
   $("exportSamples").disabled = !connected || exportBusy;
   document.querySelectorAll('#recipesView input, #recipesView select, #recipesView button').forEach(el => {
     if (el.id !== "exportRecipes") el.disabled = active || !connected;
@@ -1031,6 +1109,8 @@ function updateControls() {
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
   $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || needsErrorReset() || latest?.phase !== "paused";
   $("resetBtn").disabled = !connected || commandBusy || testCommandBusy || active || !!latest?.otaUpdating || !needsErrorReset();
+  $('resetContinueBtn').disabled = $('resetBtn').disabled || latest?.phase !== 'fault' || !!latest?.emergency || !!latest?.test?.enabled || !!latest?.lastInterruption?.pending || !latest?.faultResume?.ready;
+  $('resetContinueBtn').title = latest?.faultResume?.ready ? 'Riattiva il controllo interrotto: le resistenze possono accendersi' : latest?.faultResume?.reason || 'Nessun punto di ripresa disponibile';
   updateErrorReset();
   $("stopBtn").disabled = !latest;
 }
@@ -1122,12 +1202,12 @@ async function command(action) {
   const generation = ++commandGeneration; commandBusy = true; updateControls();
   try {
     const result = await api("/api/command", { action, recipeId: selectedId, hardwareReady: $("hardwareReady").checked });
-    if (generation !== commandGeneration) { if (action === "start") api("/api/command", {action:"stop"}).catch(() => {}); return; }
-    if (["start", "stop", "emergency", "reset"].includes(action)) $("hardwareReady").checked = $("manualHardwareReady").checked = false;
+    if (generation !== commandGeneration) { if (["start", "resetContinue"].includes(action)) api("/api/command", {action:"stop"}).catch(() => {}); return; }
+    if (["start", "stop", "emergency", "reset", "resetContinue"].includes(action)) $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     display(result);
     if (action === "start") { chartAtEnd = true; drawSoon(); }
     if (!$("logsView").hidden) refreshLogs();
-    const text = ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "Errori riconosciuti. Uscite spente: scegli e avvia esplicitamente un nuovo controllo." })[action];
+    const text = result.phase === 'fault' && action === 'resetContinue' ? result.fault : ({ start: "Ciclo avviato.", pause: result.pauseMaintainsTemperature ? `Ciclo in pausa: PID mantiene ${temp(result.pauseTargetC)} °C.` : "Ciclo in pausa: uscita spenta.", resume: "Ciclo ripreso.", stop: wasManual ? "Controllo manuale fermato: uscita spenta." : "Ciclo fermato: uscita spenta.", emergency: 'EMERGENZA: ciclo, manuale e TEST fermati; uscite bloccate fino al riconoscimento.', reset: "RESET & BLOCK: errori riconosciuti, forno fermo. Per ripartire serve un nuovo avvio.", resetContinue: 'RESET & CONTINUE: controllo ripreso dal punto interrotto, con lo stesso target e rate.' })[action];
     note("messageBox", text); note("globalMessage", text);
   } catch (e) { if (generation === commandGeneration) { note("messageBox", e.message, true); note("globalMessage", e.message, true); } }
   finally { if (generation === commandGeneration) { commandBusy = false; updateControls(); refresh(); } }
@@ -1332,7 +1412,7 @@ async function refresh() {
 }
 function show(view) {
   selectedView = view;
-  for (const name of ["Dashboard", "Manual", "Recipes", "Test", "Logs", "Report"]) {
+  for (const name of ["Dashboard", "Manual", "Recipes", "Parameters", "Test", "Logs", "Report"]) {
     const active = view === name;
     $(`tab${name}`).classList.toggle("active", active);
     if (name !== 'Manual') $(`${name.toLowerCase()}View`).hidden = name === 'Dashboard' ? !['Dashboard','Manual'].includes(view) : !active;
@@ -1358,7 +1438,7 @@ function reportDefinitions(r, definitions) {
 }
 function reportNumber(value, unit = "", digits = 2) { return Number.isFinite(value) ? `${value.toFixed(digits)}${unit}` : "—"; }
 function reportTime(epoch, uptimeMs, bootCount) {
-  return epoch ? new Date(epoch * 1000).toLocaleString("it-IT") : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
+  return epoch ? new Date(epoch * 1000).toLocaleString("it-IT", {timeZone:"Europe/Rome"}) + " (Italia)" : `Avvio ${bootCount} · uptime ${clock(uptimeMs / 1000)} (ora NTP assente)`;
 }
 function reportSummaryPairs(r) {
   const stats = r.stats, cfg = r.settings;
@@ -1375,12 +1455,12 @@ function reportSummaryPairs(r) {
     ["Comando usato", `${cfg.actuator === "ssr" ? "SSR" : "Relè meccanico"} · ${cfg.windowSec} s · limite ${cfg.maxPower}%`],
     ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
     ...thermal, ["ΔT massimo sonde", reportNumber(stats.maxDeltaC, " °C")],
-    ["Errore medio assoluto · rampa + hold", reportNumber(stats.meanAbsoluteErrorC, " °C")],
+    ["Errore medio assoluto · rampa e mantenimento", reportNumber(stats.meanAbsoluteErrorC, " °C")],
     [reportOvershootLabel(r), reportNumber(stats.maxOvershootC, " °C")],
     ["Ritardo massimo della media", reportNumber(stats.maxLagC, " °C")],
     ["PID medio richiesto", reportNumber(stats.meanCommandPct, "%")],
     ["Campioni al limite di comando", reportNumber(stats.saturationPct, "%")],
-    ["Campioni / coppie non valide", `${stats.samples} / ${stats.invalidPairs}`]
+    ["Campioni acquisiti", `${stats.samples}`], ["Coppie PT100 non valide", `${stats.invalidPairs}`]
   ];
 }
 function reportStepRows(r) {
@@ -1389,7 +1469,7 @@ function reportStepRows(r) {
     const holdRange = step.type === "hold" ? stats.sensors.map(s => reportNumber(
       s.validSamples ? s.maxC - s.minC : null, " °C")).join(" / ") : "—";
     return [
-      `${step.index + 1} · ${types[step.type] || step.type}${step.type !== "hold" ? ` · ${step.rate} °C/min` : ""}`,
+      `${step.index + 1} · ${({ramp:"Rampa",hold:"Mantenimento",cooldown:"Cooldown"})[step.type] || step.type}${step.type !== "hold" ? ` · ${step.rate} °C/min` : ""}`,
       reportNumber(step.target, " °C", 1), step.completed ? "Completato" : step.started ? "Interrotto" : "Non iniziato",
       clock(step.activeMs / 1000), clock(step.pausedMs / 1000),
       step.type === "hold" ? `${clock(step.holdInBandMs / 1000)} / ${clock(step.durationMin * 60)}` : "—",
@@ -1428,9 +1508,14 @@ async function loadReport(expectedKey = latest?.reportKey) {
     put("reportReason", r.reason);
     put("reportMessage", r.saved ? "Ultimo report salvato sull'ESP, disponibile anche dopo un riavvio. Un nuovo ciclo lo sostituirà solo quando termina." : "Report disponibile solo in RAM: scaricalo prima di riavviare l'ESP.");
     $("reportSummary").replaceChildren();
-    for (const [label, value] of reportSummaryPairs(r)) {
-      const box = document.createElement("div"), title = document.createElement("span"), item = document.createElement("strong");
-      title.textContent = label; item.textContent = value; box.append(title, item); $("reportSummary").append(box);
+    for (const group of OvenExport.summaryGroups(reportSummaryPairs(r))) {
+      const section=document.createElement('section'), heading=document.createElement('h3'), grid=document.createElement('div');
+      section.className='report-summary-section'; grid.className='report-summary-grid'; heading.textContent=group.title;
+      for (const [label,value] of group.pairs) {
+        const box=document.createElement('div'), title=document.createElement('span'), item=document.createElement('strong');
+        title.textContent=label;item.textContent=value;box.append(title,item);grid.append(box);
+      }
+      section.append(heading,grid);$('reportSummary').append(section);
     }
     $("reportSteps").replaceChildren();
     for (const values of reportStepRows(r)) {
@@ -1531,6 +1616,7 @@ function validateRecipes(list) {
 $("tabDashboard").onclick = () => show("Dashboard");
 $('tabManual').onclick = () => show('Manual');
 $("tabRecipes").onclick = () => show("Recipes");
+$('tabParameters').onclick = () => show('Parameters');
 $("tabTest").onclick = () => show("Test");
 $("tabLogs").onclick = () => show("Logs");
 $("tabReport").onclick = () => show("Report");
@@ -1555,6 +1641,7 @@ $('manualCooldown').onclick = () => manualCommand('cooldown');
 $('manualStop').onclick = () => manualCommand('stop');
 $("hardwareReady").onchange = updateControls;
 $("resetBtn").onclick = () => command("reset");
+$('resetContinueBtn').onclick = () => command('resetContinue');
 $("recipeSelect").onchange = e => { selectedId = e.target.value; renderPreview(); };
 $("editRecipeSelect").onchange = e => { saveName(); editId = e.target.value; renderEditor(); };
 $("recipeName").onchange = saveName;
@@ -1571,8 +1658,8 @@ $("savePid").onclick = async () => {
   try {
     if (["kp", "ki", "kd"].some(id => $(id).value.trim() === "")) throw Error("Inserisci Kp, Ki e Kd.");
     const result = await api("/api/pid", { kp: Number($("kp").value), ki: Number($("ki").value), kd: Number($("kd").value) });
-    display(result); note("recipeMessage", "Coefficienti PID salvati nella memoria dell'ESP.");
-  } catch (e) { note("recipeMessage", e.message, true); }
+    display(result); note("parametersMessage", "Coefficienti PID salvati nella memoria dell'ESP.");
+  } catch (e) { note("parametersMessage", e.message, true); }
 };
 $("actuator").onchange = () => {
   const minimum = $("actuator").value === "ssr" ? 1 : 60;
@@ -1583,8 +1670,16 @@ $("saveControl").onclick = async () => {
   try {
     if (["windowSec", "maxPower"].some(id => !$(id).value.trim())) throw Error("Inserisci finestra e limite potenza.");
     const result = await api("/api/control", {actuator: $("actuator").value, windowSec: Number($("windowSec").value), maxPower: Number($("maxPower").value)});
-    display(result); note("recipeMessage", "Attuatore e limite comando salvati nella memoria dell'ESP.");
-  } catch (e) { note("recipeMessage", e.message, true); }
+    display(result); note("parametersMessage", "Attuatore e limite comando salvati nella memoria dell'ESP.");
+  } catch (e) { note("parametersMessage", e.message, true); }
+};
+$('saveProtections').onclick = async () => {
+  try {
+    const values = ['maxProbeDeltaC','maxMeanOvershootC'].map(id=>$(id).value.trim() ? Number($(id).value) : NaN);
+    if (values.some(n=>!Number.isFinite(n)||n<.1||n>430)) throw Error('Inserisci entrambe le soglie da 0,1 a 430 °C.');
+    const result = await api('/api/protections',{probeDeltaEnabled:$('probeDeltaEnabled').checked,maxProbeDeltaC:values[0],meanOvershootEnabled:$('meanOvershootEnabled').checked,maxMeanOvershootC:values[1]});
+    protectionsLoaded = false; display(result); note('parametersMessage',"Blocchi salvati nella memoria dell'ESP.");
+  } catch(e) { note('parametersMessage',e.message,true); }
 };
 $("exportRecipes").onclick = () => { saveName(); download("oven-full-programmi.json", JSON.stringify(recipes, null, 2), "application/json"); };
 $("importRecipes").onchange = async e => {
@@ -2047,71 +2142,117 @@ const OvenExport = (() => {
   }
   // jsPDF's standard font supports Italian accents; normalize extra symbols.
   const pdfText = v => String(v).replace(/[–—−]/g,'-').replace(/→/g,' > ').replace(/Δ/g,'Delta ').replace(/Ω/g,'ohm').replace(/’/g,"'");
+  function summaryGroups(summary) {
+    return [
+      ['Ciclo e tempi', 0, 7], ['Impostazioni di regolazione', 7, 10],
+      ['Temperature delle sonde', 10, 15], ['Precisione della media rispetto al target', 15, 18],
+      ['Comando PID', 18, 20], ['Qualità delle letture', 20, 22]
+    ].map(([title,start,end])=>({title,pairs:summary.slice(start,end)}));
+  }
+  function phaseCurve(report, points, index) {
+    const step=report.steps[index];
+    const before=report.steps.slice(0,index).reduce((n,s)=>n+(Number(s.activeMs)||0)+(Number(s.pausedMs)||0),0);
+    const startMs=(report.startUptimeMs+before)>>>0;
+    const durationMs=(Number(step.activeMs)||0)+(Number(step.pausedMs)||0);
+    return {startMs,durationMs,points:step.started ? points.filter(p=>elapsed(p.ms,startMs)<=durationMs &&
+      (!Number.isInteger(p.step)||p.step===255||p.step===index)) : []};
+  }
   function pdf({report:r, points, summary, stepRows, explanation, curveMessage}) {
     if (!globalThis.jspdf?.jsPDF) throw Error('Generatore PDF non disponibile: ricarica la pagina.');
     const doc=new globalThis.jspdf.jsPDF({unit:'mm',format:'a4',compress:true});
     doc.setProperties({title:`Report ciclo - ${r.recipeName}`,subject:r.key,creator:'OvenController Full'});
     const color=(hex,stroke=false)=>{const v=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16));doc[stroke?'setDrawColor':'setTextColor'](...v);};
+    const tones={white:'#ffffff',blue:'#edf5ff',mint:'#edf9f3',slate:'#f0f4f9',green:'#e9f7ee',amber:'#fff5df',red:'#fff0f0'};
     let y=0;
     const text=(value,x,at,size=10,bold=false)=>{doc.setFont('helvetica',bold?'bold':'normal');doc.setFontSize(size);color(palette.ink);doc.text(Array.isArray(value)?value.map(pdfText):pdfText(value),x,at);};
     const lines=(value,width,size=10,bold=false)=>{doc.setFont('helvetica',bold?'bold':'normal');doc.setFontSize(size);return doc.splitTextToSize(pdfText(value),width);};
+    const fill=hex=>doc.setFillColor(...[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16)));
     function header(title,first=false) {
       if(!first)doc.addPage();
-      doc.setFillColor(32,52,66);doc.rect(0,0,210,3,'F');
+      fill('#f4f7fa');doc.rect(0,0,210,297,'F');
+      fill('#ffffff');doc.rect(0,0,210,43,'F');
+      fill('#387ba8');doc.rect(0,0,210,1.4,'F');
       text('OVEN CONTROLLER / REPORT DI CICLO',16,15,8,true);
       const titleLines=lines(title,178,first?21:17,true);text(titleLines,16,28,first?21:17,true);
       y=31+titleLines.length*(first?7:6);
       color(palette.grid,true);doc.line(16,y,194,y);y+=9;
     }
-    const ensure=h=>{if(y+h>275)header('Dettaglio degli step');};
-    const pair=(label,value,x,width=83)=>{
-      const labelLines=lines(label,width,8), valueLines=lines(value,width,10,true);
-      text(labelLines,x,y,8);text(valueLines,x,y+labelLines.length*3.2+2,10,true);
-      return labelLines.length*3.2+valueLines.length*4+7;
-    };
-    header(r.recipeName,true);
-    const outcomes={completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
-    text(outcomes[r.outcome]||r.outcome,16,y,11,true);y+=7;
-    const reason=lines(r.reason,178,9);text(reason,16,y,9);y+=reason.length*4+7;
-    for(const indices of [[1,2],[3,6],[7,8]]) {
-      const height=Math.max(...indices.map((index,i)=>pair(...summary[index],16+i*92)));y+=height;
+    const pairHeight=([label,value])=>lines(label,77,8).length*3.2+lines(value,77,10,true).length*4+4;
+    function pairsHeight(pairs) {
+      let height=0;
+      for(let i=0;i<pairs.length;i+=2)height+=Math.max(pairHeight(pairs[i]),pairs[i+1]?pairHeight(pairs[i+1]):0);
+      return height;
     }
-    text('SETPOINT E MEDIA DELLE PT100',16,y,11,true);y+=5;
-    const plotY=y, scale=178/1200;
-    paintChart({
-      line:(a,b,c,d,hex,w)=>{color(hex,true);doc.setLineWidth(w*scale);doc.line(16+a*scale,plotY+b*scale,16+c*scale,plotY+d*scale);},
-      dot:(a,b,hex,rad)=>{const rgb=[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16));doc.setFillColor(...rgb);doc.circle(16+a*scale,plotY+b*scale,rad*scale,'F');},
-      text:(a,b,t,hex,size,align)=>{doc.setFont('helvetica','normal');doc.setFontSize(Math.max(8,size*scale*2.83465));color(hex);doc.text(pdfText(t),16+a*scale,plotY+b*scale,{align:align==='right'?'right':align==='center'?'center':'left'});}
-    },points,{startMs:r.startUptimeMs,durationMs:r.durationMs,intervalMs:r.curveIntervalMs});
-    y+=500*scale+7;
-    const curveLines=lines(curveMessage,178,9);text(curveLines,16,y,9);
+    function drawPairs(pairs) {
+      for(let i=0;i<pairs.length;i+=2) {
+        const height=Math.max(pairHeight(pairs[i]),pairs[i+1]?pairHeight(pairs[i+1]):0);
+        for(let col=0;col<2&&pairs[i+col];col++) {
+          const [label,value]=pairs[i+col], x=22+col*89, labels=lines(label,77,8);
+          text(labels,x,y,8);text(lines(value,77,10,true),x,y+labels.length*3.2+2,10,true);
+        }
+        y+=height;
+      }
+    }
+    function panel(title,height,tone,paint) {
+      if(y+height>275)header('Riepilogo / continua');
+      const top=y;
+      fill(tones[tone]||tones.white);color('#d7e2eb',true);doc.setLineWidth(.2);
+      doc.roundedRect(16,top-4,178,height+2,2.5,2.5,'FD');
+      fill('#387ba8');doc.roundedRect(20,top+.5,.9,4,0.4,0.4,'F');
+      text(title.toUpperCase(),24,top+4,9,true);
+      y=top+12;paint();y=top+height+4;
+    }
+    const pairsPanel=(title,pairs,tone='white')=>panel(title,16+pairsHeight(pairs),tone,()=>drawPairs(pairs));
+    function drawPlot(curve,options) {
+      const plotY=y, scale=166/1200;
+      paintChart({
+        line:(a,b,c,d,hex,w)=>{color(hex,true);doc.setLineWidth(w*scale);doc.line(22+a*scale,plotY+b*scale,22+c*scale,plotY+d*scale);},
+        dot:(a,b,hex,rad)=>{fill(hex);doc.circle(22+a*scale,plotY+b*scale,rad*scale,'F');},
+        text:(a,b,t,hex,size,align)=>{doc.setFont('helvetica','normal');doc.setFontSize(Math.max(8,size*scale*2.83465));color(hex);doc.text(pdfText(t),22+a*scale,plotY+b*scale,{align:align==='right'?'right':align==='center'?'center':'left'});}
+      },curve,options);
+      y+=500*scale+2;
+    }
+    function plotPanel(title,curve,options,note='') {
+      const noteLines=note?lines(note,166,8):[];
+      panel(title,16+500*166/1200+(noteLines.length?3+noteLines.length*3.2:0),'white',()=>{
+        drawPlot(curve,options);if(noteLines.length)text(noteLines,22,y+2,8);
+      });
+    }
+    const outcomes={completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
+    const outcomeTone=r.outcome==='completed'?'green':r.outcome==='fault'?'red':'amber';
+    header(r.recipeName,true);
+    const reason=lines(r.reason,166,9);
+    panel(outcomes[r.outcome]||r.outcome,16+reason.length*4,outcomeTone,()=>text(reason,22,y,9));
+    pairsPanel('Il ciclo in sintesi',[summary[1],summary[2],summary[3],summary[6],summary[7],summary[8]],'blue');
+    plotPanel('Andamento completo / target e media PT100',points,{startMs:r.startUptimeMs,durationMs:r.durationMs,intervalMs:r.curveIntervalMs},curveMessage);
 
     header('Riepilogo completo');
-    for(let i=0;i<summary.length;i+=2) {
-      const height=Math.max(pair(...summary[i],16),summary[i+1]?pair(...summary[i+1],108):0);
-      y+=height;
-    }
-    const notes=lines(explanation,178,8);
-    if(y+notes.length*3.4+12>275)header('Note di lettura');
-    text('COME LEGGERE I DATI',16,y,9,true);y+=6;text(notes,16,y,8);
-    header('Dettaglio degli step');
-    const labels=['Tempo attivo','Pause','Hold in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in hold'];
-    for(const row of stepRows) {
-      const title=lines(`${row[0]} / Target ${row[1]} / ${row[2]}`,178,11,true);
+    for(const [index,group] of summaryGroups(summary).entries())
+      pairsPanel(group.title,group.pairs,['blue','slate','mint','blue','slate','mint'][index]);
+    const notes=lines(explanation,166,8);
+    panel('Come leggere i dati',16+notes.length*3.4,'white',()=>text(notes,22,y,8));
+    const labels=['Tempo attivo','Pause','Mantenimento in banda / richiesto','Errore medio assoluto',r.version>=3?'Superamento massimo media':'Superamento massimo sonda','Ritardo massimo','PID medio / al limite','Escursione PT100 in mantenimento'];
+    for(const [index,row] of stepRows.entries()) {
+      const phase=phaseCurve(r,points,index), step=r.steps[index];
+      header(`Fase ${index+1} / ${row[0].replace(/^\d+\s*·\s*/,'')} / Target ${row[1]}`);
+      text(row[2],17,y,9,true);y+=8;
       const pairs=labels.map((label,i)=>[label,row[i+3]]);
-      const heights=[];
-      for(let i=0;i<pairs.length;i+=2) heights.push(Math.max(...pairs.slice(i,i+2).map(([a,b])=>lines(a,83,8).length*3.2+lines(b,83,10,true).length*4+7)));
-      ensure(title.length*4.5+heights.reduce((a,b)=>a+b,0)+7);
-      text(title,16,y,11,true);y+=title.length*4.5+4;
-      for(let i=0;i<pairs.length;i+=2) {pair(...pairs[i],16);if(pairs[i+1])pair(...pairs[i+1],108);y+=heights[i/2];}
-      color(palette.grid,true);doc.line(16,y-3,194,y-3);y+=4;
+      pairsPanel('Tempi della fase',pairs.slice(0,3),'blue');
+      const plotNote=!phase.points.length?(step.started?'Curva della fase non disponibile nello storico conservato.':'Fase non iniziata: nessun dato termico.'):'';
+      plotPanel('Grafico della fase / target e media',phase.points,{startMs:phase.startMs,durationMs:phase.durationMs,intervalMs:r.curveIntervalMs},plotNote);
+      pairsPanel('Precisione e comando / fase attiva',pairs.slice(3,7),'slate');
+      const temperaturePairs=(step.stats?.sensors||[]).map((sensor,i)=>[`PT100 #${i+1} / minimo - massimo`,
+        Number.isFinite(sensor.minC)&&Number.isFinite(sensor.maxC)?`${sensor.minC.toFixed(2)} - ${sensor.maxC.toFixed(2)} °C`:'Non disponibile']);
+      if(step.type==='hold')temperaturePairs.push(pairs[7]);
+      pairsPanel('Temperature / fase e sue pause',temperaturePairs,'mint');
+      if(r.curvePartial)text('Storico parziale: alcuni campioni della fase potrebbero non essere disponibili.',17,Math.min(y+1,275),8);
     }
     const pages=doc.getNumberOfPages();
     for(let i=1;i<=pages;i++) {doc.setPage(i);color(palette.grid,true);doc.line(16,281,194,281);
       text(`Ciclo ${r.key} | ${r.firmware}`,16,287,8);text(`${i} / ${pages}`,181,287,8);}
     return doc.output('arraybuffer');
   }
-  return {csv,svg,png,zip,pdf,chartModel,paintChart,elapsed};
+  return {csv,svg,png,zip,pdf,chartModel,paintChart,elapsed,summaryGroups,phaseCurve};
 })();
 if(typeof module!=='undefined')module.exports=OvenExport;
 )OVEN_ASSET_2026";

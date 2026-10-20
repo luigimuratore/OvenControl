@@ -2,11 +2,13 @@
 
 Firmware in una **cartella dedicata**, per ESP32-S3 N16R8, due PT100 reali su MAX31865 e comando del driver di riscaldamento. Riprende dashboard, cablaggio e gestione programmi di `oven-controller-site`, aggiungendo diagnostica delle sonde, configurazione dell'attuatore e un supervisore delle uscite indipendente dal server web.
 
+**Comandi da casa:** [aprire la dashboard via Tailscale/SSH](#dashboard-da-casa) · [compilare, copiare e caricare il firmware](#firmware-da-casa). La guida indica per ogni comando se eseguirlo sul **Mac** o nella **PowerShell Windows** e distingue la password Windows dalla password OTA.
+
 La scheda **TEST** integra il collaudo di `oven-controller-field-test`: puoi verificare sonde, LED, driver e STOP nello stesso firmware, con **resistenze reali scollegate**. La dashboard esegue anche **cicli di riscaldamento**: passa al forno reale dopo aver verificato circuito di comando, cablaggio di potenza e protezioni indipendenti. Il firmware non legge corrente, tensione, feedback dei contatti o un interblocco fisico. Temperatura limite, arresto e sezionamento devono poter agire anche se ESP o attuatore si guastano. Una lettura valida o un LED spento non certificano il circuito di potenza.
 
 ## Funzioni disponibili
 
-- Dashboard locale da telefono/PC, senza dipendenze web esterne, con schede **Dashboard / Programmi / TEST / Log / Report**.
+- Dashboard locale da telefono/PC, senza dipendenze web esterne, con schede **Dashboard / Manuale / Programmi / Parameters / TEST / Log / Report**.
 - Collaudo completo: LED, sequenze, relè da 0,1 s a 10 min, heartbeat, checklist, grafico PT100 e CSV diagnostico.
 - Aggiornamenti Wi-Fi OTA con password, arresto di test/ciclo e blocco delle uscite durante la scrittura.
 - Due PT100 reali: temperatura, resistenza calcolata, RAW, RREF e fault descritti.
@@ -15,7 +17,7 @@ La scheda **TEST** integra il collaudo di `oven-controller-field-test`: puoi ver
 - PID con anti-windup e derivata filtrata, coefficienti modificabili e persistenti.
 - Scelta **SSR / relè meccanico**, finestra di comando e limite di tempo ON configurabili e persistenti.
 - Avvio, pausa, ripresa e STOP; STOP disponibile anche nelle schede Programmi e Log.
-- Limiti su sonde, temperatura, sovraelongazione, durata e freschezza del controllo; differenza sonde indicata a colori.
+- Limiti su sonde, temperatura, sovraelongazione e freschezza del controllo; differenza sonde indicata a colori.
 - Report automatico di fine ciclo: esito, tempi e pause, temperature, errori sul setpoint, hold in banda, configurazione PID/attuatore e download PDF/JSON e curva CSV/PNG; ultimo riepilogo persistente.
 - Grafico live, navigazione dello storico di circa 12 ore, marcatori di inizio/fine/STOP/allarme e CSV completo.
 - Log JSON e seriale; fino a **40 eventi principali** restano dopo un riavvio, secondo lo spazio NVS disponibile.
@@ -32,7 +34,7 @@ Nella scheda **Manuale**, accanto a **Dashboard**, trovi temperature, grafico e 
 3. Imposta **Target cooldown** (default **25 °C**, non superiore al setpoint attuale) e premi **COOLDOWN**: segue la discesa del riferimento con il PID. Può dare calore quando la media PT100 è sotto la curva; a media uguale o superiore al setpoint il comando è zero. Al termine della rampa, quando la sonda più calda è entro target +1 °C, spegne il riscaldamento e resta in monitoraggio fino a STOP. **APPLICA TARGET** può riattivare la regolazione.
 4. **STOP MANUALE** chiude la sessione e lascia l'uscita spenta. Il fungo **EMERGENZA** chiude anche il manuale e blocca nuovi avvii fino al riconoscimento.
 
-Il manuale usa gli stessi **PID, attuatore, finestra SSR e limite di potenza** impostati nella scheda Programmi. Queste impostazioni restano bloccate durante una sessione. La rampa parte dalla media PT100 all'avvio. Durante la regolazione, modificare target/rate mantiene continuo il setpoint; ripartire da un cooldown usa la temperatura attuale. Da **full-1.11** la discesa è regolata: il PID può rallentare il raffreddamento naturale usando le resistenze, ma non può accelerarlo. Nel cooldown manuale, raggiunta la fine della rampa e la temperatura finale, il riscaldamento resta spento anche se in seguito la temperatura scende ancora. Programmi, manuale e TEST sono esclusivi: termina l'attività corrente prima di passare all'altra. Nel manuale non c'è il limite automatico di 12 ore dei Programmi; restano attivi i controlli su sonde, letture scadute, sovratemperatura e supervisore delle uscite.
+Il manuale usa gli stessi **PID, attuatore, finestra SSR e limite di potenza** impostati nella scheda Parameters. Queste impostazioni restano bloccate durante una sessione. La rampa parte dalla media PT100 all'avvio. Durante la regolazione, modificare target/rate mantiene continuo il setpoint; ripartire da un cooldown usa la temperatura attuale. Da **full-1.11** la discesa è regolata: il PID può rallentare il raffreddamento naturale usando le resistenze, ma non può accelerarlo. Nel cooldown manuale, raggiunta la fine della rampa e la temperatura finale, il riscaldamento resta spento anche se in seguito la temperatura scende ancora. Programmi, manuale e TEST sono esclusivi: termina l'attività corrente prima di passare all'altra. Da full-1.16 né Programmi né Manuale hanno un tempo massimo di ciclo; restano attivi i controlli su sonde, letture scadute, sovratemperatura e supervisore delle uscite.
 
 Il controllo continua se chiudi la pagina o perdi il Wi-Fi. Dopo reset o blackout **non riparte automaticamente**: lo stesso registro di sicurezza salva l'attività «Controllo manuale», blocca le uscite al riavvio e richiede riconoscimento e nuovo avvio. Telegram `/status` mostra il manuale, il target, il raffreddamento e il tempo trascorso; avvio, cambio target, cooldown e STOP seguono la modalità notifiche scelta, mentre gli allarmi restano prioritari.
 
@@ -127,33 +129,39 @@ API diagnostiche: `POST /api/test/command` (`enter`, `exit`, `stop` e le azioni 
 
 ## Telegram · configurazione e prova
 
-Il bot risponde a **`/status`**, **`/start`**, **`/help`**, **`/modalita`** e ai tre comandi di modalità soltanto nella chat privata configurata, verificando anche il mittente. `/start` mostra l'aiuto, non avvia un programma. Non esegue comandi su uscite, PID, programmi o riconoscimento emergenze. I messaggi usano **🚀** per avvio ciclo, **⏸️** per pausa, **⏯️** per ripresa, **✅** per lo stato regolare e il completamento, **⚠️** per STOP e interruzioni, **🚨** per emergenze e allarmi. `/status` divide i dati aggiornati in blocchi: stato, ciclo/tempi, temperature, uscita, regolazione, eventuali errori registrati e sistema. **Programma, step, target e tempi compaiono soltanto durante un ciclo avviato o in pausa**; a ciclo fermo il programma selezionato in dashboard e i programmi precedenti restano esclusi. Le notifiche di fine ciclo, STOP e allarme possono invece indicare il programma a cui si riferisce l'evento. Sono riportati anche entrambe le PT100/media/differenza, età letture, GPIO/PID, attuatore/limite, uptime, avvio, RAM e RSSI.
+Il bot risponde a **`/status`**, **`/plot`**, **`/start`**, **`/help`**, **`/modalita`** e ai tre comandi di modalità soltanto nella chat privata configurata, verificando anche il mittente. `/start` mostra l'aiuto, non avvia un programma. Non esegue comandi su uscite, PID, programmi o riconoscimento emergenze. I messaggi usano **🚀** per avvio ciclo, **⏸️** per pausa, **⏯️** per ripresa, **✅** per lo stato regolare e il completamento, **⚠️** per STOP e interruzioni, **🚨** per emergenze e allarmi. `/status` divide i dati aggiornati in blocchi: stato, ciclo/tempi, temperature, uscita, regolazione, eventuali errori registrati e sistema. **Programma, step, target e tempi compaiono soltanto durante un ciclo avviato o in pausa**; a ciclo fermo il programma selezionato in dashboard e i programmi precedenti restano esclusi. Le notifiche di fine ciclo, STOP e allarme possono invece indicare il programma a cui si riferisce l'evento. Sono riportati anche entrambe le PT100/media/differenza, età letture, GPIO/PID, attuatore/limite, uptime, avvio, RAM e RSSI.
+
+**Ora italiana:** da full-1.16 il campo `Aggiornato` di `/status` usa Europe/Rome, con cambio automatico tra ora solare e legale. Non mostra più UTC come se fosse l'ora locale; il timestamp è quello dello snapshot dello stato, non un vecchio evento.
+
+**Grafico `/plot`:** il comando e il pulsante nella tastiera del bot inviano una **foto PNG aggiornata** di target/media PT100 sugli ultimi **30 minuti disponibili**, includendo una lettura corrente. È un'immagine acquisita alla richiesta: un altro `/plot` produce un nuovo aggiornamento. Funziona anche in Manuale e a riposo, in tutte le modalità, senza aprire la dashboard. Lo snapshot ha al massimo 257 punti e una sola richiesta grafico pendente; campioni non validi interrompono la curva. Rendering PNG e upload `sendPhoto` sono sul task Telegram in PSRAM, separati dal PID; non vengono usati servizi grafici esterni. Le richieste scadute o non accodabili sono segnalate. `telegram.plotsSent`, `plotsPending` e `plotsDropped` aiutano la diagnosi. Il firmware registra anche i comandi nel menu della chat autorizzata; `/start` aggiorna la guida e la tastiera. L'anteprima Python usa la libreria standard per creare il PNG. Riferimenti: [sendPhoto](https://core.telegram.org/bots/api#sendphoto), [setMyCommands](https://core.telegram.org/bots/api#setmycommands).
+
+**Avvio sempre visibile:** dopo l'avvio e il ripristino di Wi-Fi/Internet e ora NTP, il bot invia la conferma di avvio firmware con versione e IP Wi-Fi, anche in Essenziale. Anche l'avvio di un Programma o del Manuale è sempre inviato, senza suono. Eventuali emergenze o interruzioni pendenti conservano invece il messaggio di allarme dettagliato. Senza alimentazione o rete l'ESP non può inviare: il messaggio arriva quando la connessione è disponibile.
 
 **Modalità notifiche:** invia `/start` o `/modalita` e scegli uno dei pulsanti nella chat. Sono disponibili anche i comandi diretti:
 
 | Modalità | Comando | Eventi automatici |
 | --- | --- | --- |
-| 🛡️ Essenziale | `/essenziale` | Solo emergenze, allarmi, blackout e report PDF. |
+| 🛡️ Essenziale | `/essenziale` | Emergenze, allarmi, blackout e PDF; avvio ESP e avvio Programmi/Manuale sempre visibili. |
 | 🔔 Sintetica | `/sintetica` | Avvio, pausa/ripresa, STOP e completamento in formato breve; allarmi dettagliati e PDF. |
-| 📋 Dettagliata | `/dettagliata` | Tutti gli eventi con stato completo, allarmi e PDF. |
+| 📋 Dettagliata | `/dettagliata` | Tutti gli eventi con stato completo, avvisi sonde recuperate, allarmi e PDF. |
 
-La modalità iniziale è **Sintetica**, che mantiene il comportamento precedente. La selezione vale da quel momento per i nuovi eventi; passando a Essenziale vengono esclusi anche gli eventi ordinari ancora in coda. Un invio già iniziato può completarsi. **`/status`, aiuto e scelta modalità restano disponibili in tutte le modalità.** Questi comandi cambiano solo le notifiche: non avviano o fermano il forno e non riconoscono gli allarmi. Tutti i comandi richiedono la stessa chat privata, mittente e freschezza già verificati per `/status`.
+La modalità iniziale è **Sintetica**, che mantiene il comportamento precedente. La selezione vale da quel momento per i nuovi eventi; passando a Essenziale vengono esclusi anche gli eventi ordinari ancora in coda. Un invio già iniziato può completarsi. **`/status`, `/plot`, aiuto e scelta modalità restano disponibili in tutte le modalità.** Avvio ESP e avvio del controllo non vengono soppressi passando a Essenziale. Questi comandi cambiano solo le notifiche: non avviano o fermano il forno e non riconoscono gli allarmi. Tutti i comandi richiedono la stessa chat privata, mittente e freschezza già verificati per `/status`.
 
 Sull'ESP la preferenza è salvata in NVS (`tgMode`) solo quando cambia, dal loop principale; il task di rete non accede a NVS né a GPIO/PID. Se il salvataggio fallisce resta attiva la modalità precedente e il bot lo segnala. Nell'anteprima viene salvata atomicamente in `include/telegram_preferences.json`, con permessi privati e file escluso da Git. Le preferenze di ESP e anteprima sono separate: il primo avvio sull'ESP usa Sintetica. Riavviare o inviare `/start` non azzera la scelta salvata.
 
 **Messaggi brevi in Sintetica:** avvio e STOP riportano soltanto icona/evento, **nome del programma** e **giorno/ora italiana dell'evento**, inclusa l'ora legale. Lo stesso formato breve è usato per pausa, ripresa e completamento. In Dettagliata ogni evento allega invece temperature, PID, uscite e tempi al momento dell'evento; emergenze, allarmi e blackout mantengono sempre motivo e stato dettagliato. La data viene fissata alla creazione del messaggio, anche se l'invio avviene dopo; sul firmware senza NTP compare **Orario non sincronizzato**. STOP senza un ciclo attivo non genera una notifica di ciclo fermato.
 
-**Notifiche selettive:** avvio, pausa/ripresa, STOP manuale, completamento, risposte `/status`/aiuto e PDF vengono inviati con `disable_notification=true`: restano nella timeline, ma senza suono. Emergenze, allarmi, **🚨 BLACKOUT** e ciclo interrotto da riavvio usano la notifica normale (`false`); il PDF allegato allo stesso allarme resta silenzioso, evitando un secondo suono. Da **full-1.14**, i fault sonda recuperati restano soltanto nel log locale e non generano messaggi Telegram, in nessuna modalità notifiche. La priorità dell'evento determina la notifica, non l'emoji o il testo: chiedere `/status` durante un allarme non ripete il suono dell'allarme.
+**Notifiche selettive:** avvio, pausa/ripresa, STOP manuale, completamento, risposte `/status`/aiuto e PDF vengono inviati con `disable_notification=true`: restano nella timeline, ma senza suono. Emergenze, allarmi, **🚨 BLACKOUT** e ciclo interrotto da riavvio usano la notifica normale (`false`); il PDF allegato allo stesso allarme resta silenzioso, evitando un secondo suono. Da **full-1.16**, i fault sonda recuperati restano nel log locale e inviano un avviso silenzioso **solo in Dettagliata**. In Essenziale e Sintetica non inviano messaggi. I recuperi falliti conservano il normale allarme in tutte le modalità. La priorità dell'evento determina la notifica, non l'emoji o il testo: chiedere `/status` durante un allarme non ripete il suono dell'allarme.
 
 **Lascia attive le notifiche della chat del bot** e abilita quelle di Telegram sul telefono. Il bot non può scavalcare una chat silenziata, le restrizioni del sistema o Non disturbare, né garantire una consegna immediata senza rete. Secondo la [Bot API](https://core.telegram.org/bots/api#sendmessage), l'invio silenzioso può comunque produrre notifiche visive, banner e badge: elimina il suono, non tutti gli avvisi. Per azzerare anche gli avvisi ordinari servono due destinazioni separate: una timeline silenziata e una chat allarmi con notifiche attive.
 
-Al termine di ogni ciclo avviato (**completamento, STOP o allarme/emergenza**) il bot invia anche un **PDF**, senza richiedere la dashboard aperta. Il file contiene riepilogo, grafico vettoriale **target/media PT100**, dettaglio degli step e note. Il nome include l’esito: `Completed_Nome_programma_2026-10-09_16-30-00.pdf` per un ciclo completato, `Stopped_...pdf` per STOP e `Error_...pdf` per allarme/emergenza, con **data/ora italiana di fine ciclo**, inclusa l'ora legale. Un semplice STOP senza un ciclo avviato non genera PDF. Sull'ESP senza NTP il nome usa `senza_orario_avvio-<boot>_<uptime>` e gli orari restano indicati come non sincronizzati.
+Al termine di ogni ciclo avviato (**completamento, STOP o allarme/emergenza**) il bot invia anche un **PDF**, senza richiedere la dashboard aperta. Il file contiene grafico vettoriale completo **target/media PT100**, riepilogo diviso in sezioni e **una pagina per ogni fase, con grafico dedicato** e dati della fase. Il nome include l’esito: `Completed_Nome_programma_2026-10-09_16-30-00.pdf` per un ciclo completato, `Stopped_...pdf` per STOP e `Error_...pdf` per allarme/emergenza, con **data/ora italiana di fine ciclo**, inclusa l'ora legale. Un semplice STOP senza un ciclo avviato non genera PDF. Sull'ESP senza NTP il nome usa `senza_orario_avvio-<boot>_<uptime>` e gli orari restano indicati come non sincronizzati.
 
-Il loop copia soltanto uno snapshot del report e della curva in PSRAM; generazione PDF e upload HTTPS multipart sono eseguiti dal task Telegram, separato dal controllo. Un nuovo ciclo non modifica gli allegati accodati. Ci sono al massimo **4 report pendenti** (3 in coda e uno nel task), con buffer PDF limitato a **768 KiB**; i PDF precedono soltanto il polling, mentre allarmi, risposte e notifiche hanno la precedenza. Un nuovo allarme interrompe l'upload al successivo blocco di scrittura; una chiamata di rete già in corso può attendere il suo timeout. Dalla versione **full-1.6** la risposta HTTP viene letta anche quando è già stata ricevuta e conservata nel buffer del client insieme alle intestazioni: questo evita di ritentare PDF già consegnati. Un ciclo già accodato non viene accodato nuovamente (identità avvio/boot, ultime 16 identità). Gli allegati vengono ritentati con lo stesso file per un massimo di **24 ore** solo se l'upload non ha ancora tentato di scrivere il delimitatore multipart finale, oppure se Telegram risponde esplicitamente **429** (rispettando `retry_after`). Se la conferma si perde dopo il possibile invio completo, o arriva un errore 5xx, l'esito è **incerto**: il PDF viene tolto dalla coda e non reinviato automaticamente, con un unico avviso silenzioso. Gli errori 4xx permanenti fermano quel report. Questa scelta evita duplicati ma può lasciare un PDF da scaricare manualmente se il server non lo aveva ricevuto. Le code sono in RAM: riavvio, mancanza di PSRAM o coda piena possono impedire l'invio. Il report della dashboard resta scaricabile. `/api/status` espone `telegram.reportsUnconfirmed` e `telegram.duplicateReportsSkipped` oltre ai contatori già presenti; gli esiti incerti sono inclusi anche nei report scartati, senza contarli come inviati. Al riavvio non si invia automaticamente un vecchio report.
+Il loop copia soltanto uno snapshot del report e della curva in PSRAM; generazione PDF e upload HTTPS multipart sono eseguiti dal task Telegram, separato dal controllo. Un nuovo ciclo non modifica gli allegati accodati. Ci sono al massimo **4 report pendenti** (3 in coda e uno nel task), con buffer PDF limitato a **768 KiB**; allarmi, risposte e notifiche hanno la precedenza sugli allegati; il polling mantiene un proprio intervallo. Un nuovo allarme interrompe l'upload al successivo blocco di scrittura; una chiamata di rete già in corso può attendere il suo timeout. Dalla versione **full-1.6** la risposta HTTP viene letta anche quando è già stata ricevuta e conservata nel buffer del client insieme alle intestazioni: questo evita di ritentare PDF già consegnati. Uno stesso report già accodato non viene accodato nuovamente (identità boot/avvio/fine, ultime 16 identità). Una continuazione esplicita può produrre un nuovo report finale con un istante di fine diverso. Gli allegati vengono ritentati con lo stesso file per un massimo di **24 ore** solo se l'upload non ha ancora tentato di scrivere il delimitatore multipart finale, oppure se Telegram risponde esplicitamente **429** (rispettando `retry_after`). Se la conferma si perde dopo il possibile invio completo, o arriva un errore 5xx, l'esito è **incerto**: il PDF viene tolto dalla coda e non reinviato automaticamente, con un unico avviso silenzioso. Gli errori 4xx permanenti fermano quel report. Questa scelta evita duplicati ma può lasciare un PDF da scaricare manualmente se il server non lo aveva ricevuto. Le code sono in RAM: riavvio, mancanza di PSRAM o coda piena possono impedire l'invio. Il report della dashboard resta scaricabile. `/api/status` espone `telegram.reportsUnconfirmed` e `telegram.duplicateReportsSkipped` oltre ai contatori già presenti; gli esiti incerti sono inclusi anche nei report scartati, senza contarli come inviati. Al riavvio non si invia automaticamente un vecchio report.
 
 L'anteprima Python riusa **lo stesso generatore jsPDF della dashboard**, tramite `scripts/report_pdf.cjs`: serve Node.js sul Mac (viene rilevato anche il runtime di ChatGPT, se presente). Legge report e curva da localhost con verifica della chiave, evitando invii ripetuti dello stesso report durante la connessione. Anche l'anteprima elimina dalla coda un upload con conferma persa o errore permanente: il solo errore di invio ritentabile è un rifiuto esplicito 429; urllib non permette di distinguere un timeout prima dell'invio da uno dopo la consegna. Senza orari simulati il nome file usa l'ora reale italiana di acquisizione del report. Le notifiche e la didascalia PDF indicano **ANTEPRIMA SIMULATA**. Il firmware genera autonomamente il PDF e non richiede Python, Node.js o un computer acceso.
 
-Le notifiche automatiche includono **avvio del ciclo con nome del programma**, pausa/ripresa, STOP, completamento, arresto per allarme ed **EMERGENZA**. Un `0x04` PT100 recuperato non invia messaggi; se il recupero fallisce, resta il normale allarme. All'avvio si segnala anche un ciclo interrotto o un'emergenza rimasta bloccata. Gli allarmi sono accodati dopo lo spegnimento del comando uscite.
+Le notifiche automatiche includono **avvio del ciclo con nome del programma**, pausa/ripresa, STOP, completamento, arresto per allarme ed **EMERGENZA**. Un `0x04` PT100 recuperato invia un avviso solo in Dettagliata; se il recupero fallisce, resta il normale allarme in tutte le modalità. All'avvio si segnala anche un ciclo interrotto o un'emergenza rimasta bloccata. Gli allarmi sono accodati dopo lo spegnimento del comando uscite.
 
 ### 1. Associare il bot alla propria chat
 
@@ -241,112 +249,144 @@ All'avvio dell'aggiornamento autenticato si fermano ciclo e prove; tutte le usci
 
 **Cambio della password OTA:** la password è compilata nel firmware. Modificare soltanto `include/ota_config.h` non cambia né l'ESP né un `firmware.bin` già preparato. Conserva la password attualmente installata, imposta quella nuova nel file (16..64 lettere, numeri, `_` o `-`), ricompila e sostituisci il binario sul PC Windows. Nel caricamento con `espota.py` descritto sotto, al prompt inserisci la **vecchia password**, che autentica l'aggiornamento sul firmware ancora installato. Dopo un aggiornamento riuscito e il riavvio, l'ESP usa la **nuova password**. Non usare il normale `pio ... -t upload` dopo aver cambiato il file: lo script locale usa già la nuova password per l'autenticazione. Se non conosci la vecchia password, serve un caricamento USB.
 
-### Upload da casa tramite VPN / Tailscale
+### Accesso da casa: dashboard e aggiornamento firmware
 
-**Prima dell'upload, ferma Programmi, Manuale e TEST e scarica i dati che vuoi conservare:** l'aggiornamento riavvia l'ESP, svuota lo storico in RAM e non riprende il controllo precedente. Una compilazione con `pio run` senza `-t upload` prepara soltanto il firmware e non contatta il forno. Tailscale non viene installato sull'ESP: il collegamento passa da un router VPN oppure da un PC/Raspberry Pi/NAS al capannone. La VPN deve essere già configurata; questi comandi non la installano né modificano la rete.
+Questa è la procedura per il setup già configurato: **Mac di casa → Tailscale → PC Windows del capannone → ESP**.
 
-Gli esempi usano **`192.168.1.190` come IP LAN del forno**: sostituiscilo con quello attuale e, se possibile, riservalo nel DHCP del router. **`pc-capannone`** è il nome Tailscale del computer al capannone, oppure il suo IP VPN `100.x.y.z`; **`utente`** è l'utente SSH di quel computer. Il nome/IP Tailscale del computer ponte non è l'indirizzo dell'ESP.
+| Dato | Valore attuale |
+|---|---|
+| Utente Windows per SSH | `oriana` |
+| IP Tailscale del PC Windows | `100.89.40.5` |
+| IP LAN del forno | `192.168.1.190` |
+| Dashboard sul Mac, con tunnel aperto | <http://127.0.0.1:8085/> |
 
-#### Aprire la dashboard dal Mac tramite il PC Windows
+Tailscale deve essere connesso sui due computer. Il PC Windows deve essere acceso, non in sospensione e collegato alla rete del forno; OpenSSH Server deve essere attivo. Non occorre reinstallare SSH o Python ogni volta. Se cambiano gli indirizzi, aggiorna i valori nei comandi; conviene riservare l'IP del forno nel DHCP del router.
 
-Se `http://192.168.1.190/` funziona dal PC del capannone ma non dal Mac, puoi usare un **tunnel SSH per la dashboard**, senza configurare un subnet router. Occorre che entrambi i computer siano online in Tailscale e che OpenSSH Server sia già attivo e raggiungibile sul PC Windows. L'utente SSH deve essere autorizzato all'inoltro TCP; la configurazione standard OpenSSH lo permette, mentre una policy aziendale può limitarlo.
+<a id="dashboard-da-casa"></a>
 
-**Procedura da seguire ogni volta, per il setup attuale:**
+#### 1. Aprire la dashboard da casa — Terminale A del Mac
 
-1. Verifica che **Tailscale sia connesso sul Mac e sul PC del capannone**. Il PC Windows deve essere acceso, collegato alla rete del forno e non in sospensione. OpenSSH Server deve essere attivo; non serve reinstallarlo a ogni collegamento.
-2. Sul Mac apri Terminale ed esegui il comando seguente. L'utente Windows corretto è **`oriana`** e l'IP Tailscale del PC è **`100.89.40.5`**:
+Nel **Terminale del Mac** esegui:
 
-   ```sh
-   ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8085:192.168.1.190:80 oriana@100.89.40.5
-   ```
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8085:192.168.1.190:80 oriana@100.89.40.5
+```
 
-3. Inserisci la **password dell'account locale Windows `oriana`**, non il PIN di sblocco né la password Tailscale. Mentre la scrivi non vengono mostrati caratteri o asterischi: è normale. Premi Invio. Se la connessione riesce, il terminale resta in attesa senza mostrare un nuovo prompt: **lascialo aperto**.
-4. Apri sul Mac **<http://127.0.0.1:8085/>**. Puoi salvare questo indirizzo nei preferiti; funziona mentre il tunnel è aperto.
-5. Quando hai finito, premi **Ctrl+C** nel terminale. Si chiude soltanto il tunnel: **il ciclo del forno continua**. Alla prossima connessione ripeti questi passaggi.
+Inserisci la **password Windows dell'utente `oriana`**, non il PIN e non la password Tailscale. Durante la digitazione non compaiono caratteri o asterischi. Dopo Invio il terminale rimane fermo senza un nuovo prompt: è normale, **lascialo aperto**.
 
-La pagina mostra la dashboard reale dell'ESP, con gli stessi comandi del collegamento locale. Non è l'anteprima Python. Il collegamento passa da Mac → Tailscale/SSH → PC Windows → ESP; non riavvia né aggiorna il forno. Il tunnel ascolta solo sul Mac, sull'indirizzo di loopback. Se cambiano l'utente Windows, l'IP Tailscale del PC o l'IP LAN dell'ESP, aggiorna i rispettivi valori nel comando; `192.168.1.190` è l'indirizzo del forno, non del PC.
+Apri sul Mac **<http://127.0.0.1:8085/>**; puoi salvarlo nei preferiti. È la dashboard reale del forno, con gli stessi comandi del collegamento locale. Non è l'anteprima Python. Questo collegamento non riavvia né aggiorna l'ESP.
 
-Se la porta 8085 è già occupata, scegline un'altra nel comando e nel link. `Connection refused`/timeout sulla porta 22 indicano un problema nell'accesso SSH al PC; `administratively prohibited` indica un divieto di inoltro TCP sul server SSH. `Permission denied` richiede di verificare nome utente, password e autorizzazioni SSH. Se compare `channel ... open failed: connect failed` oppure il browser mostra una connessione reimpostata, il tunnel non riesce a raggiungere la destinazione: verifica di nuovo dal PC Windows che `http://192.168.1.190/` si apra e controlla con PowerShell `Test-NetConnection 192.168.1.190 -Port 80`. `ExitOnForwardFailure=yes` non garantisce che il forno sia raggiungibile: controlla l'apertura iniziale dell'inoltro. Per aprire direttamente `http://192.168.1.190/` dal Mac, senza tunnel, serve invece l'accesso tramite subnet router descritto sotto.
+Per chiudere il tunnel premi **Ctrl+C** nel Terminale A. Il ciclo del forno continua autonomamente. La porta 8085 ascolta soltanto sul Mac, sull'indirizzo di loopback. Il tunnel inoltra la dashboard HTTP, non ArduinoOTA; per il firmware segui il punto 2.
 
-Questo tunnel inoltra la **dashboard HTTP**, non il protocollo ArduinoOTA: per caricare il firmware usa la procedura Windows seguente. Riferimenti: [inoltro locale OpenSSH](https://man.openbsd.org/ssh.1#L) e [configurazione OpenSSH su Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration).
+<a id="firmware-da-casa"></a>
 
-#### Metodo consigliato per il tuo setup: progetto sul Mac, solo upload sul PC Windows
+#### 2. Aggiornare il firmware da casa — Terminale B del Mac
 
-Il progetto e tutte le configurazioni restano sul Mac. **Sul PC Windows non servono il repository o PlatformIO:** bastano Python 3 e due file, il firmware già compilato e l'uploader ufficiale ESP32 `espota.py`. Wi-Fi, Telegram e gli altri parametri compilati sono già inclusi nel binario; trattalo come un file privato.
+**Prima dell'upload:** dalla dashboard ferma Programmi, Manuale e TEST e scarica report/CSV che vuoi conservare. L'aggiornamento riavvia l'ESP, cancella lo storico in RAM e non riprende il controllo precedente.
 
-Tailscale deve essere attivo sui due computer e consentire il loro collegamento. Per eseguire comandi sul PC Windows da casa serve anche **un desktop remoto già configurato oppure OpenSSH Server per Windows**; accedere allo stesso account Tailscale non apre automaticamente un terminale o un desktop. Vedi [connessioni ai dispositivi Tailscale](https://tailscale.com/docs/how-to/connect-to-devices) e [OpenSSH Server su Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_install_firstuse).
-
-**1. Compila sul Mac e prepara i due file**, senza contattare l'ESP:
+**A. Compila sul Mac.** Lascia aperto il Terminale A della dashboard e apri un **secondo Terminale del Mac**, il Terminale B:
 
 ```sh
 cd "/Users/gigi/Documents/PROJECTS/Forno oriana/firmware/oven-controller-full"
-pio run -e esp32-s3-n16r8-ota
+"$HOME/.platformio/penv/bin/pio" run -e esp32-s3-n16r8-ota
+```
+
+Aspetta **SUCCESS**. Se la compilazione fallisce, fermati: non copiare né caricare un vecchio binario. Questo comando compila soltanto e non contatta l'ESP. I file privati Wi-Fi, Telegram e OTA devono essere quelli del forno; Git non li recupera.
+
+**B. Prepara e copia i file**, sempre nel Terminale B del Mac, soltanto dopo SUCCESS:
+
+```sh
 mkdir -p output/ota-upload
 cp .pio/build/esp32-s3-n16r8-ota/firmware.bin output/ota-upload/firmware.bin
 cp "$HOME/.platformio/packages/framework-arduinoespressif32/tools/espota.py" output/ota-upload/espota.py
 shasum -a 256 output/ota-upload/firmware.bin
+scp output/ota-upload/firmware.bin output/ota-upload/espota.py oriana@100.89.40.5:Downloads/
 ```
 
-I file privati locali devono essere quelli effettivamente usati dal forno. La password OTA richiesta all'upload deve corrispondere al firmware **attualmente installato** sull'ESP. Se hai personalizzato la cartella PlatformIO, adatta il percorso di `espota.py`. Non usare `bootloader.bin`, `partitions.bin` o un'immagine combinata al posto di `firmware.bin`.
+Per SCP inserisci la **password Windows di `oriana`**. Conserva il valore SHA256 visualizzato: servirà per confrontare il file ricevuto. Trasferisci `firmware.bin`, non `bootloader.bin`, `partitions.bin` o un'immagine combinata. Il binario contiene anche le configurazioni private compilate: trattalo come un file privato. Sul PC Windows non servono il progetto o PlatformIO.
 
-**2. Trasferisci `firmware.bin` e `espota.py` al PC Windows** tramite [Taildrop](https://tailscale.com/docs/features/taildrop?tab=windows) oppure SCP. Con OpenSSH Server già abilitato sul PC, dal Mac puoi copiarli nella cartella Downloads dell'utente remoto:
+**C. Entra nella PowerShell del PC Windows**, dal Terminale B del Mac:
 
 ```sh
-scp output/ota-upload/firmware.bin output/ota-upload/espota.py utente@pc-capannone:Downloads/
-ssh -t utente@pc-capannone
+ssh -t oriana@100.89.40.5 powershell -NoProfile
 ```
 
-Con Taildrop seleziona e invia i due file da `output/ota-upload`; su Windows verifica dove sono stati ricevuti. I comandi successivi assumono che siano in `$HOME\Downloads`. **SSH/SCP sono un'alternativa a Taildrop più desktop remoto**, non un requisito aggiuntivo quando hai già accesso al desktop Windows. Su Windows usa **PowerShell**; se SSH apre `cmd.exe`, esegui prima `powershell`.
+Inserisci ancora la **password Windows di `oriana`**. Quando compare un prompt come `PS C:\Users\Oriana>`, stai eseguendo comandi **sul PC Windows del capannone**.
 
-**3. Sul PC Windows**, nella sessione PowerShell raggiunta da casa, prepara la cartella e verifica lo stato del forno:
-
-```powershell
-New-Item -ItemType Directory -Force "$HOME\oven-upload"
-Copy-Item "$HOME\Downloads\firmware.bin" "$HOME\oven-upload\firmware.bin" -Force
-Copy-Item "$HOME\Downloads\espota.py" "$HOME\oven-upload\espota.py" -Force
-Set-Location "$HOME\oven-upload"
-$ovenPython = (py -3 -c "import sys; print(sys.executable)").Trim()
-& $ovenPython --version
-Get-FileHash .\firmware.bin -Algorithm SHA256
-Invoke-RestMethod -Uri "http://192.168.1.190/api/status" -TimeoutSec 10 | Select-Object firmware, phase, relay, otaUpdating, manual, test
-```
-
-Confronta l'hash con quello del Mac per verificare di avere lo stesso binario. Se `py` non è disponibile ma `python --version` mostra Python 3, imposta `$ovenPython = "python"`. Se Python non è installato, nella PowerShell Windows puoi installarlo per l'utente corrente con [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/install):
+**D. Controlla file, Python e stato del forno**, nella PowerShell Windows appena aperta:
 
 ```powershell
-winget install --exact --id Python.Python.3.13 --source winget --scope user --silent --location "$env:LOCALAPPDATA\Programs\Python\Python313" --accept-package-agreements --accept-source-agreements
-```
-
-Aspetta il completamento, poi usa il percorso completo per evitare problemi con il PATH della sessione SSH già aperta:
-
-```powershell
+Set-Location "$HOME\Downloads"
 $ovenPython = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
 & $ovenPython --version
+Get-Item .\firmware.bin, .\espota.py
+Get-FileHash .\firmware.bin -Algorithm SHA256
+Invoke-RestMethod "http://192.168.1.190/api/status" |
+    Select-Object firmware, phase, relay, otaUpdating, manual, test |
+    ConvertTo-Json -Depth 5
 ```
 
-Se WinGet non è disponibile, installa [Python 3 su Windows](https://docs.python.org/3/using/windows.html) dal PC e imposta `$ovenPython` al percorso del suo `python.exe`. Non servono pacchetti Python aggiuntivi. `$ovenPython` va impostato di nuovo se apri una nuova PowerShell.
+L'hash deve coincidere con quello del Mac. Per procedere: `phase` diversa da `running` e `paused`, `relay: false`, `manual.active: false`, `test.running: false` e `otaUpdating: false`. Se un controllo è attivo, fermalo e salva i dati prima di proseguire. Se Python o i file non vengono trovati, non avviare l'upload; vedi le istruzioni di prima configurazione sotto.
 
-Prima di continuare, il controllo deve essere fermo: `phase` diversa da `running` e `paused`, `relay: false`, `manual.active: false`, `test.running: false` e `otaUpdating: false`. Se è attivo, fermalo dalla dashboard e scarica i dati prima dell'aggiornamento.
-
-**4. Avvia solo l'upload, dal PC Windows**, usando l'IP LAN dell'ESP:
+**E. Carica il firmware**, sempre nella stessa PowerShell Windows:
 
 ```powershell
 & $ovenPython -c "import getpass,sys,espota; sys.exit(espota.main(['-i','192.168.1.190','-p','3232','-P','3233','-r','-a',getpass.getpass('Password OTA: '),'-f','firmware.bin']))"
 ```
 
-Il comando usa l'uploader ufficiale copiato dal Mac e chiede la password senza inserirla nella riga di comando o nella cronologia. Non abilitare `--debug`, perché l'uploader può stampare la password. Se la sessione avvisa che la password non può essere nascosta, interrompi prima di inserirla e usa una console PowerShell interattiva via desktop remoto.
+Al prompt **Password OTA** inserisci la password del firmware attualmente installato sull'ESP, configurata sul Mac in `include/ota_config.h`. **È diversa dalla password Windows.** Non inserirla nella riga di comando o in Git e non abilitare `--debug`, che può stamparla. Se compare un avviso che la password non può essere nascosta, interrompi con Ctrl+C prima di inserirla e usa una console PowerShell interattiva via desktop remoto.
 
-Il **firewall Windows deve consentire a Python di ricevere TCP 3233 dall'IP LAN dell'ESP**, sul profilo di rete appropriato del capannone; UDP 3232 deve raggiungere l'ESP. La porta 3233 deve essere libera. Il trasferimento OTA e la connessione di ritorno restano sulla LAN del forno: **non serve modificare SNAT o creare una rotta ESP → Mac di casa**. Per questo metodo basta raggiungere il PC Windows tramite Tailscale; per la dashboard sul Mac usa il tunnel SSH descritto sopra oppure il subnet router/VPN descritto sotto.
+Aspetta la fine di `Uploading` senza chiudere il terminale. Il trasferimento e la connessione di ritorno restano sulla LAN del capannone: non servono altre rotte VPN o modifiche a SNAT per questo metodo.
 
-Se compare **`Authenticating...OK` seguito da `No response from device`**, la password è corretta ma l'uploader non ha ricevuto la connessione TCP di ritorno dall'ESP: il trasferimento del firmware non è ancora iniziato. Nel setup Windows questa condizione è stata risolta con la seguente regola firewall, limitata al programma Python, alla porta 3233 e all'IP del forno. Eseguila **una sola volta in PowerShell con privilegi di amministratore** sul PC del capannone, poi ripeti l'upload:
+**F. Verifica il riavvio**, sempre nella PowerShell Windows, dopo che il forno torna raggiungibile:
+
+```powershell
+Invoke-RestMethod "http://192.168.1.190/api/status" |
+    Select-Object firmware, phase, relay, otaUpdating
+```
+
+Controlla la versione appena compilata, `relay: false` e `otaUpdating: false`; aggiorna anche la dashboard nel browser del Mac. Per uscire da Windows scrivi `exit`; se rimane una shell remota, scrivi `exit` una seconda volta. Nel Terminale A premi Ctrl+C per chiudere anche il tunnel della dashboard. Puoi poi disconnettere Tailscale sul Mac. Nessuna di queste disconnessioni interrompe il controllo del forno.
+
+#### Solo la prima volta o se qualcosa non funziona
+
+Python 3.13 e la regola firewall sono già stati configurati sul PC Windows di questo setup. Non ripetere l'installazione a ogni upload; `$ovenPython` va invece impostato ogni volta che apri una nuova PowerShell.
+
+<details>
+<summary>Python non trovato su Windows</summary>
+
+Se hai già un altro Python 3, imposta `$ovenPython` al percorso del suo `python.exe`. Per una nuova installazione per l'utente corrente usa [WinGet](https://learn.microsoft.com/en-us/windows/package-manager/winget/install) nella PowerShell Windows:
+
+```powershell
+winget install --exact --id Python.Python.3.13 --source winget --scope user --silent --location "$env:LOCALAPPDATA\Programs\Python\Python313" --accept-package-agreements --accept-source-agreements
+```
+
+Aspetta il completamento, poi ripeti i comandi del punto D. Il percorso completo evita problemi con il PATH della sessione SSH già aperta. Non servono pacchetti Python aggiuntivi. Se WinGet non è disponibile, installa [Python 3 su Windows](https://docs.python.org/3/using/windows.html) dal PC.
+
+</details>
+
+<details>
+<summary>Authenticating...OK, poi No response from device</summary>
+
+La password è corretta ma l'uploader non ha ricevuto la connessione TCP di ritorno dall'ESP; il trasferimento non è ancora iniziato. Il firewall deve consentire TCP 3233 in ingresso a Python dall'IP del forno. Nel setup attuale è bastata questa regola, da creare **una sola volta in PowerShell con privilegi di amministratore sul PC Windows**:
 
 ```powershell
 New-NetFirewallRule -Name "OvenControl-OTA-TCP3233" -DisplayName "OvenControl OTA dal forno" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3233 -RemoteAddress 192.168.1.190 -Program "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe" -Profile Any
 ```
 
-Il percorso è quello dell'installazione Python 3.13 per l'utente corrente: adattalo se usi un altro interprete. La regola vale anche se la LAN Windows è classificata come pubblica, mantenendo i vincoli su programma, porta e IP remoto. Non disabilitare il firewall. Se cambia l'IP del forno o il percorso di Python, aggiorna la regola. Riferimento: [New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule).
+La regola è limitata al programma Python, alla porta 3233 e all'IP del forno anche se la LAN Windows è classificata come pubblica. Se cambia l'IP o il percorso di Python, aggiorna la regola. Non disabilitare il firewall. La porta 3233 deve essere libera; UDP 3232 deve raggiungere l'ESP. Dopo aver corretto il problema, ripeti dal punto D. Riferimento: [New-NetFirewallRule](https://learn.microsoft.com/en-us/powershell/module/netsecurity/new-netfirewallrule).
 
-Per gli aggiornamenti successivi ricompila sul Mac, trasferisci il nuovo `firmware.bin` sostituendo quello precedente, verifica l'hash e ripeti il comando sul PC Windows. `espota.py` può restare sul PC; ricopialo quando aggiorni la piattaforma ESP32. Dopo l'upload controlla versione e uscita spenta come descritto in fondo a questa sezione.
+</details>
+
+| Problema | Cosa verificare |
+|---|---|
+| Timeout/connessione rifiutata sulla porta 22 | PC acceso, Tailscale connesso su entrambi e OpenSSH Server attivo. |
+| `Permission denied` | Nome utente `oriana`, password Windows e autorizzazioni SSH. |
+| Dashboard: `channel ... open failed: connect failed` | Dal PC Windows apri `http://192.168.1.190/` e prova `Test-NetConnection 192.168.1.190 -Port 80`. |
+| Dashboard: `administratively prohibited` | Il server SSH deve consentire l'inoltro TCP. |
+| Porta locale 8085 occupata | Cambia 8085 sia nel comando del tunnel sia nel link sul Mac. |
+| `Authentication Failed` nell'upload OTA | Serve la password installata sull'ESP, non quella Windows; controlla il file privato locale. |
+
+Il tunnel della dashboard non richiede un subnet router. Per aprire direttamente l'IP LAN dell'ESP dal Mac o usare OTA diretto attraverso la VPN, consulta le alternative sotto. Riferimenti: [inoltro locale OpenSSH](https://man.openbsd.org/ssh.1#L) e [OpenSSH su Windows](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh-server-configuration).
 
 #### Alternativa: progetto e PlatformIO anche sul computer al capannone
 
@@ -407,7 +447,7 @@ Lo script `scripts/configure_ota.py` conserva questo flag e aggiunge password e 
 
 #### Dopo l'upload e diagnosi dei problemi
 
-Attendi che l'ESP torni raggiungibile, ricarica la dashboard e controlla la **versione firmware in basso a sinistra**, l'uscita spenta e le letture delle sonde. Se compare un blocco da riconoscere, usa **RESET ERRORI** dopo aver ripristinato le condizioni richieste. Nessun nuovo controllo parte automaticamente. In caso di upload fallito, verifica la versione effettivamente in esecuzione prima di riprovare.
+Attendi che l'ESP torni raggiungibile, ricarica la dashboard e controlla la **versione firmware in basso a sinistra**, l'uscita spenta e le letture delle sonde. Se compare un blocco da riconoscere, usa **RESET & BLOCK** dopo aver ripristinato le condizioni richieste. Nessun nuovo controllo parte automaticamente. In caso di upload fallito, verifica la versione effettivamente in esecuzione prima di riprovare.
 
 | Sintomo | Verifica |
 |---|---|
@@ -421,7 +461,7 @@ Attendi che l'ESP torni raggiungibile, ricarica la dashboard e controlla la **ve
 
 1. Installa questa versione e completa il collaudo di sonde, LED, driver e STOP nella scheda **TEST**, con resistenze reali scollegate.
 2. Premi **Esci da TEST**, poi verifica entrambe le letture reali a riposo.
-3. In **Programmi → Attuatore e limite potenza**, scegli il componente realmente installato, una finestra compatibile con il circuito e il limite di comando per la prova. Premi **Salva comando sull'ESP**.
+3. In **Parameters → Attuatore e limite potenza**, scegli il componente realmente installato, una finestra compatibile con il circuito e il limite di comando per la prova. Premi **Salva comando sull'ESP**.
 4. Controlla il programma iniziale **Prova a 50 C**: rampa a **50 °C a 1 °C/min**, mantenimento **10 min in banda**, raffreddamento a **35 °C con riferimento 1 °C/min**. Questo profilo è un punto di partenza per il collaudo termico, non un programma di produzione validato.
 5. Conferma nella dashboard **CHECK HARDWARE/AMBIENTE EFFETTUATO**, poi avvia il ciclo sotto sorveglianza. La conferma è richiesta per ogni nuovo avvio e non viene conservata al refresh.
 6. Verifica risposta termica, pausa, ripresa, STOP e allarmi; salva CSV e log prima di spegnere. Tara PID e profili con prove sul forno effettivo prima di usare materiali di produzione.
@@ -442,7 +482,20 @@ Modifica le variabili all’inizio di `data/style.css`, nel blocco `:root`:
 
 Il server Python legge direttamente i file: salva e ricarica la pagina. Sull’ESP occorre ricompilare e caricare il firmware perché il CSS è incorporato in flash.
 
-## Programmi e PID
+## Programmi, Parameters e PID
+
+Da **full-1.18**, la scheda **Programmi** contiene l'editor dei profili. **Parameters**, subito dopo Programmi, raccoglie **Tuning PID**, **Attuatore e limite potenza** (con la stessa grafica precedente) e **Blocchi termici configurabili**. Manuale/Programmi e TEST/Log sono racchiusi in due gruppi con contorno; Dashboard, Parameters e Report restano singoli.
+
+In Parameters puoi abilitare o disabilitare separatamente:
+
+- **ΔT sonde:** `abs(PT100 #1 − PT100 #2) > soglia`; inizialmente **attivo oltre 30 °C**.
+- **Media − target:** `(PT100 #1 + PT100 #2)/2 − setpoint istantaneo > soglia`; inizialmente **attivo oltre 10 °C**. Il confronto è con segno: stare sotto il target non causa questo blocco.
+
+Le soglie sono numeriche da 0,1 a 430 °C; l'uguaglianza non fa scattare il blocco. Premi **Salva blocchi sull'ESP**: interruttori e soglie vengono salvati insieme in NVS e ricaricati dopo il riavvio. La riga **Impostazioni applicate** indica la configurazione effettiva, distinta dalle modifiche non salvate. Le modifiche sono bloccate durante Programmi, Manuale, pausa, TEST e OTA. Su un firmware precedente senza questa API il salvataggio è disabilitato.
+
+Entrambi i blocchi si applicano anche a pausa e cooldown di Programmi/Manuale, prima di comandare il PID. Se il raffreddamento naturale è più lento della curva e la media supera la soglia abilitata, il cooldown viene fermato anche con uscita già spenta: scegli una soglia adeguata oppure disabilita quel blocco **a controllo fermo** per consentire quel ritardo. TEST mantiene la diagnostica separata. Il limite assoluto individuale di 415 °C, i controlli di validità/freschezza delle sonde, EMERGENZA e i blocchi del supervisore non sono disattivati da questi due interruttori.
+
+`POST /api/protections` riceve `probeDeltaEnabled`, `maxProbeDeltaC`, `meanOvershootEnabled`, `maxMeanOvershootC`. Le abilitazioni devono essere booleani JSON e le soglie numeri finiti. Un salvataggio fallito lascia applicate le impostazioni precedenti; dati salvati illeggibili/non validi fanno usare i default attivi 30/10 con avviso nel log. `/api/status.protections` e Telegram `/status` mostrano la configurazione. **RESET & CONTINUE** verifica le soglie attualmente abilitate, oltre alle sonde sane e al limite assoluto; modificare questi blocchi a forno fermo non cancella il punto di recupero.
 
 L'editor accetta target **0–400 °C**, rampa almeno **0,1 °C/min**, mantenimento **1–360 minuti interi**. Il rate non ha un massimo software, ma il forno può seguire una rampa più lentamente. Dopo il primo step, una rampa deve salire rispetto al target precedente, un cooldown deve scendere e un hold deve conservare il target precedente. Le modifiche ai programmi, al PID e all'attuatore sono consentite solo a ciclo fermo. Le bozze della pagina non modificano la memoria ESP finché non premi Salva; la pagina impedisce di avviare con programmi non salvati.
 
@@ -456,9 +509,9 @@ L'editor accetta target **0–400 °C**, rampa almeno **0,1 °C/min**, mantenime
 
 La stima per una rampa seguita da hold usa la stessa banda ±5 °C dell'ingresso: considera sia la sonda sotto il limite inferiore sia quella sopra il limite superiore. La dashboard spiega quando il riferimento è arrivato al target ma aspetta ancora le sonde. `/api/status` espone `stepTransitionToHold`, `stepCompletionBandC`, `stepCompletionTarget` e `stepWaitingForTemperature`. La correzione è identificata da **`firmware: full-1.5`** (inclusa anche in `full-1.6`); non modifica un ciclo già in esecuzione sul firmware precedente e richiede un nuovo caricamento a ciclo fermo.
 
-**Da full-1.10, PAUSA mantiene con il PID la media PT100 rilevata quando premi il pulsante**, entro il range di target 0–400 °C, e congela l’avanzamento e il tempo dello step. Il mantenimento del programma non accumula minuti durante la pausa. **RIPRENDI** acquisisce nuovamente le sonde: rampa e cooldown proseguono dalla temperatura di pausa al rate originale, senza perdere il tempo attivo già svolto; un hold torna al target del programma e completa i minuti ancora richiesti. Anche una pausa durante cooldown può accendere il riscaldamento per mantenere la temperatura: riprendendo il cooldown il PID torna a seguire la curva in discesa, con comando zero sopra il setpoint. La pausa e la ripresa conservano la compensazione integrale del PID; STOP e allarmi la azzerano. Sonde, letture fresche, sovratemperatura e registro blackout restano sorvegliati durante la pausa. I firmware precedenti spegnevano invece l’uscita in pausa. **STOP** conclude il ciclo e lascia spento il riscaldamento. La durata massima di **12 ore include anche le pause**. Avviare dopo uno STOP comincia un nuovo programma dall'inizio.
+**Da full-1.10, PAUSA mantiene con il PID la media PT100 rilevata quando premi il pulsante**, entro il range di target 0–400 °C, e congela l’avanzamento e il tempo dello step. Il mantenimento del programma non accumula minuti durante la pausa. **RIPRENDI** acquisisce nuovamente le sonde: rampa e cooldown proseguono dalla temperatura di pausa al rate originale, senza perdere il tempo attivo già svolto; un hold torna al target del programma e completa i minuti ancora richiesti. Anche una pausa durante cooldown può accendere il riscaldamento per mantenere la temperatura: riprendendo il cooldown il PID torna a seguire la curva in discesa, con comando zero sopra il setpoint. La pausa e la ripresa conservano la compensazione integrale del PID; STOP e allarmi la azzerano. Sonde, letture fresche, sovratemperatura e registro blackout restano sorvegliati durante la pausa. I firmware precedenti spegnevano invece l’uscita in pausa. **STOP** conclude il ciclo e lascia spento il riscaldamento. Da **full-1.16** non è previsto un arresto per durata massima: Programmi e pause possono proseguire oltre 12 ore. Avviare dopo uno STOP comincia un nuovo programma dall'inizio.
 
-Il PID lavora sulla media delle PT100. Valori iniziali **Kp 12, Ki 0,015, Kd 50**, limiti impostabili **Kp 0–50, Ki 0–0,5, Kd 0–200**. Anti-windup, filtro della derivata e limite di tempo ON agiscono sul comando; il guadagno adatto dipende dal forno. A una temperatura della sonda più calda pari a setpoint +1 °C o oltre, il comando PID viene azzerato. Il PID non dispone di autotuning automatico.
+Il PID lavora sulla media delle PT100. Valori iniziali **Kp 12, Ki 0,015, Kd 50**, limiti impostabili **Kp 0–50, Ki 0–0,5, Kd 0–200**. Anti-windup, filtro della derivata e limite di tempo ON agiscono sul comando; il guadagno adatto dipende dal forno. A una media PT100 pari a setpoint +1 °C o oltre, il comando PID viene azzerato senza cancellare l’integrale. Il PID non dispone di autotuning automatico.
 
 ### TUNING PID
 
@@ -488,7 +541,7 @@ Anticipa il futuro misurando la velocità con cui l'errore si sta riducendo. Fun
 
 Da **full-1.8** il PID conserva integrale, derivata e fase della finestra SSR quando una rampa passa a un mantenimento allo stesso target (anche tra due mantenimenti allo stesso target). Il conteggio del nuovo hold riparte da zero con letture fresche; non eredita tempo dalla rampa. Nuovo ciclo, STOP, allarme e cambio impostazioni azzerano il PID. Da full-1.10 pausa/ripresa conservano il PID, e da full-1.11 lo conservano anche i passaggi continui verso cooldown o da cooldown a hold allo stesso target. Gli altri passaggi di step ripartono dal PID azzerato.
 
-In salita e mantenimento il taglio temporaneo del comando a **target +1 °C** usa la **media PT100**, la stessa grandezza regolata dal PID, e non cancella più l'integrale. Usare la sonda più calda qui poteva mantenere la media sotto target, anche con un Ki maggiore. L'integrale rimane limitato a `0..maxPower` con integrazione condizionata ai limiti dell'uscita; la derivata è sempre sulla misura, senza impulso dovuto al solo cambio di setpoint. In discesa regolata il comando è zero già a **media ≥ setpoint**, senza cancellare l’integrale. Gli arresti indipendenti **+8 °C dal setpoint e 415 °C assoluti restano sulla sonda più calda**; in cooldown il +8 °C viene verificato quando il PID richiede calore, mentre il limite assoluto vale sempre. `/api/status.pidState` espone `integralPct`, `proportionalPct`, `derivativePct` e `meanLimited` per distinguere regolazione e taglio temporaneo. La modifica richiede una nuova prova termica dopo il caricamento: i test del software non misurano inerzia, uniformità o precisione reale delle sonde.
+In salita e mantenimento il taglio temporaneo del comando a **target +1 °C** usa la **media PT100**, la stessa grandezza regolata dal PID, e non cancella più l'integrale. Usare la sonda più calda qui poteva mantenere la media sotto target, anche con un Ki maggiore. L'integrale rimane limitato a `0..maxPower` con integrazione condizionata ai limiti dell'uscita; la derivata è sempre sulla misura, senza impulso dovuto al solo cambio di setpoint. In discesa regolata il comando è zero già a **media ≥ setpoint**, senza cancellare l’integrale. Da **full-1.15**, l’arresto relativo usa **media PT100 > setpoint +10 °C**, con confronto stretto: esattamente +10 °C non fa scattare questo allarme. Da full-1.18 questo arresto è configurabile in Parameters e, se abilitato, vale anche per tutto il cooldown, indipendentemente dal comando PID. Il limite assoluto di **415 °C resta su ciascuna sonda**. Il messaggio di allarme riporta media, setpoint e scostamento misurati. `/api/status.pidState` espone `integralPct`, `proportionalPct`, `derivativePct` e `meanLimited` per distinguere regolazione e taglio temporaneo. La modifica richiede una nuova prova termica dopo il caricamento: i test del software non misurano inerzia, uniformità o precisione reale delle sonde.
 
 Una curva vicina alla rampa è un buon punto di partenza; il giudizio richiede anche l'arrivo al target e il mantenimento. Confronta prove con lo stesso programma, carico e condizioni iniziali, modificando un parametro alla volta **a ciclo fermo** e salvandolo sull'ESP. Esporta il CSV della Dashboard: contiene entrambe le PT100, setpoint, PID e comando uscita; annota anche coefficienti, attuatore, finestra e limite comando, che non sono colonne del CSV.
 
@@ -506,9 +559,20 @@ Il file `examples/recipes.json` contiene il programma iniziale e può essere imp
 
 ## Allarmi e supervisione delle uscite
 
-Il **fungo EMERGENZA** sempre visibile invia `POST /api/command` con `action: "emergency"`: spegne subito tutti i GPIO gestiti, interrompe ciclo e TEST e blocca nuovi avvii e prove. Il supervisore mantiene il blocco anche dopo STOP; il flag è salvato in NVS e ripristinato al riavvio. **Riconosci allarme / interruzione** lo rimuove solo con sonde sane e salvataggio riuscito. Nessun ciclo riprende automaticamente. **STOP** termina normalmente il ciclo e lascia le uscite spente, senza creare questo blocco: un nuovo avvio manuale resta possibile quando pronto.
+Il **fungo EMERGENZA** sempre visibile invia `POST /api/command` con `action: "emergency"`: spegne subito tutti i GPIO gestiti, interrompe ciclo e TEST e blocca nuovi avvii e prove. Il supervisore mantiene il blocco anche dopo STOP; il flag è salvato in NVS e ripristinato al riavvio. **RESET & BLOCK** lo rimuove solo con sonde sane e salvataggio riuscito. Nessun ciclo riprende automaticamente. **STOP** termina normalmente il ciclo e lascia le uscite spente, senza creare questo blocco: un nuovo avvio manuale resta possibile quando pronto.
 
 È un comando software via rete, non un fungo fisico che seziona la potenza: richiede ESP e collegamento funzionanti. Le protezioni hardware indipendenti restano necessarie.
+
+Da **full-1.17** la barra errori offre due azioni distinte, disponibili dalla Dashboard e da Manuale:
+
+- **RESET & BLOCK (rosso):** riconosce l'allarme e lascia il forno fermo. Scarta il punto di ripresa: per ricominciare serve un nuovo avvio.
+- **RESET & CONTINUE (arancione):** riconosce un allarme del controllo corrente e riprende lo stesso step, target e rate; nel mantenimento conserva il tempo già maturato in banda. La rampa riparte dal riferimento congelato al guasto, senza avanzare durante l'attesa. In Manuale conserva target, rate e modalità di regolazione/cooldown. Se l'allarme era scattato in PAUSA, il pulsante continua lo step attivo dal riferimento di pausa.
+
+La continuazione usa un punto salvato **solo in RAM**, al momento dell'allarme. Non è disponibile dopo blackout/riavvio, EMERGENZA, STOP, OTA, RESET & BLOCK o modifica di PID/attuatore/limite. Un allarme già presente prima dell'installazione non contiene questo punto e richiede RESET & BLOCK. Il pulsante arancione resta disabilitato se manca lo stato o le condizioni non sono valide; la barra ne mostra il motivo.
+
+Prima di riprendere, l'ESP legge nuovamente entrambe le sonde: devono essere valide, fresche e ciascuna sotto 415 °C; devono inoltre essere rispettate le soglie abilitate in Parameters rispetto al riferimento di ripresa e alla differenza fra sonde. Il registro persistente dell'attività deve essere salvato prima di riabilitare le uscite. **RESET & CONTINUE può accendere le resistenze:** è una ripresa esplicita richiesta dall'operatore, non un bypass dell'allarme. Il PID riparte con integrale azzerato. Se il problema ricompare, il controllo si arresta nuovamente.
+
+Nei Programmi l'attesa del reset viene contabilizzata come pausa, senza accumulare tempo attivo o minuti in banda; il report finale conserva i dati precedenti. Il PDF dell'allarme già inviato resta in chat e al nuovo termine viene inviato il report aggiornato; l'identità dell'evento include l'istante finale per distinguere questi due report senza duplicare lo stesso invio. Il Manuale conserva il tempo attivo senza l'attesa. Nessun comando Telegram riattiva il riscaldamento. Le API sono `POST /api/command` con `action: "reset"` e `action: "resetContinue"`; `/api/status.faultResume` indica disponibilità, condizioni e riferimento di ripresa.
 
 La sezione **ERRORI** mostra l’allarme/emergenza attuale, l’ultimo errore che ha interrotto un ciclo e l’ultima interruzione da alimentazione/reset registrata. Gli ultimi due dati sono conservati in NVS quando disponibile. Una causa accensione/brownout indica un possibile blackout o calo di alimentazione; un reset software/watchdog resta classificato come reset. Il tempo tra ultimo checkpoint e riavvio è un **limite massimo stimato**, non la durata esatta del blackout; senza ora NTP/checkpoint la durata è sconosciuta.
 
@@ -517,23 +581,23 @@ I target dei programmi arrivano a **400 °C**. Il limite assoluto è **415 °C**
 | Condizione | Comportamento |
 |---|---|
 | Sonda non valida/fault MAX31865 durante ciclo o pausa | Uscita subito spenta; arresto e allarme salvo verifica limitata del solo `0x04` isolato descritta sotto |
-| Differenza sonde >10 °C e ≤20 °C | Riquadro ΔT giallo; nessun arresto per differenza |
-| Differenza sonde >20 °C | Riquadro ΔT rosso; nessun arresto per differenza |
+| Differenza sonde >10 °C e ≤20 °C | Riquadro ΔT giallo; l’arresto dipende dalla soglia configurata |
+| Differenza sonde >20 °C | Riquadro ΔT rosso; blocco oltre la soglia configurata se abilitato (default >30 °C) |
 | Una sonda a 415 °C o più | Arresto e allarme |
-| Una sonda a setpoint +8 °C o più, durante riscaldamento/pausa o richiesta di calore in cooldown | Arresto e allarme; in cooldown una temperatura sopra la curva con comando zero è normale, non causa questo arresto |
+| Media PT100 − setpoint oltre la soglia abilitata (default >10 °C) | Arresto e allarme in Programmi/Manuale, incluse pausa e cooldown |
 | Controllo/letture assenti da 3 s | Supervisore spegne l'uscita e mantiene il blocco |
-| Durata totale 12 ore, incluse pause | Arresto e allarme |
+| Durata del ciclo e delle pause | Nessun limite massimo di ciclo; restano guasti sonde, freschezza, temperature e blocchi del supervisore |
 | Comando non valido/non finito nel supervisore | Uscita spenta e blocco |
 
-Nella Dashboard e in Manuale il riquadro principale **ΔT media PT100 − target** mostra uno scarto con segno: negativo sotto il target, positivo sopra; senza una media o un target validi mostra «—». **ΔT sonde** è accanto alle due letture PT100 e conserva le soglie di colore. Da **full-1.7** la differenza tra le PT100 è solo diagnostica: non blocca avvio/ripresa, non arresta il ciclo e non invalida la verifica di un fault transitorio. A ΔT esattamente 10 °C il riquadro resta normale; a 20 °C resta giallo. I colori usano `--delta-warning-bg`, `--delta-danger-bg`, `--warning` e `--danger` in `data/style.css`. Senza due letture valide il valore è «—»; dopo perdita della connessione, gli ultimi dati sono conservati solo nel breve intervallo già indicato come non aggiornato. Restano gli arresti per guasto, temperatura assoluta e sovratemperatura della sonda più calda rispetto al setpoint: un ciclo può quindi fermarsi per questi motivi anche con ΔT elevato. Il mantenimento richiede ancora entrambe le sonde entro ±5 °C dal target e non conta il tempo fuori banda.
+Nella Dashboard e in Manuale il riquadro principale **ΔT media PT100 − target** mostra uno scarto con segno: negativo sotto il target, positivo sopra; senza una media o un target validi mostra «—». **ΔT sonde** è accanto alle due letture PT100 e conserva le soglie di colore. Il colore del ΔT resta diagnostico e indipendente dalle soglie: da **full-1.18** l’arresto per differenza dipende dal blocco abilitabile in Parameters, inizialmente >30 °C; i firmware full-1.7–1.17 non arrestavano per differenza. A ΔT esattamente 10 °C il riquadro resta normale; a 20 °C resta giallo. I colori usano `--delta-warning-bg`, `--delta-danger-bg`, `--warning` e `--danger` in `data/style.css`. Senza due letture valide il valore è «—»; dopo perdita della connessione, gli ultimi dati sono conservati solo nel breve intervallo già indicato come non aggiornato. Restano gli arresti per guasto, temperatura assoluta e sovratemperatura della media rispetto al setpoint quando abilitata (default +10 °C): un ciclo può quindi fermarsi per questi motivi anche con ΔT elevato. Il mantenimento richiede ancora entrambe le sonde entro ±5 °C dal target e non conta il tempo fuori banda.
 
 Le letture sono campionate circa ogni **500 ms** e considerate valide senza fault, con RAW non agli estremi e temperatura tra **−20 e 430 °C**. Una lettura valida non certifica accuratezza, posizione della sonda o continuità di tutti i componenti del circuito.
 
 Da **full-1.13**, il solo fault **`0x04` (sovra/sottotensione)** permette recuperi ripetuti in **Programmi, Manuale, pausa, TEST e lettura a riposo**, senza il vecchio limite di un recupero al minuto. La stessa sonda deve fornire **due nuove conversioni consecutive valide e sicure** prima di riprendere; le uscite rimangono spente durante l'intera verifica, anche se il task GPIO esegue un TEST. Con **10 letture `0x04` consecutive**, contando quella iniziale, il recupero fallisce. Una lettura valida interrompe la serie di fault, ma una sola non basta a confermare il recupero. Anche l'alternanza indefinita fault/valido viene fermata: massimo **12 nuove conversioni** per verifica. Con la libreria attuale ogni conversione attende circa 75 ms; il ciclo di verifica è limitato, senza attese di un minuto. Il limite si cambia in `src/sensor_recovery.h`, costante `kMaxConsecutiveFaults`; `kMaxConfirmationReads` limita la durata dei tentativi instabili.
 
-Altri fault, combinazioni di bit, RAW/temperature non valide e conferme termiche fuori limite interrompono subito la verifica. Le conferme devono restare sotto il limite assoluto e, quando viene richiesto riscaldamento, sotto il limite di sovratemperatura rispetto al setpoint. Si prosegue soltanto dopo conferma e normali controlli su entrambe le sonde. Nei TEST la durata e l'heartbeat continuano durante la verifica: un recupero non prolunga né riavvia una prova scaduta; un recupero fallito termina il TEST e lascia l'allarme da riconoscere. Le normali prove diagnostiche restano possibili con sonde assenti dopo il ripristino dei blocchi applicabili. La verifica non cancella blocchi del supervisore. Gli eventi riportano fault/RAW originali ed esito; il report termico usa le coppie finali. Da **full-1.14**, i recuperi riusciti sono registrati soltanto nel log locale: Telegram invia il normale allarme quando la verifica fallisce. Non c'è una soglia aggiuntiva di 3 fault per le notifiche: resta l'arresto a 10 `0x04` consecutivi, oppure prima in caso di conferme non sicure o della verifica instabile limitata. La verifica interrompe il conteggio hold in banda. Il software non risolve la causa elettrica del disturbo: il comportamento va collaudato sul forno reale.
+Altri fault, combinazioni di bit, RAW/temperature non valide e conferme termiche fuori limite interrompono subito la verifica. Ogni conferma deve restare sotto il limite assoluto individuale. Da full-1.15 la sovratemperatura relativa è verificata sulla media dopo aver aggiornato entrambe le sonde, senza confrontare la singola conferma con il vecchio limite +8 °C. Si prosegue soltanto dopo conferma e normali controlli su entrambe le sonde. Nei TEST la durata e l'heartbeat continuano durante la verifica: un recupero non prolunga né riavvia una prova scaduta; un recupero fallito termina il TEST e lascia l'allarme da riconoscere. Le normali prove diagnostiche restano possibili con sonde assenti dopo il ripristino dei blocchi applicabili. La verifica non cancella blocchi del supervisore. Gli eventi riportano fault/RAW originali ed esito; il report termico usa le coppie finali. Da **full-1.16**, i recuperi riusciti restano nel log locale e sono notificati solo in Dettagliata, senza suono; Telegram invia il normale allarme in tutte le modalità quando la verifica fallisce. Non c'è una soglia aggiuntiva di 3 fault per le notifiche: resta l'arresto a 10 `0x04` consecutivi, oppure prima in caso di conferme non sicure o della verifica instabile limitata. La verifica interrompe il conteggio hold in banda. Il software non risolve la causa elettrica del disturbo: il comportamento va collaudato sul forno reale.
 
-**RESET ERRORI** è nella barra sotto le schede, visibile anche in Manuale, TEST, Programmi e Report e mantenuta in vista durante lo scorrimento. In presenza di allarme, emergenza, interruzione o blocco del supervisore, barra e pulsante diventano rossi e spiegano perché l'avvio è bloccato. L'avviso resta anche dopo il ritorno delle letture valide e si elimina soltanto dopo il riconoscimento riuscito. Il reset richiede il controllo fermo, letture valide e registrazione dello sblocco in memoria; termina eventuali TEST, lascia tutte le uscite spente e non riavvia alcun controllo. Non cancella log, report o la registrazione storica del blackout. Senza collegamento rimane visibile l'ultimo blocco noto e il pulsante è disabilitato. `/api/status.resetRequired` indica il blocco da riconoscere. Per i colori modifica `--error-reset-bg`, `--error-reset-active-bg` e `--error-banner-bg` in `data/style.css`.
+**RESET & BLOCK** è nella barra sotto le schede, visibile anche in Manuale, TEST, Programmi e Report e mantenuta in vista durante lo scorrimento. In presenza di allarme, emergenza, interruzione o blocco del supervisore, barra e pulsante diventano rossi e spiegano perché l'avvio è bloccato. L'avviso resta anche dopo il ritorno delle letture valide e si elimina soltanto dopo il riconoscimento riuscito. Il reset richiede il controllo fermo, letture valide e registrazione dello sblocco in memoria; termina eventuali TEST, lascia tutte le uscite spente e non riavvia alcun controllo. Non cancella log, report o la registrazione storica del blackout. Senza collegamento rimane visibile l'ultimo blocco noto e il pulsante è disabilitato. `/api/status.resetRequired` indica il blocco da riconoscere. Per i colori modifica `--error-reset-active-bg` (rosso), `--error-continue-bg` (arancione) e `--error-banner-bg` in `data/style.css`.
 
 La finestra ON/OFF viene eseguita da un **task indipendente**, con verifica circa ogni **10 ms**. Una richiesta HTTP lenta o un blocco del controllo non tengono acceso il riscaldamento oltre il limite di freschezza. Il blocco del supervisore **non si cancella quando ricompaiono letture valide**: devi riconoscere l'allarme a ciclo fermo, con sonde nuovamente valide e nei limiti.
 
@@ -541,7 +605,7 @@ Il ciclo è autonomo: **chiudere la dashboard o perdere il Wi-Fi non lo ferma**.
 
 ## Report di fine ciclo
 
-Al completamento, allo **STOP**, a un arresto per **allarme** o per aggiornamento OTA, l'ESP produce il riepilogo del ciclo. La Dashboard mostra **Apri report**; la scheda **Report** permette di consultarlo e scaricarlo direttamente come **PDF A4**, **JSON**, **PNG** oppure **ZIP con CSV e PNG**. Il PDF è impaginato con curva setpoint/media PT100, riepilogo completo, dettaglio degli step e note; include intestazioni e numeri di pagina. Gli export sono generati nel browser senza Internet, con jsPDF 4.2.1 incorporato nel firmware (licenza in `data/vendor/jspdf-LICENSE.txt`). I report v2 riportano la banda hold ±5 °C; i report v1 già salvati restano leggibili e mantengono l’indicazione ±1 °C. L'API è `GET /api/report`; prima del primo report risponde 404. `/api/status` espone `reportAvailable` e `reportKey`.
+Al completamento, allo **STOP**, a un arresto per **allarme** o per aggiornamento OTA, l'ESP produce il riepilogo del ciclo. La Dashboard mostra **Apri report**; la scheda **Report** permette di consultarlo e scaricarlo direttamente come **PDF A4**, **JSON**, **PNG** oppure **ZIP con CSV e PNG**. Da **full-1.16** il PDF usa riquadri arrotondati, sfondi chiari distinti per tempi/regolazione, temperature e precisione, ed esito evidenziato in verde, ambra o rosso. Contiene curva completa setpoint/media PT100, riepilogo diviso in sezioni (**ciclo/tempi, impostazioni, temperature, precisione, comando e qualità letture**) e una pagina per ogni fase con grafico autonomo e scala adattata; include intestazioni e numeri di pagina. Gli export sono generati nel browser senza Internet, con jsPDF 4.2.1 incorporato nel firmware (licenza in `data/vendor/jspdf-LICENSE.txt`). I report v2 riportano la banda hold ±5 °C; i report v1 già salvati restano leggibili e mantengono l’indicazione ±1 °C. L'API è `GET /api/report`; prima del primo report risponde 404. `/api/status` espone `reportAvailable` e `reportKey`.
 
 Il report include:
 
@@ -550,10 +614,10 @@ Il report include:
 - Kp/Ki/Kd, attuatore, finestra e limite comando **usati nel ciclo**, indipendenti da successive modifiche delle impostazioni.
 - Per ciascuna PT100: prima/ultima lettura valida e temperatura minima/massima; differenza massima fra sonde e conteggio dei campioni non validi.
 - Errore medio assoluto della media PT100 rispetto al setpoint, massimo ritardo della media, massimo superamento del setpoint da parte della media PT100, comando PID medio e percentuale dei campioni al limite.
-- Per ogni step: target, rate/durata richiesta, esito, tempi attivo/pausa, hold effettivo in banda, statistiche PID ed escursione max−min di ogni PT100 durante il mantenimento.
+- Per ogni fase: target, rate/durata richiesta, esito, tempi attivo/pausa, hold effettivo in banda, statistiche PID ed escursione max−min di ogni PT100 durante il mantenimento. La sua pagina PDF contiene anche il grafico limitato ai campioni della fase e delle sue pause, con tempo dall’inizio della fase. Le fasi non iniziate non hanno dati inventati; le curve mancanti o parziali sono dichiarate.
 - Curva del solo ciclo concluso: setpoint e media delle due PT100, comprese pause e cooldown; CSV con entrambe le sonde, media, setpoint, comando, eventi e tempo trascorso nel ciclo. Il PNG ha risoluzione 2400×1000 e sfondo chiaro; il PDF usa un grafico vettoriale.
 
-Le statistiche vengono accumulate dalle letture sul firmware, circa ogni 500 ms: non richiedono una dashboard aperta e non dipendono dalla rotazione dello storico. Temperature e differenza sonde includono le pause. Errori e comando PID usano solo campioni validi di **rampa e hold attivi**, escludendo pause e cooldown. Questa esclusione statistica resta anche nei cooldown regolati di full-1.11; il loro comando PID è visibile nella curva/CSV. Le medie e la saturazione sono calcolate sui campioni, non pesate sulla durata; il comando è quello richiesto prima del nuovo aggiornamento PID. Da **full-1.12**, il superamento è il massimo positivo di **media PT100 − setpoint istantaneo**, anche durante la rampa: per valutare l'arrivo al target consulta anche lo step hold. I nuovi report usano la versione dati 3; i report salvati con versioni 1/2 conservano il valore della sonda più calda e sono indicati come tali, senza ricalcoli dai soli massimi. Gli arresti di sicurezza restano sulla sonda più calda. Il tempo in banda riporta lo stesso conteggio del controllo, con entrambe le sonde entro ±5 °C e campioni consecutivi freschi. L'escursione hold include le pause dello step. Il comando non è una misura di energia o potenza elettrica.
+Le statistiche vengono accumulate dalle letture sul firmware, circa ogni 500 ms: non richiedono una dashboard aperta e non dipendono dalla rotazione dello storico. Temperature e differenza sonde includono le pause. Errori e comando PID usano solo campioni validi di **rampa e hold attivi**, escludendo pause e cooldown. Questa esclusione statistica resta anche nei cooldown regolati di full-1.11; il loro comando PID è visibile nella curva/CSV. Le medie e la saturazione sono calcolate sui campioni, non pesate sulla durata; il comando è quello richiesto prima del nuovo aggiornamento PID. Da **full-1.12**, il superamento è il massimo positivo di **media PT100 − setpoint istantaneo**, anche durante la rampa: per valutare l'arrivo al target consulta anche lo step hold. I nuovi report usano la versione dati 3; i report salvati con versioni 1/2 conservano il valore della sonda più calda e sono indicati come tali, senza ricalcoli dai soli massimi. Da full-1.15 anche l’arresto relativo al setpoint usa la media; da full-1.18 la sua soglia e abilitazione sono configurabili in Parameters (default >10 °C). Il limite assoluto resta individuale a 415 °C. Il tempo in banda riporta lo stesso conteggio del controllo, con entrambe le sonde entro ±5 °C e campioni consecutivi freschi. L'escursione hold include le pause dello step. Il comando non è una misura di energia o potenza elettrica.
 
 L'ESP conserva **un solo report finale**, salvato in NVS una volta a ciclo concluso. Il report precedente resta disponibile durante un nuovo ciclo e viene sostituito alla sua conclusione. Il salvataggio è subordinato allo spazio riservato alle impostazioni e allo stato di sicurezza; se fallisce, la pagina lo segnala come **solo RAM** e puoi scaricarlo. Dopo un riavvio viene recuperato l'ultimo report salvato con successo. Un blackout/reset improvviso non permette di completare il report del ciclo in corso: rimane il riepilogo precedente e si applica la segnalazione di ciclo interrotto già prevista. Lo storico dettagliato resta in RAM: esporta anche il CSV se ti serve analizzare la curva completa.
 
@@ -577,9 +641,9 @@ Il log mostra gli ultimi **128 eventi**, compresi cambi uscita e riepiloghi PID;
 
 Prima di avviare il riscaldamento, il firmware salva in un unico registro NVS lo stato **ciclo attivo**, il nome del programma e il primo checkpoint UTC, se NTP è disponibile. Durante ciclo e pausa aggiorna il checkpoint ogni **30 s**. Se la scrittura iniziale fallisce, il ciclo non parte; un checkpoint successivo fallito genera un allarme Telegram e mantiene il precedente salvataggio.
 
-Al riavvio i GPIO gestiti vengono inizializzati **spenti prima di Wi-Fi e caricamento delle impostazioni**. Un ciclo rimasto attivo genera un **blocco persistente delle uscite**, anche dei TEST: non riprende automaticamente. Il blocco viene salvato prima di cancellare il vecchio flag di attività e **resta dopo ulteriori riavvii**, fino a **RESET ERRORI** nella dashboard, con sonde sane e salvataggio riuscito. Anche un registro illeggibile mantiene le uscite bloccate. Il riconoscimento non accende il riscaldamento: per ripartire devi avviare un **nuovo programma dall'inizio**, dopo aver valutato il materiale.
+Al riavvio i GPIO gestiti vengono inizializzati **spenti prima di Wi-Fi e caricamento delle impostazioni**. Un ciclo rimasto attivo genera un **blocco persistente delle uscite**, anche dei TEST: non riprende automaticamente. Il blocco viene salvato prima di cancellare il vecchio flag di attività e **resta dopo ulteriori riavvii**, fino a **RESET & BLOCK** nella dashboard, con sonde sane e salvataggio riuscito. Anche un registro illeggibile mantiene le uscite bloccate. Il riconoscimento non accende il riscaldamento: per ripartire devi avviare un **nuovo programma dall'inizio**, dopo aver valutato il materiale.
 
-Da **full-1.14**, una normale accensione **a controllo fermo**, dopo STOP o completamento regolarmente salvati e senza blocchi pendenti, riparte in **IDLE con uscita spenta**: non è classificata come blackout, non richiede RESET ERRORI e genera soltanto l'evento ordinario silenzioso **ESP AVVIATO** (omesso in modalità Essenziale). Vale anche dopo accensioni ripetute. Lo storico di un'interruzione già riconosciuta rimane consultabile nella dashboard e in `/status`, ma è indicato come **Storico**, senza presentarlo come un blocco attuale.
+Da **full-1.14**, una normale accensione **a controllo fermo**, dopo STOP o completamento regolarmente salvati e senza blocchi pendenti, riparte in **IDLE con uscita spenta**: non è classificata come blackout, non richiede RESET ERRORI e genera soltanto l'evento ordinario silenzioso **ESP AVVIATO** (da full-1.16 visibile anche in Essenziale, con conferma Wi-Fi e avvio firmware). Vale anche dopo accensioni ripetute. Lo storico di un'interruzione già riconosciuta rimane consultabile nella dashboard e in `/status`, ma è indicato come **Storico**, senza presentarlo come un blocco attuale.
 
 Se l'alimentazione manca mentre un **Programma, una pausa o il Manuale sono attivi**, quando tornano Wi-Fi/Internet e sincronizzazione NTP il bot invia **🚨 BLACKOUT · ALIMENTAZIONE RIPRISTINATA**, con programma interrotto, ultimo checkpoint, intervallo stimato e istruzioni di riconoscimento. Accensione/brownout indicano un'interruzione o calo dell'alimentazione **dell'ESP**: non distinguono un blackout della rete da uno spegnimento manuale durante il controllo. Per spegnere normalmente, usa prima STOP e attendi la conferma del controllo fermo. Un reset software/watchdog durante il controllo invia invece **🚨 ALLARME · RIAVVIO CON CICLO INTERROTTO**. Se il blocco era già pendente prima di questo avvio, il messaggio è **ALLARME · INTERRUZIONE PRECEDENTE NON RICONOSCIUTA**: non dichiara un nuovo blackout e conserva il primo intervallo registrato. Un'emergenza persistente conserva il proprio allarme e blocco. Un TEST rimasto attivo al reset viene segnalato come **TEST INTERROTTO**, con uscite spente e nessuna ripresa; non dispone della stima del programma. Un vero reset **brownout** resta un allarme di alimentazione anche a controllo fermo, senza inventare un ciclo interrotto.
 
@@ -643,6 +707,8 @@ c++ -std=c++11 -Wall -Wextra -Werror tests/wifi_recovery_test.cpp -o /tmp/oven-f
 /tmp/oven-full-wifi-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/power_recovery_test.cpp -o /tmp/oven-full-recovery-test
 /tmp/oven-full-recovery-test
+c++ -std=c++17 -Wall -Wextra -Werror tests/fault_resume_test.cpp -o /tmp/oven-full-fault-resume-test
+/tmp/oven-full-fault-resume-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/cycle_report_test.cpp -o /tmp/oven-full-report-test
 /tmp/oven-full-report-test
 c++ -std=c++11 -Wall -Wextra -Werror tests/sensor_recovery_test.cpp -o /tmp/oven-full-sensor-test
@@ -659,7 +725,13 @@ c++ -std=c++11 -Wall -Wextra -Werror tests/pid_control_test.cpp -o /tmp/oven-ful
 c++ -std=c++11 -Wall -Wextra -Werror tests/telegram_runtime_test.cpp -o /tmp/oven-full-tg-runtime-test
 /tmp/oven-full-tg-runtime-test
 /tmp/oven-full-delivery-test
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_telegram_tool.py' -v
+c++ -std=c++17 -Wall -Wextra -Werror tests/report_pdf_test.cpp -o /tmp/oven-full-pdf-test
+/tmp/oven-full-pdf-test
+c++ -std=c++17 -Wall -Wextra -Werror tests/plot_png_test.cpp -o /tmp/oven-full-plot-test
+/tmp/oven-full-plot-test
+c++ -std=c++17 -Wall -Wextra -Werror tests/plot_snapshot_test.cpp -o /tmp/oven-full-plot-snapshot-test
+/tmp/oven-full-plot-snapshot-test
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-Coprono report ciclo/step, pause, hold, esclusione cooldown, campioni non validi, STOP/allarme e overflow dei timer; prove LED/relè e durate prolungate, heartbeat, esclusione TEST/PID, blocco OTA, profili, finestre ON/OFF, pausa/cooldown/STOP, blocco per controllo vecchio, durata massima, impostazioni non valide, overflow dei timer, conteggio del mantenimento e pulizia selettiva dei log con NVS piena o errori di accesso. La compilazione e i test del software non verificano hardware e risposta termica: quelli restano il collaudo sul campo e la successiva taratura sul forno reale.
+Coprono report ciclo/step, pause, hold, esclusione cooldown, campioni non validi, STOP/allarme e overflow dei timer; prove LED/relè e durate prolungate, heartbeat, esclusione TEST/PID, blocco OTA, profili, finestre ON/OFF, pausa/cooldown/STOP, blocco per controllo vecchio, prosecuzione oltre 12 ore, impostazioni non valide, overflow dei timer, conteggio del mantenimento e pulizia selettiva dei log con NVS piena o errori di accesso. La compilazione e i test del software non verificano hardware e risposta termica: quelli restano il collaudo sul campo e la successiva taratura sul forno reale.

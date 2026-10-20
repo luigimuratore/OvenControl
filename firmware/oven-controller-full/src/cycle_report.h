@@ -99,6 +99,17 @@ class Recorder {
     data.endMs = now; data.outcome = outcome; active = false;
     return true;
   }
+  bool canContinue() const { return !active && data.outcome == Outcome::Fault && step < data.stepCount; }
+  bool continueAfterFault(uint32_t now) {
+    if (!canContinue()) return false;
+    // Keep the complete report and phase timing coherent: the blocked interval
+    // is a pause, never hold qualification or active heating time.
+    active = true;
+    if (!paused) ++data.pauseCount;
+    paused = true; account(now); paused = false;
+    data.outcome = Outcome::None; data.endMs = 0; data.endUtc = 0; data.reason[0] = 0;
+    return true;
+  }
  private:
   uint32_t previousAt = 0;
 };

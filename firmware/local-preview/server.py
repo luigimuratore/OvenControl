@@ -72,8 +72,11 @@ class DemoDevice:
         self.mode, self.speed, self.now = mode, speed if mode == "full" else 1, 600.0
         self.phase, self.fault, self.temperature, self.missing = "idle", "", 24.0, False
         self.pause_target = None
+        self.fault_resume = None
+        self.manual_blocked_time = 0.0
         self.control = {"actuator": "relay", "windowSec": 60, "maxPower": 30}
         self.pid = {"kp": 12, "ki": .015, "kd": 50}
+        self.protections = dict(probeDeltaEnabled=True,maxProbeDeltaC=30.0,meanOvershootEnabled=True,maxMeanOvershootC=10.0)
         self.emergency, self.last_cycle_error = False, ""
         self.recipes = json.loads((ROOT / "oven-controller-full/examples/recipes.json").read_text())
         self.report_work, self.last_report = None, None
@@ -207,6 +210,8 @@ class DemoDevice:
     def finish_report(self, outcome, reason):
         if not self.report_work:
             return
+        if outcome == "fault":
+            self.save_fault_resume()
         r = self.report_work
         if outcome == "fault":
             self.last_cycle_error = reason
@@ -264,7 +269,59 @@ class DemoDevice:
                 self.record()
                 self.last_sample = self.now
 
+    def save_fault_resume(self):
+        if self.phase not in ("running", "paused") or self.emergency or self.test_enabled:
+            return
+        names = ("operation", "active", "step_index", "step_elapsed", "hold", "target", "cycle_at", "step_at",
+                 "pause_target", "manual_mode", "manual_target", "manual_rate", "manual_cooling",
+                 "manual_cooldown_complete", "manual_started", "manual_ended", "manual_blocked_time", "report_work")
+        self.fault_resume = dict(at=self.now, paused=self.phase == "paused", values={name: copy.deepcopy(getattr(self,name)) for name in names})
+        if self.phase == "paused":
+            step = self.active["steps"][self.step_index]
+            self.fault_resume["values"]["target"] = step["target"] if step["type"] == "hold" else min(step["target"],self.target) if step["type"] == "ramp" else max(step["target"],self.target)
+
+    def fault_resume_status(self):
+        saved = self.fault_resume
+        pair = self.sensors()
+        healthy = all(sensor["valid"] and sensor["c"] is not None and math.isfinite(sensor["c"]) and sensor["c"] < 415 for sensor in pair)
+        available = bool(saved) and self.phase == "fault" and not self.emergency
+        reference = saved["values"]["target"] if saved else None
+        if self.emergency or self.phase == "interrupted":
+            reason = "Emergenza/blackout: usa RESET & BLOCK."
+        elif not available:
+            reason = "Nessun punto di ripresa in RAM: usa RESET & BLOCK."
+        elif not healthy:
+            reason = "Ripristina entrambe le sonde e attendi letture valide sotto 415 °C."
+        elif reference is None or self.protection_problem(reference):
+            reason = "Attendi il rientro delle temperature nelle soglie abilitate in Parameters."
+        else:
+            reason = ""
+        return dict(available=available, ready=not reason, reason=reason, targetC=reference,
+                    operation=saved["values"]["operation"] if saved else "program")
+
+    def continue_after_fault(self):
+        state = self.fault_resume_status()
+        require(state["ready"],state["reason"],409)
+        saved = self.fault_resume
+        waiting = self.now-saved["at"]
+        for name,value in saved["values"].items():
+            setattr(self,name,copy.deepcopy(value))
+        self.step_at += waiting
+        if self.operation == "manual":
+            self.manual_blocked_time += waiting
+        elif self.report_work:
+            self.report_work["pausedMs"] += round(waiting*1000)
+            self.report_work["durationMs"] += round(waiting*1000)
+            self.report_work["pauseCount"] += int(not saved["paused"])
+            self.report_work["steps"][self.step_index]["pausedMs"] += round(waiting*1000)
+        self.phase,self.fault,self.fault_resume = "running","",None
+        self.was_in_band = False
+        self.duty,self.relay = 0.0,False
+        self.record()
+
     def end_manual(self, phase="idle", record=True):
+        if phase == "fault":
+            self.save_fault_resume()
         self.manual_ended = self.now
         self.manual_mode, self.manual_cooling = "idle", False
         self.phase, self.target, self.duty, self.relay = phase, None, 0.0, False
@@ -274,6 +331,7 @@ class DemoDevice:
     def manual_command(self, body):
         action = body.get("action")
         if action == "stop":
+            self.fault_resume = None
             if self.operation == "manual" and self.phase == "running":
                 self.end_manual()
                 self.log("MANUALE", "Controllo manuale fermato dall'operatore")
@@ -299,6 +357,9 @@ class DemoDevice:
         if action == "start":
             require(self.phase not in ("running", "paused"), "Ferma prima il programma/manuale", 409)
             require(body.get("hardwareReady") is True, "CHECK HARDWARE/AMBIENTE richiesto")
+            require(not self.protection_problem(self.temperature+.1),self.protection_problem(self.temperature+.1) or "Blocchi attivi",409)
+            self.fault_resume = None
+            self.manual_blocked_time = 0.0
             self.operation, self.active = "manual", None
             self.manual_started, self.cycle_at = self.now, self.now
             self.step_index, self.step_elapsed = 0, 0
@@ -316,6 +377,25 @@ class DemoDevice:
         self.log("MANUALE", ("Manuale avviato: target " if action == "start" else "Target manuale modificato: ") + str(target) + " °C · rate " + str(rate) + " °C/min")
         return self.status()
 
+    def protection_problem(self, reference):
+        pair = self.sensors()
+        if not all(sensor["valid"] for sensor in pair):
+            return None
+        first,second = (sensor["c"] for sensor in pair)
+        if max(first,second) >= 415:
+            return "Temperatura >= 415 °C: uscita spenta (simulata)"
+        cfg = self.protections
+        if cfg["probeDeltaEnabled"] and abs(first-second) > cfg["maxProbeDeltaC"]:
+            return f'Differenza PT100: {abs(first-second):.2f} °C (limite >{cfg["maxProbeDeltaC"]:g} °C): uscita spenta (simulata)'
+        mean = (first+second)/2
+        if cfg["meanOvershootEnabled"] and reference is not None and mean > reference+cfg["maxMeanOvershootC"]:
+            return (f'Sovratemperatura media PT100: {mean:.2f} °C; setpoint {reference:.2f} °C; '
+                    f'scostamento +{mean-reference:.2f} °C (limite >{cfg["maxMeanOvershootC"]:g} °C): uscita spenta (simulata)')
+        return None
+
+    def overtemperature(self):
+        return self.protection_problem(self.target)
+
     def advance_full(self, dt):
         if self.manual_mode != "idle":
             self.duty, self.relay = 0.0, False
@@ -331,8 +411,9 @@ class DemoDevice:
                 actual = (pair[0]["c"] + pair[1]["c"]) / 2 if descending else self.temperature
                 self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
                 self.relay = self.duty > 0 and (self.now - self.manual_started) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
-            if self.temperature + .2 >= 415 or ((not descending or self.duty > 0) and self.temperature + .2 >= self.target + 8):
-                self.fault = "Sovratemperatura manuale simulata"
+            fault = self.overtemperature()
+            if fault:
+                self.fault = fault
                 self.end_manual("fault")
                 self.log("ALLARME", self.fault)
                 return
@@ -341,15 +422,11 @@ class DemoDevice:
         if self.phase in ("running", "paused"):
             self.account_report(dt)
         self.duty, self.relay = 0.0, False
-        if self.phase in ("running", "paused") and self.now - self.cycle_at >= 43200:
-            self.finish_report("fault", "Durata massima simulata: 12 ore")
-            self.phase, self.fault = "fault", "Durata massima simulata: 12 ore"
-            self.log("ALLARME", self.fault)
-            self.record(marker=128)
         if self.phase == "paused":
-            if self.temperature + .2 >= 415 or self.temperature + .2 >= self.target + 8:
-                self.finish_report("fault", "Sovratemperatura durante pausa simulata")
-                self.phase, self.fault, self.target = "fault", "Sovratemperatura durante pausa simulata", None
+            fault = self.overtemperature()
+            if fault:
+                self.finish_report("fault", fault)
+                self.phase, self.fault, self.target = "fault", fault, None
                 self.record(marker=128)
                 self.log("ALLARME", self.fault)
                 return
@@ -374,9 +451,10 @@ class DemoDevice:
         if not cooldown_finished:
             self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
             self.relay = self.duty > 0 and (self.now - self.cycle_at) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
-        if self.temperature + .2 >= 415 or ((step["type"] != "cooldown" or self.duty > 0) and self.temperature + .2 >= self.target + 8):
-            self.finish_report("fault", "Sovratemperatura simulata")
-            self.phase, self.fault, self.target = "fault", "Sovratemperatura simulata", None
+        fault = self.overtemperature()
+        if fault:
+            self.finish_report("fault", fault)
+            self.phase, self.fault, self.target = "fault", fault, None
             self.duty, self.relay = 0.0, False
             self.record(marker=128)
             self.log("ALLARME", self.fault)
@@ -434,12 +512,13 @@ class DemoDevice:
             base.update(cooldownRegulated=True, pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
                         stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
                         emergency=self.emergency, lastCycleError=self.last_cycle_error,
-                        resetRequired=self.emergency or self.phase in ("fault", "interrupted"), supervisorFault=0)
+                        resetRequired=self.emergency or self.phase in ("fault", "interrupted"), supervisorFault=0,
+                        faultResume=self.fault_resume_status(),protections=copy.deepcopy(self.protections))
             base.update(self.control)
             manual_active = self.manual_mode != "idle" and self.phase == "running"
             base.update(operation=self.operation, manual=dict(active=manual_active, mode=self.manual_mode,
                 targetC=self.manual_target, cooldownComplete=self.manual_cooldown_complete, rateCMin=self.manual_rate, setpointC=self.target, coolingToTarget=self.manual_cooling,
-                elapsedSec=max(0, int((self.now if manual_active else self.manual_ended) - self.manual_started)),
+                elapsedSec=max(0, int((self.now if manual_active else self.manual_ended) - self.manual_started - self.manual_blocked_time)),
                 startedAtMs=int(self.manual_started * 1000)))
             base.update(mode="FULL", phase=self.phase, fault=self.fault, relay=self.relay, duty=self.duty,
                         ready=not self.missing and self.phase not in ("fault", "interrupted"), pid=dict(self.pid),
@@ -524,6 +603,13 @@ class DemoDevice:
             return self.field_command(endpoint, body)
         if endpoint in ("test/command", "test/heartbeat"):
             return self.full_test_command(endpoint, body)
+        if endpoint == "protections":
+            require(self.phase not in ("running","paused") and not self.test_enabled,"Ferma il controllo ed esci da TEST prima di modificare i blocchi",409)
+            require(all(type(body.get(key)) is bool for key in ("probeDeltaEnabled","meanOvershootEnabled")),"Abilitazioni booleane richieste")
+            require(all(number(body.get(key),.1,430) for key in ("maxProbeDeltaC","maxMeanOvershootC")),"Soglie da 0,1 a 430 °C")
+            self.protections = {key:body[key] for key in self.protections}
+            self.log("PARAMETERS","Blocchi termici salvati in RAM nell'anteprima")
+            return self.status()
         if endpoint in ("recipes", "pid", "control"):
             require(self.phase not in ("running", "paused"), "Ferma il ciclo simulato prima di modificare", 409)
             if endpoint == "recipes":
@@ -539,11 +625,13 @@ class DemoDevice:
                 require(type(body.get("windowSec")) is int and (1 if body["actuator"] == "ssr" else 60) <= body["windowSec"] <= 300
                         and number(body.get("maxPower"), 1, 100), "Finestra o limite comando fuori intervallo")
                 self.control = {k: body[k] for k in ("actuator", "windowSec", "maxPower")}
+            self.fault_resume = None
             self.log(endpoint.upper(), "Impostazioni salvate in RAM nell'anteprima")
             return self.status()
         require(endpoint == "command", "API non trovata", 404)
         action = body.get("action")
         if action == "emergency":
+            self.fault_resume = None
             self.stop_field()
             self.test_enabled = False
             self.emergency = True
@@ -556,6 +644,7 @@ class DemoDevice:
             self.phase, self.target = "fault", None
             self.record(marker=128)
         elif action == "stop":
+            self.fault_resume = None
             self.stop_field()
             self.duty, self.relay = 0.0, False
             if self.operation == "manual" and self.manual_mode != "idle":
@@ -565,11 +654,15 @@ class DemoDevice:
                 self.finish_report("stopped", "Ciclo simulato fermato manualmente")
                 self.phase, self.target = "idle", None
                 self.record(marker=32)
+        elif action == "resetContinue":
+            self.continue_after_fault()
         elif action == "reset":
             require(self.phase not in ("running", "paused"), "Ferma il controllo prima di RESET ERRORI", 409)
             self.stop_field()
             self.test_enabled = False
             require(not self.missing, "Ferma il ciclo e ripristina le sonde", 409)
+            require(all(sensor["valid"] and sensor["c"] is not None and sensor["c"] < 415 for sensor in self.sensors()), "Sonde o temperature fuori limite",409)
+            self.fault_resume = None
             self.phase, self.fault, self.target = "idle", "", None
             self.emergency = False
         elif action == "start":
@@ -579,8 +672,11 @@ class DemoDevice:
             recipe = next((r for r in self.recipes if r["id"] == body.get("recipeId")), None)
             require(recipe is not None, "Programma non trovato", 404)
             first = recipe["steps"][0]
+            reference=first["target"] if first["type"]=="hold" else self.temperature+.1
+            require(not self.protection_problem(reference),self.protection_problem(reference) or "Blocchi attivi",409)
             require(first["type"] != "ramp" or self.temperature + .1 < first["target"] - 1, "Temperatura già vicina al primo target", 409)
             require(first["type"] != "cooldown" or self.temperature + .1 > first["target"] + 1, "Temperatura già sotto il cooldown", 409)
+            self.fault_resume = None
             self.operation, self.manual_mode = "program", "idle"
             self.active, self.phase, self.step_index, self.cycle_at = copy.deepcopy(recipe), "running", 0, self.now
             self.begin_step()
@@ -599,7 +695,9 @@ class DemoDevice:
         elif action == "resume":
             require(self.phase == "paused" and not self.missing, "Nessun ciclo in pausa o sonda non valida", 409)
             step = self.active["steps"][self.step_index]
-            self.target = step["target"] if step["type"] == "hold" else min(step["target"], self.pause_target) if step["type"] == "ramp" else max(step["target"], self.pause_target)
+            reference = step["target"] if step["type"] == "hold" else min(step["target"], self.pause_target) if step["type"] == "ramp" else max(step["target"], self.pause_target)
+            require(not self.protection_problem(reference),self.protection_problem(reference) or "Blocchi attivi",409)
+            self.target = reference
             self.phase = "running"
         else:
             raise ApiError(400, "Azione sconosciuta")

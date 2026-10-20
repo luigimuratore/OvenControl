@@ -56,4 +56,11 @@ int main() {
   cycles.remember(19, 794418);
   assert(cycles.contains(19, 0) && cycles.contains(19, 794418));
   assert(!cycles.contains(20, 794418) && !cycles.contains(19, 794419));
+  // A resumed cycle may later produce a final report; repeated copies of each
+  // terminal event must still be suppressed.
+  cycles.remember(21,1000,62000);
+  assert(cycles.contains(21,1000,62000));
+  assert(!cycles.contains(21,1000,782000));
+  cycles.remember(21,1000,782000);
+  assert(cycles.contains(21,1000,62000) && cycles.contains(21,1000,782000));
 }

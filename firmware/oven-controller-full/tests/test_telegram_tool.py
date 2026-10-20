@@ -322,7 +322,10 @@ class NotificationModeTest(unittest.TestCase):
         device.request("POST", "command", body=dict(action="start", hardwareReady=True, recipeId=device.recipes[0]["id"]))
         status = device.status()
         for title in ("CICLO AVVIATO", "STOP", "CICLO IN PAUSA", "CICLO RIPRESO", "CICLO COMPLETATO"):
-            self.assertIsNone(tool.format_notice(title, status=status, mode="essenziale"))
+            if title == "CICLO AVVIATO":
+                self.assertIn(title, tool.format_notice(title, status=status, mode="essenziale"))
+            else:
+                self.assertIsNone(tool.format_notice(title, status=status, mode="essenziale"))
             brief = tool.format_notice(title, status=status, mode="sintetica")
             detailed = tool.format_notice(title, status=status, mode="dettagliata")
             self.assertIn("Programma:", brief)

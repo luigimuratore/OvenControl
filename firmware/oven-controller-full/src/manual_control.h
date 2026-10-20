@@ -64,6 +64,10 @@ public:
     return true;
   }
   void stop(uint32_t now) { account(now); mode = Mode::Idle; coolingToTarget = false; }
+  // Used only on a saved copy: preserve the reference and accumulated active
+  // time at the fault, then rebase its clock on an explicit operator resume.
+  void freeze(uint32_t now) { account(now); }
+  void rebase(uint32_t now) { lastAt = now; }
 };
 inline const char *modeName(Mode mode) {
   return mode == Mode::Regulating ? "regulating" : mode == Mode::Cooldown ? "cooldown" : "idle";

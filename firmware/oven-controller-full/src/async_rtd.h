@@ -23,8 +23,9 @@ class AsyncRtd : public Adafruit_MAX31865 {
   explicit AsyncRtd(int chipSelect) : Adafruit_MAX31865(chipSelect), cs(chipSelect) {}
   void bias() { write(MAX31865_CONFIG_REG, config | MAX31865_CONFIG_FAULTSTAT | MAX31865_CONFIG_BIAS); }
   void oneShot() { write(MAX31865_CONFIG_REG, config | MAX31865_CONFIG_BIAS | MAX31865_CONFIG_1SHOT); }
-  uint16_t readRaw() { return read(MAX31865_RTDMSB_REG, true) >> 1; }
-  void startFault() { write(MAX31865_CONFIG_REG, config | 0x84); }
+  uint16_t readRaw() { return read(MAX31865_RTDMSB_REG, true); } // Includes the RTD fault flag (bit 0).
+  void startFault() { write(MAX31865_CONFIG_REG, config | 0x88); } // Manual cycle 1: open FORCE-.
+  void finishFault() { write(MAX31865_CONFIG_REG, config | 0x8c); } // Manual cycle 2: check and close.
   uint8_t faultBits() { return uint8_t(read(MAX31865_FAULTSTAT_REG)); }
   void stop() { write(MAX31865_CONFIG_REG, config); }
   void start(uint32_t now) { conversion.start(*this, now); }

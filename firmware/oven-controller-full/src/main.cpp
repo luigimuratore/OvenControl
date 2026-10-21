@@ -117,7 +117,7 @@ constexpr uint8_t HISTORY_START = 0x10, HISTORY_STOP = 0x20;
 constexpr uint8_t HISTORY_COMPLETE = 0x40, HISTORY_FAULT = 0x80;
 
 Sensor sensors[2];
-probes::Recovery sensorRecovery[2];
+probes::PairRecovery sensorRecovery;
 Recipe recipes[MAX_RECIPES], activeRecipe;
 size_t recipeCount = 0;
 Phase phase = Phase::Idle;
@@ -433,7 +433,7 @@ void drainHeaterNotices() {
 }
 String sensorMessage(const Sensor &sensor);
 struct SensorRead {
-  bool previousValid = false, done = false, checking = false;
+  bool previousValid = false, previousRecoveryFailed = false, done = false, checking = false, rawFault = false;
   uint8_t previousFault = 0, initialFault = 0;
   uint16_t initialRaw = 0;
   probes::RecoveryResult result = probes::RecoveryResult::NotAttempted;
@@ -442,9 +442,11 @@ SensorRead sensorReads[2];
 bool sensorBatchActive = false, sensorBatchChecking = false;
 void startSensorPair() {
   sensorBatchActive = true; sensorBatchChecking = false;
+  sensorRecovery = probes::PairRecovery{};
   for (size_t i = 0; i < 2; ++i) {
     sensorReads[i] = SensorRead{};
     sensorReads[i].previousValid = sensors[i].valid; sensorReads[i].previousFault = sensors[i].fault;
+    sensorReads[i].previousRecoveryFailed = sensors[i].recoveryFailed;
     sensors[i].recoveryFailed = false;
   }
   rtd1.start(millis()); rtd2.start(millis());
@@ -457,15 +459,19 @@ void finishSensorRead(size_t index) {
     stopTests("Fault PT100 persistente/non sicuro: TEST fermato", true);
     trip("TEST · PT100 #" + String(index + 1) + ": " + sensorMessage(sensor));
   }
-  if (read.checking)
+  // A disconnected probe is still checked, but the same failed verification
+  // at rest must not fill the log or write NVS every second.
+  if (read.checking && (read.result == probes::RecoveryResult::Confirmed ||
+      !read.previousRecoveryFailed || sensor.fault != read.previousFault))
     logEvent("SONDA", "PT100 #" + String(index + 1) + ": Fault 0x" + String(read.initialFault, HEX) +
       " · RAW " + String(read.initialRaw) +
       (read.result == probes::RecoveryResult::Confirmed ?
-       " · transitorio recuperato con due nuove conversioni valide; uscita spenta durante verifica" :
+       " · transitorio recuperato con una nuova coppia valida; uscita spenta durante verifica" :
        " · verifica non confermata; arresto e allarme"));
   if (read.result == probes::RecoveryResult::Confirmed)
     telegramBot.notifyEvent("⚠️ AVVISO SONDA · PT100 #" + String(index + 1) +
-      "\nFault 0x04 recuperato. Due nuove letture valide; uscite spente durante la verifica.\nEvento a uptime " +
+      "\nLettura anomala recuperata · Fault 0x" + String(read.initialFault, HEX) + " · RAW " + String(read.initialRaw) +
+      ". Nuova coppia valida; uscite spente durante la verifica.\nEvento a uptime " +
       String(millis() / 1000) + " s.", false, telegram::EventScope::DetailedOnly);
   if (sensor.valid != read.previousValid || sensor.fault != read.previousFault)
     logEvent(sensor.valid ? "PT100" : "SONDA", "PT100 #" + String(index + 1) + ": " + sensorMessage(sensor) +
@@ -478,28 +484,36 @@ bool pollSensorPair() {
     auto &read = sensorReads[i]; auto &device = *devices[i]; auto &sensor = sensors[i];
     if (read.done || !device.tick(millis())) continue;
     sensor.raw = device.conversion.raw; sensor.fault = device.conversion.fault;
+    read.rawFault = device.conversion.rawFault;
     const float reference = i == 0 ? RREF_1 : RREF_2;
     sensor.ohms = sensor.raw * reference / 32768.0f;
     sensor.c = device.calculateTemperature(sensor.raw, RNOMINAL, reference);
-    sensor.valid = sensor.fault == 0 && sensor.raw > 0 && sensor.raw < 32767 && thermal::validReading(sensor.c, diagnosticMode());
-    if (!sensor.valid && cycleActive()) inhibitHeater();
-    if (!read.checking) {
+    sensor.valid = !read.rawFault && sensor.fault == 0 && sensor.raw > 0 && sensor.raw < 32767 && thermal::validReading(sensor.c, diagnosticMode());
+    if (!sensor.valid && !read.checking) {
       read.initialFault = sensor.fault; read.initialRaw = sensor.raw;
-      read.result = sensorRecovery[i].begin(sensor.fault);
-      if (read.result == probes::RecoveryResult::Pending) {
-        read.checking = true; sensorBatchChecking = true;
+      read.checking = true;
+      if (!sensorBatchChecking) {
+        sensorBatchChecking = true;
         portENTER_CRITICAL(&heaterMux); outputs.beginSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
         holdTimer.update(millis(), false, false);
       }
-    } else {
-      const auto confirmation = sensor.fault == probes::Recovery::kOvUv ? probes::Confirmation::OvUv :
-        !sensor.valid || !thermal::belowHardLimit(sensor.c) ? probes::Confirmation::Unsafe : probes::Confirmation::Safe;
-      read.result = sensorRecovery[i].confirm(confirmation);
     }
-    if (read.result == probes::RecoveryResult::Pending) device.start(millis());
-    else { read.done = true; if (read.result == probes::RecoveryResult::Failed) sensor.valid = false; }
+    read.done = true;
   }
   if (!sensorReads[0].done || !sensorReads[1].done) return false;
+  if (sensorBatchChecking) {
+    const auto result = sensorRecovery.observe(
+      probes::confirmation(sensors[0].fault, sensors[0].raw, sensors[0].c, diagnosticMode(), sensorReads[0].rawFault),
+      probes::confirmation(sensors[1].fault, sensors[1].raw, sensors[1].c, diagnosticMode(), sensorReads[1].rawFault));
+    if (result == probes::RecoveryResult::Pending) {
+      // Reacquire BOTH probes in every round; do not retain a stale healthy sibling.
+      for (size_t i = 0; i < 2; ++i) { sensorReads[i].done = false; devices[i]->start(millis()); }
+      return false;
+    }
+    for (size_t i = 0; i < 2; ++i)
+      if (sensorReads[i].checking || sensorRecovery.probe[i].failure != probes::RecoveryFailure::None)
+        sensorReads[i].result = result;
+  }
   // Keep verification inhibition through fault handling/logging. No new output
   // is published until both probes and relative protections have been checked.
   for (size_t i = 0; i < 2; ++i) finishSensorRead(i);
@@ -519,11 +533,11 @@ String sensorMessage(const Sensor &sensor) {
   if (sensor.valid) return "Lettura valida";
   String text;
   if (sensor.recoveryFailed) {
-    const auto failure = sensorRecovery[&sensor == &sensors[0] ? 0 : 1].failure;
+    const auto failure = sensorRecovery.probe[&sensor == &sensors[0] ? 0 : 1].failure;
     if (failure == probes::RecoveryFailure::ConsecutiveFaults)
-      text += String(probes::Recovery::kMaxConsecutiveFaults) + " fault 0x04 consecutivi: recupero fallito; ";
+      text += String(probes::Recovery::kMaxConsecutiveFaults) + " letture non valide consecutive: recupero fallito; ";
     else if (failure == probes::RecoveryFailure::Unstable)
-      text += "Letture instabili: due conferme valide non ottenute entro la verifica limitata; ";
+      text += "Letture instabili: nessuna coppia valida ottenuta entro la verifica limitata; ";
     else text += "Conferma non valida o fuori dai limiti di sicurezza: recupero interrotto; ";
   }
   if (sensor.fault & MAX31865_FAULT_HIGHTHRESH) text += "RTD oltre soglia alta; ";
@@ -560,7 +574,7 @@ const char *faultResumeProblem() {
   if (output.recoveryBlocked || recoveryJournal.data.pending || phase == Phase::Interrupted)
     return "Blackout/riavvio o memoria di sicurezza: continuazione non disponibile.";
   if (output.updating || output.diagnostic) return "Esci da TEST e attendi la fine dell'aggiornamento.";
-  if (output.sensorChecking) return "Verifica sonde in corso: attendi due nuove letture valide.";
+  if (output.sensorChecking) return "Verifica sonde in corso: attendi una nuova coppia valida.";
   if (phase != Phase::Fault || !faultResume.available)
     return "Nessun punto di ripresa in RAM. Dopo riavvio, STOP o RESET & BLOCK serve un nuovo avvio.";
   if (!faultResume.manual && (faultResume.step >= activeRecipe.count || !cycleReport.canContinue()))

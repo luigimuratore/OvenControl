@@ -48,7 +48,7 @@ constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 🛡️ /essenziale — Allarmi/blackout e PDF, più avvio ESP e controllo.
 🔔 /sintetica — Eventi brevi, allarmi dettagliati e PDF.
 📋 /dettagliata — Tutti gli eventi con stato completo e PDF.
-La scelta viene salvata; /status e /plot restano sempre disponibili. Avvio ESP e avvio del controllo vengono sempre segnalati, senza suono.
+La scelta è personale e viene salvata; /status e /plot restano sempre disponibili. Avvio ESP e avvio del controllo vengono sempre segnalati, senza suono.
 
 🔔 EVENTI AUTOMATICI
 🚀 Avvio · ⏸️ Pausa · ⏯️ Ripresa · ⚠️ STOP · ✅ Fine ciclo.

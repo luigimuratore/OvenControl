@@ -73,6 +73,9 @@ class DemoDevice:
         self.phase, self.fault, self.temperature, self.missing = "idle", "", 24.0, False
         self.pause_target = None
         self.fault_resume = None
+        self.telegram_users = [dict(chatId="1",name="Proprietario",username="",owner=True,mode="sintetica")]
+        self.telegram_pending = []
+        self.telegram_next_id = 10000
         self.manual_blocked_time = 0.0
         self.control = {"actuator": "relay", "windowSec": 60, "maxPower": 30}
         self.pid = {"kp": 12, "ki": .015, "kd": 50}
@@ -546,8 +549,48 @@ class DemoDevice:
                 runSeq=self.test_run_seq, startedAtMs=int(self.test_at * 1000))
         return base
 
+    def telegram_users_status(self):
+        self.telegram_pending=[u for u in self.telegram_pending if self.now-u["created"]<600]
+        return dict(configured=True,running=True,networkReady=True,preview=True,botUsername="",botUrl="",maxUsers=8,
+                    users=copy.deepcopy(self.telegram_users),pending=[{k:v for k,v in u.items() if k!="created"} for u in self.telegram_pending])
+
+    def telegram_users_command(self,body):
+        self.telegram_users_status()
+        require(not self.status().get("otaUpdating"),"Aggiornamento firmware in corso",409)
+        action=body.get("action")
+        if action=="simulateRequest":
+            require(len(self.telegram_pending)<8,"Richieste in attesa al completo",409)
+            self.telegram_next_id+=1
+            self.telegram_pending.append(dict(chatId=str(self.telegram_next_id),name="Utente di prova",username="utente_prova",created=self.now))
+            return self.telegram_users_status()
+        ident=body.get("chatId")
+        require(isinstance(ident,str) and ident.isdigit() and 0<int(ident)<10**18,"ID Telegram non valido")
+        selected=body.get("mode","sintetica")
+        pending=next((u for u in self.telegram_pending if u["chatId"]==ident),None)
+        user=next((u for u in self.telegram_users if u["chatId"]==ident),None)
+        if action=="reject":
+            require(pending is not None,"Richiesta scaduta o non disponibile",404)
+            self.telegram_pending.remove(pending)
+        elif action=="approve":
+            require(pending is not None,"Richiesta scaduta: invia di nuovo /start",409)
+            require(user is None and len(self.telegram_users)<8,"Utente già autorizzato o limite raggiunto",409)
+            require(selected in ("essenziale","sintetica","dettagliata"),"Modalità non valida")
+            self.telegram_users.append(dict(chatId=ident,name=pending["name"],username=pending["username"],owner=False,mode=selected))
+            self.telegram_pending.remove(pending)
+        elif action=="remove":
+            require(user is not None and not user["owner"],"Il proprietario non è rimovibile",409)
+            self.telegram_users.remove(user)
+        elif action=="mode":
+            require(user is not None and selected in ("essenziale","sintetica","dettagliata"),"Utente o modalità non validi")
+            user["mode"]=selected
+        else:raise ApiError(400,"Azione Telegram sconosciuta")
+        return self.telegram_users_status()
+
     def request(self, method, endpoint, query=None, body=None):
         query = query or {}
+        if endpoint=="telegram/users" and self.mode=="full":
+            if method=="GET":return self.telegram_users_status()
+            if method=="POST":return self.telegram_users_command(body or {})
         if method == "GET":
             if endpoint == "status":
                 return self.status()

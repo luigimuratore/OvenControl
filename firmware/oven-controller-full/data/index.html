@@ -16,6 +16,7 @@
     <button id="tabParameters">Parameters</button>
     <div class="tab-group" role="group" aria-label="Diagnostica"><button id="tabTest">TEST</button><button id="tabLogs">Log</button></div>
     <button id="tabReport">Report</button>
+    <button id="tabTelegram">Telegram</button>
   </nav>
   <section id="errorResetBar" class="error-reset-bar" aria-label="Stato blocco e reset errori">
     <div><strong id="errorResetTitle">Stato errori</strong><p id="errorResetText" role="status" aria-live="polite">In attesa del controllore.</p></div>
@@ -105,6 +106,13 @@
       <p class="hint">Le modifiche si applicano dopo il salvataggio e restano memorizzate al riavvio. Le letture valide e fresche, l'emergenza e il limite assoluto individuale di 415 °C restano attivi. TEST mantiene la sua diagnostica separata.</p>
     </section>
     <div id="parametersMessage" class="notice hidden" role="status"></div>
+  </section>
+  <section id="telegramView" class="panel telegram-view" hidden aria-labelledby="telegramTitle">
+    <div class="panel-title-row"><div><div class="eyebrow">NOTIFICHE E ACCESSI</div><h2 id="telegramTitle">Telegram</h2><p>Gestisci chi può consultare il forno e ricevere gli eventi.</p></div><button id="refreshTelegram" class="ghost">Aggiorna</button></div>
+    <div class="telegram-intro"><div><h3>Invita una persona</h3><ol><li>Condividi il link del bot qui sotto.</li><li>La persona apre la chat e preme <strong>AVVIA</strong> oppure invia <strong>/start</strong>.</li><li>Autorizza la richiesta che compare in questa pagina.</li></ol><p class="hint">Nome e @username aiutano a riconoscere la persona; l'accesso è associato al suo ID Telegram e resta valido se cambia username. Le richieste scadono dopo 10 minuti.</p></div><div class="telegram-connection"><strong id="telegramConnection">In attesa del bot…</strong><a id="telegramBotLink" class="telegram-link" target="_blank" rel="noopener noreferrer" hidden></a><p class="hint">Il link apre la chat del bot. Ogni nuova persona richiede la tua approvazione.</p></div></div>
+    <section class="telegram-section"><h3>Richieste di accesso</h3><button id="simulateTelegramRequest" class="ghost" hidden>Simula /start di un nuovo utente</button><p id="telegramPendingEmpty" class="hint">Nessuna richiesta in attesa.</p><div id="telegramPending" class="telegram-users"></div></section>
+    <section class="telegram-section"><h3>Utenti autorizzati <span id="telegramUserCount"></span></h3><p class="hint">Ogni utente può usare /status e /plot e scegliere le proprie notifiche con /modalita. Il proprietario configurato nel firmware resta autorizzato. Avvio, STOP ed emergenza si comandano dalla dashboard.</p><div id="telegramUsers" class="telegram-users"></div></section>
+    <div id="telegramMessage" class="notice hidden" role="status"></div>
   </section>
   <section id="logsView" class="logs-view panel" hidden><div class="panel-title-row"><div><div class="eyebrow">DIAGNOSTICA</div><h2>Log del controllore</h2><p>Avvio/fine ciclo, step, PID, allarmi, rete e interruzioni.</p></div><div class="log-actions"><button id="refreshLogs" class="ghost">Aggiorna</button><button id="exportLogs" class="ghost">Esporta JSON</button></div></div><p id="logRetention" class="hint">Caricamento…</p><div id="logList" class="log-list"></div></section>
 <section id="testView" hidden>

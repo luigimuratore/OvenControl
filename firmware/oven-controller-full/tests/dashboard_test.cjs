@@ -59,6 +59,45 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
 
 (async () => {
   await flush(); await flush();
+  // The Telegram tab manages approvals and personal modes without changing oven commands.
+  const originalFetch=fetchImpl;
+  let telegramData={configured:true,running:true,networkReady:true,botUsername:'OvenControl_bot',botUrl:'https://t.me/OvenControl_bot',maxUsers:8,
+    users:[{chatId:'42',name:'Proprietario',username:'',owner:true,mode:'sintetica'}],
+    pending:[{chatId:'77',name:'Davide',username:'davide_test',expiresInSec:500}]};
+  const telegramPosts=[];
+  let telegramRepaints=0;
+  elements.get('telegramUsers').replaceChildren=()=>{telegramRepaints++;};
+  fetchImpl=async(url,options)=>{
+    if(url!=='/api/telegram/users')return originalFetch(url,options);
+    if(options?.method==='POST'){
+      const body=JSON.parse(options.body);telegramPosts.push(body);
+      if(body.action==='approve'){
+        telegramData={...telegramData,users:[...telegramData.users,{...telegramData.pending[0],owner:false,mode:body.mode}],pending:[]};
+      }else if(body.action==='mode')telegramData={...telegramData,users:telegramData.users.map(u=>u.chatId===body.chatId?{...u,mode:body.mode}:u)};
+      else if(body.action==='remove')telegramData={...telegramData,users:telegramData.users.filter(u=>u.chatId!==body.chatId)};
+    }
+    return response(telegramData);
+  };
+  run("show('Telegram')");await flush();await flush();
+  assert(!elements.get('telegramView').hidden&&elements.get('dashboardView').hidden);
+  assert(elements.get('telegramPending').textContent.includes('Davide'));
+  assert.equal(elements.get('telegramBotLink').href,'https://t.me/OvenControl_bot');
+  assert(elements.get('simulateTelegramRequest').hidden);
+  const painted=telegramRepaints;telegramData.pending[0].expiresInSec-=5;
+  await run('refreshTelegramUsers()');
+  assert.equal(telegramRepaints,painted); // Polling must not destroy an open mode selector or its buttons.
+  await run("telegramUserAction('approve','77','dettagliata')");
+  assert.equal(telegramPosts.at(-1).chatId,'77');
+  assert.equal(run("telegramUsersData.users[1].mode"),'dettagliata');
+  await run("telegramUserAction('mode','77','essenziale')");
+  assert.equal(run("telegramUsersData.users[0].mode"),'sintetica');
+  assert.equal(run("telegramUsersData.users[1].mode"),'essenziale');
+  run("telegramModeDrafts.set('42','dettagliata')");await run('refreshTelegramUsers()');
+  assert.equal(run("telegramModeDrafts.get('42')"),'dettagliata');
+  await run("telegramUserAction('remove','77','essenziale')");
+  assert.equal(run('telegramUsersData.users.length'),1);
+  assert(telegramPosts.every(p=>p.action!=='start'&&p.action!=='stop'));
+  fetchImpl=originalFetch;run("show('Dashboard')");
   // The recipe editor/import validation accepts 400 C and rejects targets above it.
   const highRecipe = target => [{id:'alta', name:'Prova alta', steps:[{type:'ramp', target, rate:1}]}];
   run(`validateRecipes(${JSON.stringify(highRecipe(400))})`);

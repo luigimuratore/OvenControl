@@ -509,3 +509,20 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
 .report-chart { margin: 18px 0 26px; }
 #reportPlot svg { display: block; width: 100%; height: auto; border-radius: 8px; }
+
+/* Scheda Telegram: colori delle schede e dei riquadri. */
+.telegram-view { max-width:1532px; margin:0 auto 28px; padding:24px; }
+.telegram-intro { display:grid; grid-template-columns:1.4fr 1fr; gap:24px; padding:22px; margin:20px 0; background:#172a36; border:1px solid #34576b; border-radius:12px; }
+.telegram-intro ol { padding-left:22px; line-height:1.9; }
+.telegram-connection { align-self:center; padding:18px; background:#111f2c; border-radius:10px; overflow-wrap:anywhere; }
+.telegram-link { display:block; color:var(--accent-2); margin-top:12px; }
+.telegram-section { padding:22px; margin-top:18px; border:1px solid var(--border); background:var(--panel-2); border-radius:12px; }
+.telegram-users { display:grid; gap:12px; margin-top:14px; }
+.telegram-user { display:flex; align-items:center; justify-content:space-between; gap:18px; padding:16px; background:var(--panel); border:1px solid var(--border); border-radius:10px; }
+.telegram-user.pending { border-color:#6c6139; background:#282719; }
+.telegram-user small { display:block; color:var(--muted); margin-top:5px; }
+.telegram-user-actions { display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
+.telegram-user-actions select { width:auto; min-width:155px; }
+.telegram-user>div:first-child { min-width:0; overflow-wrap:anywhere; }
+@media(max-width:1600px){.telegram-view{margin-left:34px;margin-right:34px;}}
+@media(max-width:680px){.telegram-view{margin-left:16px;margin-right:16px;}.telegram-intro{grid-template-columns:1fr;}.telegram-user{align-items:stretch;flex-direction:column;}.telegram-user-actions>*{flex:1;}}

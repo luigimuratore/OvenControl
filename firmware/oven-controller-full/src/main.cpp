@@ -53,6 +53,8 @@
 #define OVEN_TELEGRAM_CHAT_ID ""
 #endif
 TelegramService telegramBot;
+telegram::Users telegramUsers;
+telegram::PendingUsers telegramPending;
 // ESP32-S3 N16R8; GPIO35/36 are occupied by PSRAM on this module.
 constexpr int CS1 = PIN_CS1, CS2 = PIN_CS2;
 constexpr int HEAT = PIN_RELAY, RED = PIN_RED, GREEN = PIN_GREEN;
@@ -322,7 +324,7 @@ void resetPid() {
 }
 void recordHistory(bool force = false, uint8_t eventFlag = 0);
 void finishCycleReport(Phase next, const String &reason);
-String telegramStatus();
+String telegramStatus(int64_t recipient = 0);
 void telegramNotice(const String &title, const String &reason = "", bool critical = false,
                     telegram::EventScope scope = telegram::EventScope::Selected);
 void stopCycle(Phase next, const String &reason) {
@@ -560,7 +562,7 @@ String telegramTime(uint32_t seconds) {
     (unsigned long)((seconds / 60) % 60), (unsigned long)(seconds % 60));
   return buffer;
 }
-String telegramStatus() {
+String telegramStatus(int64_t recipient) {
   const auto output = outputSnapshot();
   const uint32_t now = millis();
   const char *icon = "💤";
@@ -668,14 +670,17 @@ String telegramStatus() {
   }
   text += "\n🧠 SISTEMA\nUptime: " + telegramTime(now / 1000) + "\nAvvio: #" + String(bootCount) + "\n";
   text += "RAM libera/min: " + String(ESP.getFreeHeap()) + " / " + String(ESP.getMinFreeHeap()) + " B\n";
-  text += "Modalità notifiche: " + String(telegram::modeName(telegramBot.mode())) + "\n";
+  text += "Modalità notifiche: " + String(telegram::modeName(telegramBot.mode(recipient))) + "\n";
   text += "Wi-Fi: " + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + " dBm";
   return text;
 }
 void telegramNotice(const String &title, const String &reason, bool critical, telegram::EventScope scope) {
   if (!telegramBot.configured) return;
-  const auto mode = telegramBot.mode();
-  if (!telegram::allowEvent(mode, critical, scope)) return;
+  const auto recipients=telegramBot.userSettings();
+  for(const auto &user:recipients.entries){
+  if(user.chat<=0)continue;
+  const auto mode = telegram::modeFrom(user.mode);
+  if (!telegram::allowEvent(mode, critical, scope)) continue;
   const char *icon = critical ? "🚨" : "✅";
   if (title.indexOf("EMERGENZA") >= 0 || title.indexOf("ALLARME") >= 0) icon = "🚨";
   else if (title == "CICLO AVVIATO" || title == "MANUALE AVVIATO") icon = "🚀";
@@ -696,14 +701,15 @@ void telegramNotice(const String &title, const String &reason, bool critical, te
     if (title == "ESP AVVIATO") text += String("Avvio completato · firmware ") + firmwareinfo::kVersion +
       "\nWi-Fi capannone connesso: " + WiFi.localIP().toString() + "\n";
     text += "📅 " + String(date);
-    telegramBot.notifyEvent(text, false, scope);
-    return;
+    telegramBot.notifyEvent(text, false, scope,user.chat);
+    continue;
   }
   text += "📅 " + String(date) + "\n";
   if (!cycleActive() && activeRecipe.count) text += "\nProgramma dell'evento: " + activeRecipe.name + "\n";
   if (reason.length()) text += "Motivo: " + reason + "\n";
-  text += "\n📍 STATO AL MOMENTO DELL'EVENTO\n" + telegramStatus();
-  telegramBot.notifyEvent(text, critical, scope);
+  text += "\n📍 STATO AL MOMENTO DELL'EVENTO\n" + telegramStatus(user.chat);
+  telegramBot.notifyEvent(text, critical, scope,user.chat);
+  }
 }
 void beginStep(bool preservePid = false) {
   if (stepIndex >= activeRecipe.count) {
@@ -1660,6 +1666,91 @@ void testHeartbeatApi() {
   if (!ok) { error(403, "Test terminato o appartenente a un'altra dashboard"); return; }
   server.sendHeader("Cache-Control", "no-store"); server.send(204);
 }
+bool saveTelegramUsers(const telegram::Users &proposed) {
+  if(!prefsReady||!telegram::commitUsers(telegramUsers,proposed,[](const telegram::Users &value){
+    return prefs.putBytes("tgUsers",&value,sizeof(value))==sizeof(value);
+  }))return false;
+  telegramBot.setUsers(telegramUsers);return true;
+}
+void telegramUsersApi() {
+  const uint32_t now=millis();telegramPending.expire(now);
+  JsonDocument doc;
+  const auto username=telegramBot.botUsername();
+  doc["configured"]=telegramBot.configured;doc["running"]=telegramBot.statusRunning();
+  doc["networkReady"]=workshopReady()&&ntpSynced&&!outputSnapshot().updating;
+  doc["botUsername"]=username;doc["botUrl"]=username.length()?"https://t.me/"+username:String("");
+  doc["maxUsers"]=telegram::kMaxUsers;
+  auto list=doc["users"].to<JsonArray>();
+  for(size_t i=0;i<telegram::kMaxUsers;++i){const auto &u=telegramUsers.entries[i];if(u.chat<=0)continue;
+    auto row=list.add<JsonObject>();row["chatId"]=String(static_cast<long long>(u.chat));
+    row["name"]=u.name;row["username"]=u.username;row["owner"]=i==0;row["mode"]=telegram::modeKey(telegram::modeFrom(u.mode));
+  }
+  auto pending=doc["pending"].to<JsonArray>();
+  for(const auto &j:telegramPending.entries)if(j.user.chat>0){auto row=pending.add<JsonObject>();
+    row["chatId"]=String(static_cast<long long>(j.user.chat));row["name"]=j.user.name;row["username"]=j.user.username;
+    row["expiresInSec"]=(telegram::kJoinLifetimeMs-uint32_t(now-j.created)+999)/1000;
+  }
+  sendJson(200,doc);
+}
+void telegramUsersCommandApi(){
+  if(outputSnapshot().updating){error(409,"Aggiornamento firmware in corso");return;}
+  if(!telegramBot.configured||!telegramBot.statusRunning()){error(409,"Telegram non configurato o task non disponibile");return;}
+  if(server.arg("plain").length()>1024){error(413,"Richiesta troppo grande");return;}
+  JsonDocument input;if(deserializeJson(input,server.arg("plain"))){error(400,"JSON non valido");return;}
+  const char *id=input["chatId"]|"";char *end=nullptr;
+  const int64_t chat=strtoll(id,&end,10);
+  if(!id[0]||!end||*end||chat<=0||strlen(id)>18){error(400,"ID Telegram non valido");return;}
+  const String action=input["action"]|"";
+  telegramPending.expire(millis());
+  if(action=="reject"){if(!telegramPending.remove(chat)){error(404,"Richiesta scaduta o non disponibile");return;}telegramUsersApi();return;}
+  auto proposed=telegramUsers;
+  const int selected=telegram::modeIndex(input["mode"]|"");
+  if(action=="approve"){
+    if(!input["mode"].isNull()&&selected<0){error(400,"Modalità non valida");return;}
+    const int i=telegramPending.find(chat);
+    if(i<0){error(409,"Richiesta scaduta: l'utente deve inviare di nuovo /start");return;}
+    auto user=telegramPending.entries[i].user;user.mode=uint8_t(selected<0?int(telegram::Mode::Brief):selected);
+    if(!proposed.add(user)){error(409,"Utente già autorizzato o limite di 8 utenti raggiunto");return;}
+  }else if(action=="remove"){
+    if(!proposed.remove(chat)){error(409,"Il proprietario non è rimovibile; utente non disponibile");return;}
+  }else if(action=="mode"){
+    if(!proposed.setMode(chat,selected)){error(400,"Utente o modalità non validi");return;}
+  }else{error(400,"Azione Telegram sconosciuta");return;}
+  if(!saveTelegramUsers(proposed)){error(507,"Salvataggio utenti fallito: autorizzazioni precedenti mantenute");return;}
+  if(action=="approve"){
+    telegramPending.remove(chat);
+    telegramBot.reply(String("✅ Accesso autorizzato a OvenControl.\n/status e /plot sono disponibili.\nModalità notifiche: ")+telegram::modeName(telegramBot.mode(chat))+".\nUsa /modalita per cambiarla o /start per la guida.",true,false,chat);
+  }
+  logEvent("TELEGRAM",String("Utenti aggiornati: ")+action+" · ID "+String(static_cast<long long>(chat)),false);
+  telegramUsersApi();
+}
+void handleTelegramRequest(const telegram::UserRequest &request){
+  if(uint32_t(millis()-request.created)>telegram::kReplyLifetimeMs)return;
+  const int64_t chat=request.user.chat;
+  if(request.command==telegram::Command::None){
+    if(telegramUsers.find(chat)>=0)return;
+    if(telegramPending.add(request.user,millis()))
+      telegramBot.reply("👋 Richiesta di accesso inviata. Il proprietario deve autorizzarti dalla scheda Telegram della dashboard. Poi potrai usare /status e /plot.",false,false,chat,true);
+    return;
+  }
+  if(telegramUsers.find(chat)<0)return;
+  if(request.command==telegram::Command::Status){telegramBot.reply(telegramStatus(chat),false,false,chat);return;}
+  const int selected=request.command==telegram::Command::Essential?0:request.command==telegram::Command::Brief?1:request.command==telegram::Command::Detailed?2:-1;
+  if(selected>=0){
+    auto proposed=telegramUsers;proposed.setMode(chat,selected);
+    if(telegramBot.mode(chat)==telegram::modeFrom(selected)||saveTelegramUsers(proposed))
+      telegramBot.reply(String("✅ Modalità personale: ")+telegram::modeName(telegramBot.mode(chat))+".\n/status e /plot sempre disponibili.",true,false,chat);
+    else telegramBot.reply("⚠️ Modalità non salvata: resta attiva quella precedente.",true,false,chat);
+    return;
+  }
+  const unsigned minutes=request.command==telegram::Command::Plot15?15:request.command==telegram::Command::Plot30?30:request.command==telegram::Command::Plot60?60:0;
+  if(minutes){
+    const uint8_t flags=(sensors[0].valid?1:0)|(sensors[1].valid?2:0)|(std::isfinite(setpointC)?8:0);
+    const Sample current{historySeq,millis(),sensors[0].c,sensors[1].c,setpointC,duty,flags,uint8_t(manualOperation?255:stepIndex)};
+    if(!telegramBot.plot(history,HISTORY_CAP,historyHead,historyCount,current,minutes,chat))
+      telegramBot.reply("📈 Un grafico è già in preparazione o la memoria non è disponibile. Riprova tra poco.",false,false,chat);
+  }
+}
 void setupOta() {
   if (!OVEN_OTA_PASSWORD[0]) { logEvent("OTA", "OTA disabilitato: configura include/ota_config.h"); return; }
   ArduinoOTA.setHostname(MDNS_NAME); ArduinoOTA.setPort(OTA_PORT);
@@ -1919,6 +2010,8 @@ void setup() {
     server.send_P(200, "application/javascript", reinterpret_cast<const char *>(WEB_PDF_JS), sizeof(WEB_PDF_JS));
   });
   server.on("/api/status", HTTP_GET, [] { statusApi(); });
+  server.on("/api/telegram/users",HTTP_GET,telegramUsersApi);
+  server.on("/api/telegram/users",HTTP_POST,telegramUsersCommandApi);
   server.on("/api/recipes", HTTP_GET, recipesApi);
   server.on("/api/recipes", HTTP_POST, saveRecipesApi);
   server.on("/api/command", HTTP_POST, commandApi);
@@ -1937,9 +2030,15 @@ void setup() {
   chipTemperatureC = temperatureRead();
   lastChipTemperatureAt = millis();
   if (apReady) logEvent("RETE", "Dashboard diretta: http://" + WiFi.softAPIP().toString() + "/");
-  telegramBot.setMode(telegram::modeFrom(prefs.getUChar("tgMode", uint8_t(telegram::Mode::Brief))));
+  telegramUsers.begin(strtoll(OVEN_TELEGRAM_CHAT_ID,nullptr,10),telegram::modeFrom(prefs.getUChar("tgMode",uint8_t(telegram::Mode::Brief))));
+  if(prefs.isKey("tgUsers")){
+    telegram::Users saved;
+    if(prefs.getBytesLength("tgUsers")==sizeof(saved)&&prefs.getBytes("tgUsers",&saved,sizeof(saved))==sizeof(saved)&&saved.valid(telegramUsers.entries[0].chat))telegramUsers=saved;
+    else logEvent("ATTENZIONE","Elenco Telegram non valido: resta autorizzato solo il proprietario configurato",false);
+  }
+  telegramBot.setUsers(telegramUsers);
   if (telegramBot.begin(OVEN_TELEGRAM_TOKEN, OVEN_TELEGRAM_CHAT_ID)) {
-    logEvent("TELEGRAM", "Task notifiche attivo; /status riservato alla chat privata configurata", false);
+    logEvent("TELEGRAM", "Task notifiche attivo; utenti autorizzati gestiti dalla scheda Telegram", false);
     // Compose one alert with its time estimate once NTP is available, before
     // enabling Telegram's verified TLS connection.
     bootNoticePending = true;
@@ -1951,28 +2050,8 @@ void loop() {
   if (otaEnabled) ArduinoOTA.handle();
   wifiRecoveryAllowed = !outputSnapshot().updating;
   telegramBot.setAvailable(workshopReady() && ntpSynced && !outputSnapshot().updating);
-  const int requestedMode = telegramBot.takeModeRequest();
-  if (telegram::validMode(requestedMode)) {
-    const auto selected = telegram::modeFrom(requestedMode);
-    if (selected == telegramBot.mode()) {
-      telegramBot.reply(String("🎛 Modalità già attiva: ") + telegram::modeName(selected), true);
-    } else if (prefsReady && prefs.putUChar("tgMode", uint8_t(selected)) == sizeof(uint8_t)) {
-      telegramBot.setMode(selected);
-      logEvent("TELEGRAM", String("Modalità notifiche: ") + telegram::modeName(selected), false);
-      telegramBot.reply(String("✅ Modalità salvata: ") + telegram::modeName(selected) +
-        "\n/status sempre disponibile. Allarmi e PDF restano attivi.", true);
-    } else {
-      telegramBot.reply(String("⚠️ Modalità non salvata. Resta attiva: ") + telegram::modeName(telegramBot.mode()), true);
-    }
-  }
-  if (telegramBot.takeStatusRequest()) telegramBot.reply(telegramStatus());
-  if (const unsigned plotMinutes = telegramBot.takePlotRequest()) {
-    const uint8_t flags = (sensors[0].valid ? 1 : 0) | (sensors[1].valid ? 2 : 0) | (std::isfinite(setpointC) ? 8 : 0);
-    const Sample current{historySeq, millis(), sensors[0].c, sensors[1].c, setpointC, duty, flags,
-      uint8_t(manualOperation ? 255 : stepIndex)};
-    if (!telegramBot.plot(history, HISTORY_CAP, historyHead, historyCount, current, plotMinutes))
-      telegramBot.reply("📈 Grafico non accodato: un invio è già in corso o la memoria non è disponibile. Riprova /plot tra poco.");
-  }
+  telegram::UserRequest request;
+  if(telegramBot.takeRequest(request))handleTelegramRequest(request);
   if (outputSnapshot().updating) { delay(5); return; }
   server.handleClient();
   updateNetwork();

@@ -6,6 +6,8 @@ const types = { ramp: "Ramp", hold: "Hold", cooldown: "Cooldown" };
 const markerNames = { 16: "INIZIO CICLO", 32: "STOP", 64: "FINE CICLO", 128: "ALLARME" };
 let recipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
 let pidLoaded = false;
+let telegramUsersBusy=false, telegramUsersData=null, telegramRenderedKey='';
+const telegramModeDrafts=new Map();
 let protectionsLoaded = false;
 let manualTargetDirty = false;
 let selectedView = 'Dashboard';
@@ -696,7 +698,7 @@ async function refresh() {
 }
 function show(view) {
   selectedView = view;
-  for (const name of ["Dashboard", "Manual", "Recipes", "Parameters", "Test", "Logs", "Report"]) {
+  for (const name of ["Dashboard", "Manual", "Recipes", "Parameters", "Telegram", "Test", "Logs", "Report"]) {
     const active = view === name;
     $(`tab${name}`).classList.toggle("active", active);
     if (name !== 'Manual') $(`${name.toLowerCase()}View`).hidden = name === 'Dashboard' ? !['Dashboard','Manual'].includes(view) : !active;
@@ -709,9 +711,56 @@ function show(view) {
   if (view !== "Test") cancelTestOwnership(true);
   if (view === "Report" && latest?.reportAvailable) loadReport();
   if (view === "Logs") refreshLogs();
+  if(view==='Telegram')refreshTelegramUsers();
   if (view === "Dashboard" || view === 'Manual') drawSoon();
 }
 
+const telegramModes={essenziale:'Essenziale',sintetica:'Sintetica',dettagliata:'Dettagliata'};
+function renderTelegramUsers(data){
+  telegramUsersData=data;
+  $('simulateTelegramRequest').hidden=!data.preview;
+  put('telegramConnection',data.preview?'Anteprima locale · nessun messaggio reale':!data.configured?'Bot non configurato nel firmware':!data.running?'Task Telegram non disponibile':data.networkReady?(data.botUsername?'Bot disponibile · gestione accessi attiva':'Verifica del bot in corso…'):'In attesa di Wi-Fi e ora sincronizzata');
+  const link=$('telegramBotLink');link.hidden=!data.botUrl;
+  if(data.botUrl){link.href=data.botUrl;link.textContent=data.botUrl;}
+  put('telegramUserCount',`${data.users.length} / ${data.maxUsers}`);
+  $('telegramPendingEmpty').hidden=!!data.pending.length;
+  const present=new Set([...data.users,...data.pending].map(u=>u.chatId));
+  for(const id of telegramModeDrafts.keys())if(!present.has(id))telegramModeDrafts.delete(id);
+  const key=JSON.stringify({users:data.users,pending:data.pending.map(({expiresInSec,...u})=>u),running:data.running,busy:telegramUsersBusy,updating:!!latest?.otaUpdating});
+  if(key===telegramRenderedKey)return;
+  telegramRenderedKey=key;
+  $('telegramUsers').replaceChildren();$('telegramPending').replaceChildren();
+  for(const [pending,rows] of [[true,data.pending],[false,data.users]])for(const user of rows){
+    const card=document.createElement('article'),info=document.createElement('div'),name=document.createElement('strong'),detail=document.createElement('small'),actions=document.createElement('div');
+    card.className=`telegram-user${pending?' pending':''}`;actions.className='telegram-user-actions';
+    name.textContent=`${user.name||'Utente Telegram'}${user.owner&&user.name!=='Proprietario'?' · Proprietario':''}`;
+    detail.textContent=`${user.username?'@'+user.username+' · ':''}ID ${user.chatId}${pending?' · in attesa di approvazione':''}`;
+    info.append(name,detail);
+    const mode=document.createElement('select');mode.setAttribute?.('aria-label',`Notifiche per ${user.name||user.chatId}`);
+    for(const [value,label]of Object.entries(telegramModes)){const option=document.createElement('option');option.value=value;option.textContent=label;mode.append(option);}
+    mode.value=telegramModeDrafts.get(user.chatId)||user.mode||'sintetica';mode.onchange=()=>telegramModeDrafts.set(user.chatId,mode.value);actions.append(mode);
+    const button=(label,action,style)=>{const b=document.createElement('button');b.textContent=label;b.className=style;
+      b.disabled=telegramUsersBusy||!!latest?.otaUpdating||!data.running||(action==='approve'&&data.users.length>=data.maxUsers);
+      b.onclick=()=>telegramUserAction(action,user.chatId,mode.value);actions.append(b);};
+    button(pending?'Autorizza':'Salva notifiche',pending?'approve':'mode','primary');
+    if(pending||!user.owner)button(pending?'Rifiuta':'Revoca accesso',pending?'reject':'remove','danger');
+    card.append(info,actions);$(pending?'telegramPending':'telegramUsers').append(card);
+  }
+}
+async function refreshTelegramUsers(){
+  if(telegramUsersBusy)return;telegramUsersBusy=true;$('refreshTelegram').disabled=true;
+  try{const data=await api('/api/telegram/users');telegramUsersBusy=false;renderTelegramUsers(data);}
+  catch(e){note('telegramMessage',e.message,true);}
+  finally{telegramUsersBusy=false;$('refreshTelegram').disabled=false;}
+}
+async function telegramUserAction(action,chatId,mode){
+  if(telegramUsersBusy)return;telegramUsersBusy=true;$('refreshTelegram').disabled=true;
+  if(telegramUsersData)renderTelegramUsers(telegramUsersData);
+  try{const data=await api('/api/telegram/users',{action,chatId,mode});telegramModeDrafts.delete(chatId);telegramUsersBusy=false;renderTelegramUsers(data);
+    note('telegramMessage',({approve:'Utente autorizzato e salvato.',reject:'Richiesta rifiutata.',remove:'Accesso revocato.',mode:'Modalità personale salvata.',simulateRequest:'Richiesta simulata aggiunta: puoi autorizzarla qui.'})[action]);}
+  catch(e){note('telegramMessage',e.message,true);}
+  finally{telegramUsersBusy=false;$('refreshTelegram').disabled=false;if(telegramUsersData)renderTelegramUsers(telegramUsersData);}
+}
 const reportOutcomes = {completed: "CICLO COMPLETATO", stopped: "CICLO FERMATO", fault: "CICLO IN ALLARME"};
 function reportOvershootLabel(r) {
   return r.version >= 3 ? "Superamento massimo della media" : "Superamento massimo sonda più calda";
@@ -901,6 +950,9 @@ $("tabDashboard").onclick = () => show("Dashboard");
 $('tabManual').onclick = () => show('Manual');
 $("tabRecipes").onclick = () => show("Recipes");
 $('tabParameters').onclick = () => show('Parameters');
+$('tabTelegram').onclick=()=>show('Telegram');
+$('refreshTelegram').onclick=refreshTelegramUsers;
+$('simulateTelegramRequest').onclick=()=>telegramUserAction('simulateRequest','0','sintetica');
 $("tabTest").onclick = () => show("Test");
 $("tabLogs").onclick = () => show("Logs");
 $("tabReport").onclick = () => show("Report");
@@ -1008,6 +1060,7 @@ const dashboardInspector = createChartInspector($("tempChart"), $("chartTooltip"
 setupChartScale($("chartYStep"), drawChart);
 updateControls(); drawChart(); loadRecipes().catch(e => note("messageBox", `Programmi non disponibili: ${e.message}`, true)); refresh();
 setInterval(refresh, 500);
+setInterval(()=>{if(selectedView==='Telegram'&&connected)refreshTelegramUsers();},5000);
 setInterval(() => { if (!renderFailed && lastResponseAt !== null && (!connected || performance.now() - lastResponseAt > 5000)) connectionLost(); }, 500);
 setInterval(() => { if (!$("logsView").hidden) refreshLogs(); }, 5000);
 

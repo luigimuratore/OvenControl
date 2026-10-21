@@ -28,7 +28,7 @@ class BotUpdatesTest(unittest.TestCase):
 
     def test_plot_is_a_command_and_has_a_persistent_button(self):
         self.assertIn('/plot', tool.GUIDE_TEXT)
-        self.assertEqual(tool.main_keyboard()['keyboard'], [['/notifiche', '/status'], ['/plot15', '/plot30', '/plot60']])
+        self.assertEqual(tool.main_keyboard()['keyboard'], [['🔔 /notifiche', '🌡️ /status'], ['📈 /plot15', '📈 /plot30', '📈 /plot60']])
         command = tool.Commands(42)
         message = dict(date=100, text='/plot', chat=dict(id=42, type='private'), **{'from': dict(id=42)})
         self.assertEqual(command.consume([dict(update_id=1, message=message)], 101), ['/plot'])
@@ -63,7 +63,7 @@ class BotUpdatesTest(unittest.TestCase):
         buttons = [b for keyboard in (tool.main_keyboard(), tool.mode_keyboard(), tool.plot_keyboard())
                    for row in keyboard['keyboard'] for b in row]
         for button in buttons:
-            expected = '/menu' if button == tool.BACK_BUTTON else tool.PLOT_BUTTONS.get(button, tool.MODE_BUTTONS.get(button, button))
+            expected = '/menu' if button == tool.BACK_BUTTON else tool.MAIN_BUTTONS.get(button, tool.PLOT_BUTTONS.get(button, tool.MODE_BUTTONS.get(button, button)))
             for sender, date, result in ((42, 100, [expected]), (7, 100, []), (42, 1, [])):
                 with self.subTest(button=button, sender=sender, date=date):
                     message = dict(date=date, text=button, chat=dict(id=42, type='private'), **{'from': dict(id=sender)})

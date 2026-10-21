@@ -38,6 +38,8 @@ MODE_MENU_TEXT = re.search(r'R"modes\((.*?)\)modes"',
     (ROOT / "src/telegram_policy.h").read_text(), re.S)[1]
 MODE_LABELS = {"essenziale": "Essenziale", "sintetica": "Sintetica", "dettagliata": "Dettagliata"}
 MODE_BUTTONS = {"🛡️ Essenziale": "/essenziale", "🔔 Sintetica": "/sintetica", "📋 Dettagliata": "/dettagliata"}
+MAIN_BUTTONS = {"🔔 /notifiche": "/notifiche", "🌡️ /status": "/status",
+                "📈 /plot15": "/plot15", "📈 /plot30": "/plot30", "📈 /plot60": "/plot60"}
 PLOT_BUTTONS = {"📈 15 min": "/plot15", "📈 30 min": "/plot30", "📈 60 min": "/plot60"}
 BACK_BUTTON = "⬅️ Indietro"
 MAIN_MENU_TEXT = "🏠 Menu principale: scegli notifiche, stato del forno o un grafico."
@@ -55,7 +57,8 @@ def mode_keyboard():
 
 
 def main_keyboard():
-    return dict(keyboard=[["/notifiche", "/status"], ["/plot15", "/plot30", "/plot60"]],
+    buttons = list(MAIN_BUTTONS)
+    return dict(keyboard=[buttons[:2], buttons[2:]],
                 resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 
@@ -771,7 +774,7 @@ class Commands:
             if not private_message(message, self.chat) or not (0 < date <= now and now - date <= 120):
                 continue
             text = message.get("text")
-            command = PLOT_BUTTONS.get(text, MODE_BUTTONS.get(text, text)) if isinstance(text, str) else None
+            command = MAIN_BUTTONS.get(text, PLOT_BUTTONS.get(text, MODE_BUTTONS.get(text, text))) if isinstance(text, str) else None
             if command == BACK_BUTTON:
                 command = "/menu"
             if command in ("/status", "/plot", "/plot15", "/plot30", "/plot60", "/start", "/help", "/notifiche", "/modalita", "/menu", "/essenziale", "/sintetica", "/dettagliata"):

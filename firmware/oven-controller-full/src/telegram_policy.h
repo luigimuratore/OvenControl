@@ -29,12 +29,18 @@ constexpr const char *kPlot30Button = "📈 30 min";
 constexpr const char *kPlot60Button = "📈 60 min";
 constexpr const char *kBackButton = "⬅️ Indietro";
 constexpr const char *kMainMenuText = "🏠 Menu principale: scegli notifiche, stato del forno o un grafico.";
+struct CommandButton { const char *label, *command; };
+constexpr CommandButton kMainButtons[] = {
+  {"🔔 /notifiche", "/notifiche"}, {"🌡️ /status", "/status"},
+  {"📈 /plot15", "/plot15"}, {"📈 /plot30", "/plot30"}, {"📈 /plot60", "/plot60"}
+};
 enum class Keyboard : uint8_t { None, Main, Notifications, Plot };
 struct KeyboardLayout { const char *buttons[3][3]; size_t rows; };
 inline KeyboardLayout keyboardLayout(Keyboard keyboard) {
   switch (keyboard) {
     case Keyboard::Main:
-      return {{{"/notifiche", "/status", nullptr}, {"/plot15", "/plot30", "/plot60"}, {nullptr, nullptr, nullptr}}, 2};
+      return {{{kMainButtons[0].label, kMainButtons[1].label, nullptr},
+               {kMainButtons[2].label, kMainButtons[3].label, kMainButtons[4].label}, {nullptr, nullptr, nullptr}}, 2};
     case Keyboard::Notifications:
       return {{{kEssentialButton, kBriefButton, nullptr}, {kDetailedButton, nullptr, nullptr}, {kBackButton, nullptr, nullptr}}, 3};
     case Keyboard::Plot:
@@ -48,10 +54,10 @@ inline Keyboard messageKeyboard(bool menu, bool plotMenu) {
 }
 struct BotCommand { const char *name, *description; };
 constexpr BotCommand kBotCommands[] = {
-  {"notifiche", "Scegli le notifiche"}, {"status", "Stato completo del forno"},
-  {"plot15", "Grafico degli ultimi 15 minuti"}, {"plot30", "Grafico degli ultimi 30 minuti"},
-  {"plot60", "Grafico degli ultimi 60 minuti"}, {"menu", "Torna al menu principale"},
-  {"help", "Guida ai comandi"}, {"start", "Mostra e fissa la guida"}
+  {"notifiche", "🔔 Scegli le notifiche"}, {"status", "🌡️ Stato completo del forno"},
+  {"plot15", "📈 Grafico degli ultimi 15 minuti"}, {"plot30", "📈 Grafico degli ultimi 30 minuti"},
+  {"plot60", "📈 Grafico degli ultimi 60 minuti"}, {"menu", "🏠 Torna al menu principale"},
+  {"help", "📖 Guida ai comandi"}, {"start", "📌 Mostra e fissa la guida"}
 };
 constexpr const char *kPlotMenuText = "📈 Scegli l'intervallo del grafico: 15, 30 o 60 minuti. Riceverai una nuova immagine con lo storico disponibile fino a questo momento.";
 inline bool validPlotMinutes(unsigned minutes) { return minutes == 15 || minutes == 30 || minutes == 60; }
@@ -65,13 +71,13 @@ Avvio ESP e avvio del controllo vengono sempre segnalati, senza suono. Gli event
 constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 
 📋 COMANDI
-/status — Stato completo: ciclo, temperature, uscite, PID e allarmi.
-/plot — Scegli il grafico target/media PT100 degli ultimi 15, 30 o 60 minuti.
-/help — Aiuto sul bot.
-/start — Mostra e fissa questa guida; non avvia il forno.
-/notifiche — Mostra la modalità attiva e i pulsanti di scelta.
-/plot15 · /plot30 · /plot60 — Grafico diretto dell'intervallo scelto.
-/menu oppure ⬅️ Indietro — Torna al menu principale.
+🌡️ /status — Stato completo: ciclo, temperature, uscite, PID e allarmi.
+📈 /plot — Scegli il grafico target/media PT100 degli ultimi 15, 30 o 60 minuti.
+📖 /help — Aiuto sul bot.
+📌 /start — Mostra e fissa questa guida; non avvia il forno.
+🔔 /notifiche — Mostra la modalità attiva e i pulsanti di scelta.
+📈 /plot15 · /plot30 · /plot60 — Grafico diretto dell'intervallo scelto.
+🏠 /menu oppure ⬅️ Indietro — Torna al menu principale.
 
 🎛 MODALITÀ NOTIFICHE
 🛡️ /essenziale — Allarmi/blackout e PDF, più avvio ESP e controllo.
@@ -111,6 +117,8 @@ inline bool fresh(int64_t date, int64_t now) {
 enum class Command { None, Status, Plot, Plot15, Plot30, Plot60, Help, ModeMenu, Essential, Brief, Detailed, MainMenu };
 inline Command command(const char *text) {
   if (!text) return Command::None;
+  for (const auto &button : kMainButtons)
+    if (std::strcmp(text, button.label) == 0) { text = button.command; break; }
   if (std::strcmp(text, "/status") == 0) return Command::Status;
   if (std::strcmp(text, "/plot") == 0) return Command::Plot;
   if (std::strcmp(text, "/plot15") == 0 || std::strcmp(text, kPlot15Button) == 0) return Command::Plot15;

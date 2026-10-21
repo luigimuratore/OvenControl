@@ -38,8 +38,9 @@ int main() {
   assert(messageKeyboard(true, true) == Keyboard::Notifications);
   const auto main = keyboardLayout(Keyboard::Main);
   assert(main.rows == 2);
-  assert(!strcmp(main.buttons[0][0], "/notifiche") && !strcmp(main.buttons[0][1], "/status") && !main.buttons[0][2]);
-  assert(!strcmp(main.buttons[1][0], "/plot15") && !strcmp(main.buttons[1][1], "/plot30") && !strcmp(main.buttons[1][2], "/plot60"));
+  assert(!strcmp(main.buttons[0][0], "🔔 /notifiche") && !strcmp(main.buttons[0][1], "🌡️ /status") && !main.buttons[0][2]);
+  assert(!strcmp(main.buttons[1][0], "📈 /plot15") && !strcmp(main.buttons[1][1], "📈 /plot30") && !strcmp(main.buttons[1][2], "📈 /plot60"));
+  for (const auto &button : kMainButtons) assert(command(button.label) == command(button.command));
   const auto notifications = keyboardLayout(Keyboard::Notifications);
   assert(notifications.rows == 3 && command(notifications.buttons[2][0]) == Command::MainMenu);
   assert(command(notifications.buttons[0][0]) == Command::Essential);

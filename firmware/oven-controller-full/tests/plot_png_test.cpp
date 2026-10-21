@@ -13,9 +13,10 @@ int main(int argc, char **argv) {
   }
   const size_t size = plotpng::generate(image.data(), image.size(), raster.data(), raster.size(),
     points.data(), points.size(), start, start + 1800000);
-  assert(size > 400000 && size < image.size());
+  assert(size > 1000 && size < 50000 && size < image.size());
   assert(!memcmp(image.data(), "\x89PNG\r\n\x1a\n", 8));
   assert(!plotpng::generate(image.data(), 1024, raster.data(), raster.size(), points.data(), points.size(), start, start + 1800000));
   assert(!plotpng::generate(image.data(), image.size(), nullptr, 0, points.data(), points.size(), start, start + 1800000));
   if (argc > 1) { std::ofstream f(argv[1], std::ios::binary); f.write(image.data(), size); assert(f.good()); }
+  if (argc > 2) { std::ofstream f(argv[2], std::ios::binary); f.write(reinterpret_cast<const char *>(raster.data()), raster.size()); assert(f.good()); }
 }

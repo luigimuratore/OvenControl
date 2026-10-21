@@ -32,6 +32,16 @@ struct Record {
   char program[49]{};
 };
 struct Estimate { bool known = false; uint64_t upperSec = 0; };
+class CheckpointSchedule {
+  uint32_t attemptedAt = 0;
+ public:
+  static constexpr uint32_t kIntervalMs = 30000;
+  void immediate(uint32_t now) { attemptedAt = now - kIntervalMs; }
+  bool take(uint32_t now) {
+    if (uint32_t(now - attemptedAt) < kIntervalMs) return false;
+    attemptedAt = now; return true;
+  }
+};
 inline Estimate estimate(uint64_t checkpoint, uint64_t reboot) {
   if (!checkpoint || !reboot || reboot < checkpoint) return {};
   Estimate result; result.known = true; result.upperSec = reboot - checkpoint;

@@ -17,6 +17,12 @@ let events = [], eventKey = "", logsBusy = false;
 let history = [], live = [], historyBusy = false, hasOlder = false, boot = null;
 let chartAtEnd = true, chartStart = 0, timeOffset = Date.now(), chartFrame = 0;
 let cycleAnchor = null, cycleKey = null, lastResponseAt = null, renderFailed = false;
+let timelineUptime = null;
+const MILLIS_WRAP = 0x100000000;
+function timelineMs(raw, reference = timelineUptime) {
+  if (!Number.isFinite(raw) || !Number.isFinite(reference)) return raw;
+  return raw + Math.round((reference - raw) / MILLIS_WRAP) * MILLIS_WRAP;
+}
 let readBusy = false, readQueue = [];
 let renderTestStatus = () => {}, testOffline = () => {}, cancelTestOwnership = () => {};
 let testCommandBusy = false;
@@ -28,7 +34,7 @@ function note(id, text, isError = false) {
   const box = $(id); box.textContent = text; box.className = isError ? "notice error" : "notice";
   setTimeout(() => { if (box.textContent === text) box.classList.add("hidden"); }, 7000);
 }
-// WebServer serves one client at a time. Queue reads and give status priority;
+// Queue background reads and give status priority to keep browser traffic bounded;
 // STOP and test heartbeats bypass the queue. Timeouts start when a request is sent.
 function api(path, body, timeoutMs = 2500) {
   if (body !== undefined) return fetchApi(path, body, timeoutMs);
@@ -84,7 +90,7 @@ function remainingStepSeconds(s) {
     ramp ? endTarget - band - Math.min(...readings) : Math.max(...readings) - endTarget - band;
   return Math.ceil(Math.max(0, reference, measured) * 60 / s.stepRate);
 }
-function dateAt(ms) { return new Date(timeOffset + ms).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
+function dateAt(ms) { return new Date(timeOffset + timelineMs(ms)).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }); }
 function chartWindow(oldest, newest, span, anchor, follow, position) {
   const maxStart = Math.max(oldest, anchor ?? oldest, newest - span);
   const start = follow ? maxStart : Math.max(oldest, Math.min(maxStart, position));
@@ -190,15 +196,17 @@ function display(s) {
   if (boot !== null && boot !== s.bootCount) {
     history = []; live = []; hasOlder = false; chartAtEnd = true; chartStart = 0; eventKey = "";
     cycleAnchor = cycleKey = null;
+    timelineUptime = null;
     pidLoaded = settingsLoaded = protectionsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     if (!recipesDirty) { recipesLoaded = false; loadRecipes().catch(() => {}); }
   }
   boot = s.bootCount; latest = s; connected = true; lastResponseAt = performance.now(); renderFailed = false;
+  timelineUptime = Number.isFinite(s.uptimeTotalMs) ? s.uptimeTotalMs : timelineMs(Number(s.uptimeMs));
   if (Number.isFinite(s.cycleStartedAtMs)) {
     const key = `${boot}:${s.cycleStartedAtMs}`;
-    if (key !== cycleKey) { cycleKey = key; cycleAnchor = s.cycleStartedAtMs; chartAtEnd = true; drawSoon(); }
+    if (key !== cycleKey) { cycleKey = key; cycleAnchor = timelineMs(s.cycleStartedAtMs); chartAtEnd = true; drawSoon(); }
   }
-  timeOffset = (s.utcSec ? s.utcSec * 1000 : Date.now()) - Number(s.uptimeMs);
+  timeOffset = (s.utcSec ? s.utcSec * 1000 : Date.now()) - timelineUptime;
   const t1 = s.sensors[0].valid ? Number(s.sensors[0].c) : NaN;
   const t2 = s.sensors[1].valid ? Number(s.sensors[1].c) : NaN;
   const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1 + t2) / 2 : NaN;
@@ -241,7 +249,7 @@ function display(s) {
   }
   put("relayState", s.relay ? "ACCESO" : "SPENTO"); $("relayState").classList.toggle("heating", s.relay);
   put("pidInfo", s.test?.enabled ? "Comando manuale TEST · PID escluso" : `PID ${Math.round(s.duty)}% · finestra ${s.windowSec} s · max ${s.maxPower}%`);
-  put("uptime", clock(s.uptimeMs / 1000));
+  put("uptime", clock(timelineUptime / 1000));
   put("cycleInfo", manualActive ? manualLabel : s.recipeName && (s.phase === "running" || s.phase === "paused") ? s.recipeName : "Due PT100 reali · nessuna simulazione");
   put("stepPosition", s.phase === "complete" ? `${s.stepCount} / ${s.stepCount} · Terminata` : s.stepCount && s.stepIndex < s.stepCount ? `${s.stepIndex + 1} / ${s.stepCount} · ${types[s.stepType] || "—"}` : "—");
   put("finalTarget", Number.isFinite(s.stepFinalTarget) ? `${temp(s.stepFinalTarget)} °C` : "—");
@@ -328,9 +336,10 @@ function display(s) {
     $("actuator").value = s.actuator; $("windowSec").value = s.windowSec; $("maxPower").value = s.maxPower;
     $("windowSec").min = s.actuator === "ssr" ? "1" : "60"; settingsLoaded = true;
   }
-  if (s.sampleAtMs && Number(s.sampleAtMs) > (live.at(-1)?.ms ?? -1)) {
-    live.push({ ms: Number(s.sampleAtMs), t1, t2, actual: avg, target, duty: Number(s.duty), relay: !!s.relay });
-    while (live.length > 1 && live[0].ms < Number(s.sampleAtMs) - LIVE_MS) live.shift();
+  const sampleMs = timelineMs(s.sampleAtMs);
+  if (Number.isFinite(sampleMs) && sampleMs > (live.at(-1)?.ms ?? -1)) {
+    live.push({ ms: sampleMs, t1, t2, actual: avg, target, duty: Number(s.duty), relay: !!s.relay });
+    while (live.length > 1 && live[0].ms < sampleMs - LIVE_MS) live.shift();
     drawSoon();
   }
 }
@@ -544,6 +553,7 @@ function historyPoint(row) {
            target: target === null ? NaN : Number(target), duty: Number(duty), relay: !!(flags & 4),
            marker: flags & 0xf0, step: step === 255 ? null : step, operation: step === 255 ? 'manual' : 'program' };
 }
+function dashboardPoint(row) { const point = historyPoint(row); point.ms = timelineMs(point.ms); return point; }
 async function loadHistory(initial = false) {
   if (historyBusy) return;
   historyBusy = true;
@@ -552,7 +562,7 @@ async function loadHistory(initial = false) {
     const data = await api(initial ? "/api/history?tail=1" : `/api/history?after=${after}`);
     if (boot !== null && data.bootCount !== boot) return;
     if (initial) history = [];
-    history.push(...data.samples.map(historyPoint).filter(p => initial || p.seq > after));
+    history.push(...data.samples.map(dashboardPoint).filter(p => initial || p.seq > after));
     history = history.filter(p => p.seq >= data.oldestSeq);
     hasOlder = !!history.length && history[0].seq > data.oldestSeq;
     drawSoon();
@@ -565,7 +575,7 @@ async function loadOlder() {
   try {
     const before = history[0].seq, data = await api(`/api/history?before=${before}`);
     if (boot !== null && data.bootCount !== boot) return false;
-    const older = data.samples.map(historyPoint).filter(p => p.seq < before);
+    const older = data.samples.map(dashboardPoint).filter(p => p.seq < before);
     history = older.concat(history).filter(p => p.seq >= data.oldestSeq);
     hasOlder = !!history.length && history[0].seq > data.oldestSeq;
     drawSoon(); return older.length > 0;
@@ -1039,7 +1049,7 @@ $("exportSamples").onclick = async () => {
       if (data.bootCount !== exportBoot) throw Error("ESP riavviato durante esportazione: riprova.");
       if (latestSeq === null) latestSeq = data.latestSeq;
       const page = data.samples.filter(row => row[0] <= latestSeq);
-      points.push(...page.map(historyPoint));
+      points.push(...page.map(dashboardPoint));
       if (!page.length) break;
       after = page.at(-1)[0];
       if (after >= latestSeq || !data.more) break;
@@ -1130,13 +1140,13 @@ function renderStatus(data) {
   }
   boot = data.bootCount; state = data; online = true;
   if (data.runSeq && data.runSeq !== runSeq) {
-    runSeq = data.runSeq; testAnchor = data.startedAtMs; chartAtEnd = true;
+    runSeq = data.runSeq; testAnchor = timelineMs(data.startedAtMs); chartAtEnd = true;
     lastHistoryPoll = 0; drawChart();
   }
   if (!data.running && token) clearOwnership();
   $('statusText').textContent = data.running ? 'Test in corso' : 'Connesso';
   $('statusDot').className = `status-dot ${data.running ? 'paused' : 'running'}`;
-  $('uptime').textContent = duration(data.uptimeMs);
+  $('uptime').textContent = duration(timelineUptime ?? data.uptimeMs);
   $('relayState').textContent = data.relay ? 'ATTIVO' : 'SPENTO';
   $('relayState').className = data.relay ? 'heating' : '';
   $('relayHint').textContent = 'Comando GPIO · Verifica il driver';
@@ -1214,7 +1224,7 @@ async function loadHistory() {
   try {
     const data = await api(historySeq ? `/api/history?after=${historySeq}` : '/api/history?tail=1');
     if (generation !== historyGeneration || data.bootCount !== boot) return;
-    samples = samples.concat(data.samples).filter((row, i, all) => (!i || row[0] !== all[i - 1][0]) && row[0] >= data.oldestSeq);
+    samples = samples.concat(data.samples.map(row => [row[0], timelineMs(row[1]), ...row.slice(2)])).filter((row, i, all) => (!i || row[0] !== all[i - 1][0]) && row[0] >= data.oldestSeq);
     hasOlder = !!samples.length && samples[0][0] > data.oldestSeq;
     if (data.samples.length) historySeq = data.samples[data.samples.length - 1][0];
     if (data.more) lastHistoryPoll = 0;
@@ -1230,7 +1240,7 @@ async function moveChart(dir) {
     try {
       const data = await api(`/api/history?before=${before}`);
       if (generation !== historyGeneration || data.bootCount !== boot) return;
-      samples = data.samples.filter(row => row[0] < before).concat(samples).filter(row => row[0] >= data.oldestSeq);
+      samples = data.samples.filter(row => row[0] < before).map(row => [row[0], timelineMs(row[1]), ...row.slice(2)]).concat(samples).filter(row => row[0] >= data.oldestSeq);
       hasOlder = !!samples.length && samples[0][0] > data.oldestSeq;
     } catch (error) { $('chartRangeLabel').textContent = 'Impossibile caricare i dati precedenti'; return; }
     finally { historyBusy = false; setControls(); }

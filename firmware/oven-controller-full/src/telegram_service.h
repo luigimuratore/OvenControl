@@ -14,6 +14,7 @@
 #include "report_pdf.h"
 #include "plot_png.h"
 #include "plot_snapshot.h"
+#include "telegram_outbox.h"
 
 // Arduino's WiFiClientSecure library shadows the SDK's esp_crt_bundle.h.
 // Use the native IDF bundle (built into this SDK), not its Arduino replacement.
@@ -22,7 +23,7 @@ extern "C" esp_err_t esp_crt_bundle_attach(void *conf);
 // The worker owns all HTTPS/JSON state. The loop only copies fixed-size messages
 // into PSRAM queues with zero wait. No sensor, PID, Preferences or GPIO access here.
 class TelegramService {
-  struct Message { uint32_t created; int64_t chat=0; bool registration=false, pin=false, menu=false, plotMenu=false, event=false; telegram::EventScope scope=telegram::EventScope::Selected; char text[telegram::kMessageBytes]; };
+  struct Message { uint32_t created; uint64_t createdUtc=0; int diskSlot=-1; int64_t chat=0; bool registration=false, pin=false, menu=false, plotMenu=false, event=false; telegram::EventScope scope=telegram::EventScope::Selected; char text[telegram::kMessageBytes]; };
   struct ReportJob {
     reports::Snapshot report;
     reportpdf::Point *points = nullptr;
@@ -33,8 +34,17 @@ class TelegramService {
     int64_t recipients[telegram::kMaxUsers]{};
     size_t recipientCount=0, recipientIndex=0;
     bool recipientFailed=false;
+    int diskSlot = -1;
+    uint64_t expiresUtc = 0;
+  };
+  struct StoredReport {
+    reports::Snapshot report;
+    uint32_t count = 0, recipientCount = 0, recipientIndex = 0;
+    int64_t recipients[telegram::kMaxUsers]{};
+    bool partial = false, recipientFailed = false;
   };
   struct Worker {
+    telegram::DurableOutbox outbox;
     Message critical{}, notice{}, reply{};
     bool hasCritical = false, hasNotice = false, hasReply = false;
     char *response = nullptr;
@@ -46,9 +56,10 @@ class TelegramService {
     uint32_t lastSend = 0;
     unsigned serverRetry = 0;
     std::atomic<bool> tlsConnected{false};
-    telegram::RetryLane messages, polling, attachments, setup;
+    telegram::RetryLane messages, polling, attachments, setup, storage;
     bool identityLoaded=false;
     ReportJob *document = nullptr;
+    ReportJob *plotWaiting = nullptr;
     char *pdf = nullptr;
     size_t pdfBytes = 0;
   };
@@ -96,6 +107,7 @@ class TelegramService {
   }
   void finishDocument(bool success) {
     const bool plot = worker->document->plot;
+    worker->outbox.erase(worker->document->diskSlot);
     releaseReport(worker->document); worker->document = nullptr;
     free(worker->pdf); worker->pdf = nullptr; worker->pdfBytes = 0;
     if (plot) { --plotsPending; if (success) ++plotsSent; else ++plotsDropped; }
@@ -104,7 +116,107 @@ class TelegramService {
   void finishRecipient(bool success) {
     auto *job=worker->document;
     job->recipientFailed |= !success;
-    if(++job->recipientIndex>=job->recipientCount) finishDocument(!job->recipientFailed);
+    ++job->recipientIndex;
+    worker->outbox.mark(job->diskSlot, job->recipientIndex, false, job->recipientFailed);
+    if(job->recipientIndex>=job->recipientCount) finishDocument(!job->recipientFailed);
+  }
+  void stageMessages(QueueHandle_t queue, telegram::StoredKind kind) {
+    if (!worker->outbox.active()) return;
+    Message message{};
+    // Peek leaves the original queued if flash is full/unavailable.
+    for (unsigned n=0; n<80 && xQueuePeek(queue,&message,0)==pdTRUE; ++n) {
+      const int slot=worker->outbox.put(kind,&message,sizeof(message));
+      if(slot<0)break;
+      xQueueReceive(queue,&message,0);
+    }
+  }
+  int persistReport(const ReportJob &job) {
+    StoredReport stored; stored.report=job.report; stored.count=job.count;
+    stored.recipientCount=job.recipientCount; stored.partial=job.partial;
+    stored.recipientIndex=job.recipientIndex;stored.recipientFailed=job.recipientFailed;
+    memcpy(stored.recipients,job.recipients,sizeof(stored.recipients));
+    return worker->outbox.put(telegram::StoredKind::Report,&stored,sizeof(stored),job.points,job.count*sizeof(reportpdf::Point));
+  }
+  void stageDocuments() {
+    if (!worker->outbox.active()) return;
+    auto *held=worker->document;
+    if(held && !held->plot && held->diskSlot<0) {
+      // A report dequeued during a storage failure can become durable later.
+      const int slot=persistReport(*held);
+      if(slot<0)return;
+      held->diskSlot=slot;worker->outbox.loaded(slot);
+    }
+    ReportJob *job=nullptr;
+    while (xQueuePeek(documents,&job,0)==pdTRUE) {
+      if(job->plot) {
+        if(worker->plotWaiting)break;
+        xQueueReceive(documents,&worker->plotWaiting,0); continue;
+      }
+      const int slot=persistReport(*job);
+      if(slot<0)break;
+      xQueueReceive(documents,&job,0); releaseReport(job);
+      // The logical pending count now belongs to the durable record.
+    }
+  }
+  bool restoreMessage(Message &message, telegram::StoredKind kind) {
+    auto &outbox=worker->outbox;
+    for (int slot=outbox.next(kind); slot>=0; slot=outbox.next(kind)) {
+      const auto header=outbox.entry(slot).header;
+      if(!outbox.read(slot,&message,sizeof(message)) || message.registration || message.chat<=0 ||
+          !memchr(message.text,0,sizeof(message.text)) || unsigned(message.scope)>unsigned(telegram::EventScope::DetailedOnly)) {
+        outbox.erase(slot); ++dropped; continue;
+      }
+      const auto epoch=time(nullptr);
+      const uint64_t createdUtc=message.createdUtc?message.createdUtc:header.utc;
+      if(kind==telegram::StoredKind::Notice && createdUtc && epoch>=1700000000 &&
+          uint64_t(epoch)>createdUtc+telegram::kNoticeLifetimeMs/1000) {
+        outbox.erase(slot); ++dropped; continue;
+      }
+      const uint64_t age=createdUtc && epoch>=1700000000 && uint64_t(epoch)>=createdUtc ? uint64_t(epoch)-createdUtc : 0;
+      message.created=millis()-uint32_t(std::min(age,uint64_t(86400))*1000); message.diskSlot=slot; outbox.loaded(slot); return true;
+    }
+    return false;
+  }
+  ReportJob *restoreDocument() {
+    auto &outbox=worker->outbox;
+    const int slot=outbox.next(telegram::StoredKind::Report);
+    if(slot<0)return nullptr;
+    const auto entry=outbox.entry(slot);
+    if(entry.header.metadata!=sizeof(StoredReport) || entry.header.payload>4321*sizeof(reportpdf::Point) || entry.header.payload%sizeof(reportpdf::Point)) {
+      outbox.erase(slot);--reportsPending;++reportsDropped;return nullptr;
+    }
+    auto *job=static_cast<ReportJob *>(ps_malloc(sizeof(ReportJob)));
+    if(!job)return nullptr;
+    new(job)ReportJob(); StoredReport stored;
+    job->points=entry.header.payload?static_cast<reportpdf::Point *>(ps_malloc(entry.header.payload)):nullptr;
+    if (entry.header.payload&&!job->points) {releaseReport(job);return nullptr;}
+    if (!outbox.read(slot,&stored,sizeof(stored),job->points,entry.header.payload)) {
+      releaseReport(job);outbox.erase(slot);--reportsPending;++reportsDropped;return nullptr;
+    }
+    bool valid=stored.count<=4321 && stored.count*sizeof(reportpdf::Point)==entry.header.payload &&
+      stored.recipientCount>0 && stored.recipientCount<=telegram::kMaxUsers && entry.progress.index<=stored.recipientCount && stored.recipientIndex<=stored.recipientCount &&
+      reports::supportedVersion(stored.report.version) && stored.report.stepCount<=reports::kMaxSteps &&
+      memchr(stored.report.recipeName,0,sizeof(stored.report.recipeName)) && memchr(stored.report.reason,0,sizeof(stored.report.reason));
+    for(size_t i=0;i<stored.recipientCount && i<telegram::kMaxUsers;++i)valid &= stored.recipients[i]>0;
+    if(!valid){releaseReport(job);outbox.erase(slot);--reportsPending;++reportsDropped;return nullptr;}
+    job->report=stored.report; job->count=stored.count; job->partial=stored.partial;
+    job->recipientCount=stored.recipientCount; memcpy(job->recipients,stored.recipients,sizeof(job->recipients));
+    job->recipientIndex=std::max(stored.recipientIndex,entry.progress.index); job->diskSlot=slot; job->created=millis();
+    job->recipientFailed=stored.recipientFailed||entry.progress.failed;
+    const uint64_t createdUtc=stored.report.endUtc?stored.report.endUtc:entry.header.utc;
+    job->expiresUtc=createdUtc?createdUtc+86400:0;
+    if(entry.progress.ambiguous && job->recipientIndex<job->recipientCount) {
+      // A power cut after the durable send-intent may have delivered this
+      // recipient's PDF. Never replay an ambiguous upload; continue the others.
+      reply("⚠️ Invio PDF precedente al riavvio non confermato. Per evitare duplicati non viene ripetuto; controlla la chat o scaricalo dalla dashboard.",false,false,job->recipients[job->recipientIndex]);
+      ++job->recipientIndex; job->recipientFailed=true; ++reportsUnconfirmed;
+      outbox.mark(slot,job->recipientIndex,false,true);
+    }
+    outbox.loaded(slot);
+    if(job->recipientIndex>=job->recipientCount) {
+      outbox.erase(slot);releaseReport(job);--reportsPending;return nullptr;
+    }
+    return job;
   }
   int pendingPin() const {
     for(size_t i=0;i<telegram::kMaxUsers;++i)if(worker->pinMessageId[i])return int(i);
@@ -291,10 +403,11 @@ class TelegramService {
     if(!authorizedChat(recipient)){finishRecipient(false);return false;}
     w.serverRetry = 0;
     if (!w.pdf) {
-      w.pdf = static_cast<char *>(ps_malloc(reportpdf::kCapacity));
+      const size_t capacity = plot ? plotpng::kCapacity : reportpdf::kCapacity;
+      w.pdf = static_cast<char *>(ps_malloc(capacity));
       if (w.pdf && plot) {
         auto *raster = static_cast<uint8_t *>(ps_malloc(plotpng::kRasterBytes));
-        if (raster) w.pdfBytes = plotpng::generate(w.pdf, reportpdf::kCapacity, raster, plotpng::kRasterBytes,
+        if (raster) w.pdfBytes = plotpng::generate(w.pdf, capacity, raster, plotpng::kRasterBytes,
           w.document->points, w.document->count, w.document->report.startMs, w.document->report.endMs, renderYield);
         free(raster);
       } else if (w.pdf) w.pdfBytes = reportpdf::generate(w.pdf, reportpdf::kCapacity, w.document->report,
@@ -340,7 +453,12 @@ class TelegramService {
         if (uxQueueMessagesWaiting(alarms) || uxQueueMessagesWaiting(replies)) { interrupted = true; return false; }
         // A failed final write may still have reached the server. Do not repeat
         // an upload with an ambiguous result, even if its reply is lost.
-        if (finalBoundary) mayHaveDelivered = true;
+        if (finalBoundary) {
+          // Persist send-intent BEFORE the only write that can complete an
+          // upload. A reset afterwards skips this recipient rather than spamming.
+          if(!w.outbox.mark(w.document->diskSlot,w.document->recipientIndex,true,w.document->recipientFailed))return false;
+          mayHaveDelivered = true;
+        }
         const int n = esp_http_client_write(client, data + at, std::min(size_t(1024), bytes - at));
         if (n <= 0) return false;
         at += n; vTaskDelay(pdMS_TO_TICKS(1));
@@ -368,7 +486,11 @@ class TelegramService {
       w.serverRetry = response["parameters"]["retry_after"] | 0U;
     const auto result = telegram::documentResult(mayHaveDelivered, code, validResponse,
       response["ok"].as<bool>(), response["result"]["message_id"] | int64_t(0));
-    if (result == telegram::DocumentResult::Retry) { backoff(w.attachments); return false; }
+    if (result == telegram::DocumentResult::Retry) {
+      // Telegram's explicit 429 proves rejection; a reboot may safely retry it.
+      if(code==429)w.outbox.mark(w.document->diskSlot,w.document->recipientIndex,false,w.document->recipientFailed);
+      backoff(w.attachments); return false;
+    }
     if (result != telegram::DocumentResult::Confirmed) {
       ++failed;
       if (!plot && result == telegram::DocumentResult::Uncertain) ++reportsUnconfirmed;
@@ -428,24 +550,43 @@ class TelegramService {
   }
   void run() {
     auto &w = *worker;
+    w.outbox.begin(chatId);
+    for(int i=0;i<telegram::DurableOutbox::kSlots;++i)
+      if(w.outbox.entry(i).occupied && w.outbox.entry(i).progress.index!=255 && w.outbox.entry(i).header.kind==telegram::StoredKind::Report)++reportsPending;
     for (;;) {
-      if (!available.load()) { closeHttp(); vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+      // Stage even while offline. All flash I/O is on this worker, never the
+      // control task. Full/unavailable storage retains the original RAM queues.
+      if(w.storage.ready(millis())) {
+        const uint32_t errors=w.outbox.failures();
+        stageMessages(alarms,telegram::StoredKind::Alarm);
+        stageMessages(notices,telegram::StoredKind::Notice);
+        stageDocuments();
+        if(w.outbox.failures()!=errors)w.storage.fail(millis());
+        else w.storage.success(millis(),200);
+      }
+      if (!available.load()) { closeHttp(); vTaskDelay(pdMS_TO_TICKS(100)); continue; }
       const uint32_t now = millis();
-      if (!w.hasCritical) w.hasCritical = xQueueReceive(alarms, &w.critical, 0) == pdTRUE;
+      if (!w.hasCritical) w.hasCritical = restoreMessage(w.critical,telegram::StoredKind::Alarm) || xQueueReceive(alarms, &w.critical, 0) == pdTRUE;
       if (!w.hasReply) w.hasReply = xQueueReceive(replies, &w.reply, 0) == pdTRUE;
-      if (!w.hasNotice) w.hasNotice = xQueueReceive(notices, &w.notice, 0) == pdTRUE;
-      if (!w.document) xQueueReceive(documents, &w.document, 0);
-      if (w.document && uint32_t(now - w.document->created) > (w.document->plot ? 60000u : 86400000u)) {
+      if (!w.hasNotice) w.hasNotice = restoreMessage(w.notice,telegram::StoredKind::Notice) || xQueueReceive(notices, &w.notice, 0) == pdTRUE;
+      if (!w.document) {
+        if(w.plotWaiting){w.document=w.plotWaiting;w.plotWaiting=nullptr;}
+        else w.document=restoreDocument();
+        if(!w.document)xQueueReceive(documents,&w.document,0);
+      }
+      if (w.document && ((w.document->expiresUtc && uint64_t(time(nullptr))>w.document->expiresUtc) ||
+          uint32_t(now - w.document->created) > (w.document->plot ? 60000u : 86400000u))) {
         const bool plot = w.document->plot; const int64_t recipient=w.document->recipients[w.document->recipientIndex];finishDocument(false);
         if (plot) reply("📈 Richiesta grafico scaduta durante l'attesa. Riprova /plot.",false,false,recipient);
       }
       if (w.hasReply && telegram::expired(now, w.reply.created, true, false)) { w.hasReply = false; ++dropped; }
-      if (w.hasNotice && telegram::expired(now, w.notice.created, false, false)) { w.hasNotice = false; ++dropped; }
+      if (w.hasNotice && telegram::expired(now, w.notice.created, false, false)) { w.outbox.erase(w.notice.diskSlot); w.hasNotice = false; ++dropped; }
       // A selection also suppresses old routine events still waiting in the queue.
-      if (w.hasNotice && w.notice.event && !telegram::allowEvent(mode(w.notice.chat), false, w.notice.scope)) w.hasNotice = false;
+      if (w.hasNotice && w.notice.event && !telegram::allowEvent(mode(w.notice.chat), false, w.notice.scope)) {w.outbox.erase(w.notice.diskSlot);w.hasNotice = false;}
       Message *out = w.hasCritical ? &w.critical : w.hasReply ? &w.reply : w.hasNotice ? &w.notice : nullptr;
       if (out && w.messages.ready(now) && uint32_t(now - w.lastSend) >= 1100) {
         if (sendMessage(*out, out == &w.critical)) {
+          w.outbox.erase(out->diskSlot);
           if (out == &w.critical) w.hasCritical = false;
           else if (out == &w.reply) w.hasReply = false;
           else w.hasNotice = false;
@@ -464,6 +605,7 @@ class TelegramService {
   static void task(void *self) { static_cast<TelegramService *>(self)->run(); }
   static void copyText(Message &message, const String &text) {
     message.created = millis();
+    const auto epoch=time(nullptr);message.createdUtc=epoch>=1700000000?uint64_t(epoch):0;
     size_t bytes = text.length();
     if (bytes >= sizeof(message.text)) {
       bytes = sizeof(message.text) - 1;
@@ -592,5 +734,8 @@ public:
     object["tlsRecordBytes"] = kTlsRecordBytes; object["memoryDeferrals"] = memoryDeferrals.load();
     object["pollCount"] = pollCount.load(); object["lastPollAtMs"] = lastPoll.load();
     object["commandsReceived"] = commandsReceived.load(); object["staleCommands"] = staleCommands.load();
+    object["outboxReady"] = worker && worker->outbox.active();
+    object["outboxRecords"] = worker ? worker->outbox.count() : 0;
+    object["outboxErrors"] = worker ? worker->outbox.failures() : 0;
   }
 };

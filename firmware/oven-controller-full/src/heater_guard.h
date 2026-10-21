@@ -10,8 +10,7 @@ inline bool validSettings(bool ssr, float maxPower, uint32_t windowMs) {
 enum class Fault : uint8_t { None, StaleControl, InvalidPlan = 3 };
 struct Plan {
   bool cycleActive = false, heatingAllowed = false, healthy = false;
-  bool manual = false; // Manual regulation ends only on operator command or a fault.
-  uint32_t sampleAt = 0, cycleAt = 0, windowAt = 0, windowMs = 60000;
+  uint32_t sampleAt = 0, windowAt = 0, windowMs = 60000;
   float duty = 0;
 };
 class Guard {

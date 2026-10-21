@@ -15,7 +15,7 @@ int main() {
   assert(!guard.tick(0));
   heater::Plan p;
   p.cycleActive = p.heatingAllowed = p.healthy = true;
-  p.sampleAt = p.cycleAt = p.windowAt = 100; p.windowMs = 10000; p.duty = 25;
+  p.sampleAt = p.windowAt = 100; p.windowMs = 10000; p.duty = 25;
   guard.publish(p);
   assert(guard.tick(100)); assert(guard.tick(2599)); assert(!guard.tick(2600));
   p.sampleAt = 10000; guard.publish(p); assert(!guard.tick(10099)); assert(guard.tick(10100));
@@ -29,13 +29,13 @@ int main() {
   assert(!guard.tick(200000) && guard.fault == heater::Fault::None); // STOP does not leave an active lease.
   guard.clear(); p.heatingAllowed = true; p.sampleAt = p.windowAt = 43200100; guard.publish(p);
   assert(guard.tick(43200100) && guard.fault == heater::Fault::None);
-  guard.clear(); p.sampleAt = p.cycleAt = p.windowAt = 0; p.duty = std::numeric_limits<float>::quiet_NaN(); guard.publish(p);
+  guard.clear(); p.sampleAt = p.windowAt = 0; p.duty = std::numeric_limits<float>::quiet_NaN(); guard.publish(p);
   assert(!guard.tick(0) && guard.fault == heater::Fault::InvalidPlan);
   guard.clear(); p.duty = 100; p.healthy = false; guard.publish(p);
   assert(!guard.tick(0) && guard.fault == heater::Fault::InvalidPlan);
   guard.clear(); p.healthy = true; p.windowMs = 0; guard.publish(p);
   assert(!guard.tick(0) && guard.fault == heater::Fault::InvalidPlan);
-  guard.clear(); p.windowMs = 10000; p.sampleAt = p.cycleAt = p.windowAt = UINT32_MAX - 500;
+  guard.clear(); p.windowMs = 10000; p.sampleAt = p.windowAt = UINT32_MAX - 500;
   guard.publish(p); assert(guard.tick(200));
   assert(!guard.tick(uint32_t(p.sampleAt + 3000)) && guard.fault == heater::Fault::StaleControl);
 

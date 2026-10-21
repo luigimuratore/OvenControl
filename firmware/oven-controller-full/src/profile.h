@@ -9,7 +9,7 @@ enum class Type : uint8_t { Ramp, Hold, Cooldown };
 struct Step {
   Type type;
   float target;
-  float rate;       // °C/min for ramps and passive cooldowns
+  float rate;       // °C/min for ramps and regulated cooldowns
   uint16_t minutes; // Hold duration
 };
 

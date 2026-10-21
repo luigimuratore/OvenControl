@@ -21,7 +21,7 @@ int main() {
   const float output = pid.update(pause.targetC, 101.5f, 12, .02f, 50, 60, 65000);
   assert(output == 9 && pid.integral == 9);
   heater::Plan plan; plan.cycleActive = plan.heatingAllowed = plan.healthy = true;
-  plan.sampleAt = plan.cycleAt = plan.windowAt = 65000;
+  plan.sampleAt = plan.windowAt = 65000;
   plan.windowMs = 5000; plan.duty = output;
   OutputSupervisor supervisor; assert(supervisor.publish(plan));
   supervisor.tick(65000, true, false); assert(supervisor.relay);
@@ -73,7 +73,7 @@ int main() {
   assert(pause.resume(ramp, uint32_t(start + 1000), origin, segmentAt, before));
   assert(before == 1500 && uint32_t(uint32_t(start + 1100) - segmentAt) == 100);
   regulation::ProgramPause afterBoot; assert(!afterBoot.active);
-  heater::Guard timeout; plan.heatingAllowed = true; plan.duty = 30; plan.cycleAt = 0;
+  heater::Guard timeout; plan.heatingAllowed = true; plan.duty = 30;
   plan.sampleAt = 13UL * 3600000; plan.windowAt = plan.sampleAt; timeout.publish(plan);
   assert(timeout.tick(plan.sampleAt) && timeout.fault == heater::Fault::None);
   puts("Pause: PID hold, continuous resume/rate, active times, hold qualification, cooldown, bounds, STOP, safety and wrap passed");

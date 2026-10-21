@@ -10,7 +10,7 @@ int main() {
   OutputSupervisor outputs;
   heater::Plan plan;
   plan.cycleActive = plan.heatingAllowed = plan.healthy = true;
-  plan.sampleAt = plan.cycleAt = plan.windowAt = 100;
+  plan.sampleAt = plan.windowAt = 100;
   plan.windowMs = 1000; plan.duty = 100;
   outputs.publish(plan); outputs.tick(100, true, false);
   assert(outputs.relay);

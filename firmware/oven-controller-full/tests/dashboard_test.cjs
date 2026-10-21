@@ -59,6 +59,18 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
 
 (async () => {
   await flush(); await flush();
+  // Live/history clocks continue through millis() rollover, including reload
+  // after rollover with a 64-bit uptime, and reset cleanly on a real reboot.
+  run('display({...latest,bootCount:1,uptimeMs:4294967000,sampleAtMs:4294967000,uptimeTotalMs:4294967000})');
+  run('display({...latest,uptimeMs:204,sampleAtMs:204,uptimeTotalMs:4294967500})');
+  assert.equal(run('live.at(-1).ms'),4294967500);
+  assert.equal(run('dashboardPoint([1,4294967000,30,31,50,10,11,0]).ms'),4294967000);
+  assert.equal(run('historyPoint([1,204,30,31,50,10,11,0]).ms'),204); // Report snapshots retain their own timeline.
+  run('display({...latest,uptimeMs:704,sampleAtMs:704,uptimeTotalMs:undefined})');
+  assert.equal(run('live.at(-1).ms'),4294968000);
+  run('display({...latest,bootCount:2,uptimeMs:500,sampleAtMs:500,uptimeTotalMs:500})');
+  assert.equal(run('live.at(-1).ms'),500);
+  run('display({...latest,bootCount:1,uptimeMs:610000,sampleAtMs:610000,uptimeTotalMs:610000})');
   // The Telegram tab manages approvals and personal modes without changing oven commands.
   const originalFetch=fetchImpl;
   let telegramData={configured:true,running:true,networkReady:true,botUsername:'OvenControl_bot',botUrl:'https://t.me/OvenControl_bot',maxUsers:8,

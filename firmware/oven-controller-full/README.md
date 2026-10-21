@@ -8,7 +8,7 @@ La scheda **TEST** integra il collaudo di `oven-controller-field-test`: puoi ver
 
 ## Funzioni disponibili
 
-- Dashboard locale da telefono/PC, senza dipendenze web esterne, con schede **Dashboard / Manuale / Programmi / Parameters / TEST / Log / Report**.
+- Dashboard locale da telefono/PC, senza dipendenze web esterne, con schede **Dashboard / Manuale / Programmi / Parameters / TEST / Log / Report / Telegram**.
 - Collaudo completo: LED, sequenze, relè da 0,1 s a 10 min, heartbeat, checklist, grafico PT100 e CSV diagnostico.
 - Aggiornamenti Wi-Fi OTA con password, arresto di test/ciclo e blocco delle uscite durante la scrittura.
 - Due PT100 reali: temperatura, resistenza calcolata, RAW, RREF e fault descritti.
@@ -24,6 +24,49 @@ La scheda **TEST** integra il collaudo di `oven-controller-field-test`: puoi ver
 - Rete Wi-Fi diretta più rete del capannone, mDNS, NTP, contatore avvii e rilevazione ciclo interrotto.
 - Diagnostica chip ESP, RAM libera/minima, RSSI e età delle letture.
 - Bot Telegram opzionale: `/status` dalla chat privata autorizzata e notifiche di avvio, pausa/ripresa, STOP, completamento, emergenze, allarmi e riavvio.
+
+## Ottimizzazione e verifica — full-1.21
+
+Le funzioni di full-1.20 rimangono disponibili: programmi e manuale, PID e discesa regolata, pausa con mantenimento, RESET & BLOCK / CONTINUE, TEST, report PDF/CSV/PNG/JSON e bot multiutente con modalità personali. Le impostazioni e i registri NVS esistenti conservano formato e chiavi. Nessun aggiornamento viene caricato dall'esecuzione dei test.
+
+| Intervento | Comportamento |
+| --- | --- |
+| HTTP separato dal controllo | Un task di rete gestisce fino a 3 connessioni con intestazioni/corpi limitati, lettura incrementale e invio socket senza attese. Solo richieste complete entrano nel loop; solo il loop legge/modifica lo stato del forno. POST precede le letture. Richieste in attesa oltre 1,5 s non avviano azioni tardive; STOP, EMERGENZA e uscita da TEST restano accettati. |
+| Letture PT100 | Due conversioni one-shot in parallelo, con le stesse attese minime di bias/conversione/fault (10/65/1 ms) e lo stesso calcolo Adafruit. Il campionamento periodico avanza senza `delay`; avvio/ripresa/reset richiedono ancora una coppia appena completata. I recuperi restano limitati a 10 fault consecutivi e richiedono due conferme sicure; uscite inibite durante la verifica. |
+| Memoria | Storico dashboard da 4.320 campioni in PSRAM, come gli storici TEST/report. Se manca, riduzione esplicita dello storico con avviso e capienza esposta dall'API. Buffer plot distinto da quello PDF. |
+| Trasferimenti | HTML/CSS/JavaScript incorporati in gzip deterministico. PNG `/plot` compresso senza perdita con memoria limitata, senza servizi esterni. I sorgenti in `data/` e l'anteprima Python restano normali file leggibili. |
+| Persistenza | Checkpoint tentato al massimo ogni 30 s anche se NVS fallisce. Un fallimento di salvataggio a fine ciclo produce stato, report e marcatore di allarme coerenti. |
+| Pulizia | Eliminati campi inutilizzati nel piano GPIO; driver, framing HTTP, compressione e storage durevole isolati in moduli verificabili. Dipendenze principali fissate alle versioni compilate. Corretta la versione firmware nell'API report. |
+| Orologio dashboard | Uptime esteso a 64 bit e ricostruzione dei timestamp live/storico/TEST attraverso il ritorno a zero di `millis()` dopo circa 49,7 giorni. I report mantengono la propria linea temporale. |
+
+Confronto delle compilazioni locali full-1.20 → full-1.21: **RAM statica 193.820 → 73.532 byte** (59,1% → 22,4%). HTML/CSS/JS principali: **165.793 → 48.592 byte** trasferiti con gzip. Il grafico nativo di regressione passa da circa **461 kB a 24.864 byte**, con raster identico verificato tramite decompressione indipendente. Queste misure non sono una misura della RAM dinamica o dei tempi reali del forno; questi ultimi vanno controllati sull'ESP.
+
+### Coda Telegram persistente
+
+Il task Telegram salva eventi ordinari/allarmi e snapshot dei report con la curva, senza effettuare scritture filesystem nel loop di controllo. Usa esclusivamente file `/ovtg*.dat/.ack/.tmp` nella partizione SPIFFS già prevista dal layout da 16 MB; non modifica partizioni, programmi, PID o registro blackout NVS. La partizione viene inizializzata automaticamente **solo se interamente cancellata**. Una partizione non vuota che non si monta viene lasciata intatta e si continua con le code RAM.
+
+- Fino a **96 record** durevoli complessivi; restano i limiti di ammissione dei report e delle code RAM. I dati diventano durevoli quando il worker ha completato il salvataggio: un taglio prima di quel punto può ancora perdere l'ultimo evento.
+- Record versionati con checksum, destinatari numerici e proprietario associato. A ogni invio viene ricontrollata l'autorizzazione attuale; la revoca impedisce anche gli invii ancora pendenti.
+- Gli avvisi ordinari scadono dopo un'ora e rispettano la modalità personale attuale. Gli allarmi restano pendenti fino alla consegna. Risposte ai comandi e grafici richiesti con `/plot` non vengono riprodotti dopo un riavvio.
+- I PDF pendenti vengono ricostruiti dallo snapshot salvato, con lo stesso nome e gli stessi dati. Con orario di fine noto, la scadenza rimane 24 ore dalla fine del ciclo; altrimenti si usa l'ora del salvataggio o, senza orario noto, il limite della sessione corrente.
+- Prima di completare l'upload PDF viene salvata l'intenzione di invio per quel destinatario. Dopo un reset con esito ambiguo **quel destinatario viene saltato**, con avviso silenzioso, mentre si prosegue con gli altri. Una risposta Telegram 429 permette il ritentativo. È la stessa scelta conservativa usata per una conferma di rete persa.
+- Le notifiche testuali privilegiano la consegna: un taglio tra conferma Telegram e cancellazione del record può ripetere un singolo messaggio. Non esiste una garanzia di consegna esattamente una volta nella Bot API.
+- Storage pieno/non disponibile: dati ancora nelle code RAM, ritentativi di salvataggio distanziati; nessun arresto o riavvio automatico del controllo per l'outbox. Le chiavi API `telegram.outboxReady`, `outboxRecords`, `outboxErrors` espongono lo stato. `http.running/served/rejected` mostrano il nuovo server.
+
+### Pipeline locale ripetibile
+
+Prerequisiti: Python 3, compilatore C++17, Node.js; PlatformIO per le due compilazioni finali. Dalla cartella `firmware/oven-controller-full`:
+
+```bash
+# Test Python + anteprima, C++ con AddressSanitizer/UndefinedBehaviorSanitizer,
+# dashboard/report JavaScript e controllo degli asset incorporati.
+python3 scripts/check_all.py
+
+# Stessi test più compilazione USB e OTA. NON esegue upload.
+python3 scripts/check_all.py --build
+```
+
+La pipeline copre programmi, mantenimento, PID, pause, cooldown, manuale, ripresa da allarme, supervisore, TEST/heartbeat, sonde, blackout/NVS, Wi-Fi, autorizzazioni e invii Telegram, HTTP frammentato, scritture interrotte dell'outbox e round-trip di PNG/gzip. Non invia messaggi Telegram reali. Le prove native e l'anteprima non sostituiscono il collaudo sull'ESP: prima dell'uso reale della nuova versione verificare letture RAW/temperature, STOP/emergenza e temporizzazione uscita, poi un ciclo sorvegliato e una prova di riavvio con allegato pendente. L'aggiornamento rimane esplicito e a forno fermo.
 
 ## Controllo manuale
 
@@ -180,7 +223,7 @@ Sull'ESP la preferenza è salvata in NVS (`tgMode`) solo quando cambia, dal loop
 
 Al termine di ogni ciclo avviato (**completamento, STOP o allarme/emergenza**) il bot invia anche un **PDF**, senza richiedere la dashboard aperta. Il file contiene grafico vettoriale completo **target/media PT100**, riepilogo diviso in sezioni e **una pagina per ogni fase, con grafico dedicato** e dati della fase. Il nome include l’esito: `Completed_Nome_programma_2026-10-09_16-30-00.pdf` per un ciclo completato, `Stopped_...pdf` per STOP e `Error_...pdf` per allarme/emergenza, con **data/ora italiana di fine ciclo**, inclusa l'ora legale. Un semplice STOP senza un ciclo avviato non genera PDF. Sull'ESP senza NTP il nome usa `senza_orario_avvio-<boot>_<uptime>` e gli orari restano indicati come non sincronizzati.
 
-Il loop copia soltanto uno snapshot del report e della curva in PSRAM; generazione PDF e upload HTTPS multipart sono eseguiti dal task Telegram, separato dal controllo. Un nuovo ciclo non modifica gli allegati accodati. Ci sono al massimo **4 report pendenti** (3 in coda e uno nel task), con buffer PDF limitato a **768 KiB**; allarmi, risposte e notifiche hanno la precedenza sugli allegati; il polling mantiene un proprio intervallo. Un nuovo allarme interrompe l'upload al successivo blocco di scrittura; una chiamata di rete già in corso può attendere il suo timeout. Dalla versione **full-1.6** la risposta HTTP viene letta anche quando è già stata ricevuta e conservata nel buffer del client insieme alle intestazioni: questo evita di ritentare PDF già consegnati. Uno stesso report già accodato non viene accodato nuovamente (identità boot/avvio/fine, ultime 16 identità). Una continuazione esplicita può produrre un nuovo report finale con un istante di fine diverso. Gli allegati vengono ritentati con lo stesso file per un massimo di **24 ore** solo se l'upload non ha ancora tentato di scrivere il delimitatore multipart finale, oppure se Telegram risponde esplicitamente **429** (rispettando `retry_after`). Se la conferma si perde dopo il possibile invio completo, o arriva un errore 5xx, l'esito è **incerto**: il PDF viene tolto dalla coda e non reinviato automaticamente, con un unico avviso silenzioso. Gli errori 4xx permanenti fermano quel report. Questa scelta evita duplicati ma può lasciare un PDF da scaricare manualmente se il server non lo aveva ricevuto. Le code sono in RAM: riavvio, mancanza di PSRAM o coda piena possono impedire l'invio. Il report della dashboard resta scaricabile. `/api/status` espone `telegram.reportsUnconfirmed` e `telegram.duplicateReportsSkipped` oltre ai contatori già presenti; gli esiti incerti sono inclusi anche nei report scartati, senza contarli come inviati. Al riavvio non si invia automaticamente un vecchio report.
+Il loop copia soltanto uno snapshot del report e della curva in PSRAM; generazione PDF e upload HTTPS multipart sono eseguiti dal task Telegram, separato dal controllo. Un nuovo ciclo non modifica gli allegati accodati. Ci sono al massimo **4 report pendenti** (3 in coda e uno nel task), con buffer PDF limitato a **768 KiB**; allarmi, risposte e notifiche hanno la precedenza sugli allegati; il polling mantiene un proprio intervallo. Un nuovo allarme interrompe l'upload al successivo blocco di scrittura; una chiamata di rete già in corso può attendere il suo timeout. Dalla versione **full-1.6** la risposta HTTP viene letta anche quando è già stata ricevuta e conservata nel buffer del client insieme alle intestazioni: questo evita di ritentare PDF già consegnati. Uno stesso report già accodato non viene accodato nuovamente (identità boot/avvio/fine, ultime 16 identità). Una continuazione esplicita può produrre un nuovo report finale con un istante di fine diverso. Gli allegati vengono ritentati con lo stesso file per un massimo di **24 ore** solo se l'upload non ha ancora tentato di scrivere il delimitatore multipart finale, oppure se Telegram risponde esplicitamente **429** (rispettando `retry_after`). Se la conferma si perde dopo il possibile invio completo, o arriva un errore 5xx, l'esito è **incerto**: il PDF viene tolto dalla coda e non reinviato automaticamente, con un unico avviso silenzioso. Gli errori 4xx permanenti fermano quel report. Questa scelta evita duplicati ma può lasciare un PDF da scaricare manualmente se il server non lo aveva ricevuto. Fino a full-1.20 le code erano solo in RAM. Da **full-1.21** eventi e report pendenti vengono salvati dal task Telegram nella coda persistente descritta sotto; rimane il ripiego in RAM se lo storage non è disponibile. Il report della dashboard resta scaricabile. `/api/status` espone `telegram.reportsUnconfirmed` e `telegram.duplicateReportsSkipped` oltre ai contatori già presenti; gli esiti incerti sono inclusi anche nei report scartati, senza contarli come inviati. Al riavvio si riprendono solo i report effettivamente pendenti nella coda persistente; non viene riaccodato il semplice ultimo riepilogo della dashboard.
 
 L'anteprima Python riusa **lo stesso generatore jsPDF della dashboard**, tramite `scripts/report_pdf.cjs`: serve Node.js sul Mac (viene rilevato anche il runtime di ChatGPT, se presente). Legge report e curva da localhost con verifica della chiave, evitando invii ripetuti dello stesso report durante la connessione. Anche l'anteprima elimina dalla coda un upload con conferma persa o errore permanente: il solo errore di invio ritentabile è un rifiuto esplicito 429; urllib non permette di distinguere un timeout prima dell'invio da uno dopo la consegna. Senza orari simulati il nome file usa l'ora reale italiana di acquisizione del report. Le notifiche e la didascalia PDF indicano **ANTEPRIMA SIMULATA**. Il firmware genera autonomamente il PDF e non richiede Python, Node.js o un computer acceso.
 

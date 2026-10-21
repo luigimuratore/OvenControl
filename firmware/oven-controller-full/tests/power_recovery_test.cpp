@@ -11,6 +11,15 @@ struct Store {
   bool save(const recovery::Record &record) { if (fail) return false; committed = record; exists = true; return true; }
 };
 int main() {
+  // A failed store gets one attempt per interval, including wraparound. It
+  // cannot turn a 10 ms control loop into thousands of NVS writes per second.
+  recovery::CheckpointSchedule clock;
+  const uint32_t origin=UINT32_MAX-1000;
+  clock.immediate(origin);
+  unsigned attempts=0;
+  for(uint32_t elapsed=0;elapsed<90000;elapsed+=10)if(clock.take(origin+elapsed))++attempts;
+  assert(attempts==3);
+  clock.immediate(100);assert(clock.take(100)&&!clock.take(101));
   // Cold starts and software restarts at rest are ordinary, silent events.
   recovery::BootState boot;
   for (const auto cause : {recovery::Cause::PowerOn, recovery::Cause::Other}) {
@@ -52,7 +61,7 @@ int main() {
   assert(!strcmp(reboot.data.program, "Programma ceramica"));
   OutputSupervisor outputs; outputs.blockRecovery();
   heater::Plan p; p.cycleActive = p.heatingAllowed = p.healthy = true;
-  p.sampleAt = p.cycleAt = p.windowAt = 100; p.windowMs = 1000; p.duty = 100;
+  p.sampleAt = p.windowAt = 100; p.windowMs = 1000; p.duty = 100;
   assert(!outputs.publish(p)); assert(!outputs.enterTest(false));
   assert(!outputs.startTest(TestMode::RelayPulse, 100, 1000, false));
   outputs.tick(100, true, false); assert(!outputs.relay && !outputs.red && !outputs.green);

@@ -4,7 +4,7 @@
 
 heater::Plan heating(uint32_t now) {
   heater::Plan p; p.cycleActive = p.heatingAllowed = p.healthy = true;
-  p.sampleAt = p.cycleAt = p.windowAt = now; p.windowMs = 1000; p.duty = 100;
+  p.sampleAt = p.windowAt = now; p.windowMs = 1000; p.duty = 100;
   return p;
 }
 int main() {

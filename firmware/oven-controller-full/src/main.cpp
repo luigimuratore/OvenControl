@@ -3,10 +3,10 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
-#include <WebServer.h>
+#include "control_web_server.h"
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <Adafruit_MAX31865.h>
+#include "async_rtd.h"
 #include <esp_system.h>
 #include <esp_sntp.h>
 #include <nvs.h>
@@ -59,7 +59,6 @@ telegram::PendingUsers telegramPending;
 constexpr int CS1 = PIN_CS1, CS2 = PIN_CS2;
 constexpr int HEAT = PIN_RELAY, RED = PIN_RED, GREEN = PIN_GREEN;
 constexpr uint32_t SAMPLE_MS = 500, HISTORY_MS = 10000;
-constexpr uint32_t CHECKPOINT_MS = 30000;
 constexpr size_t MAX_RECIPES = 8, MAX_STEPS = 12, HISTORY_CAP = 4320, HISTORY_PAGE = 180;
 constexpr size_t EVENT_CAP = 128, PERSIST_CAP = 40;
 constexpr char AP_SSID[] = "OvenController-Full";
@@ -68,8 +67,8 @@ constexpr char MDNS_NAME[] = "oven-full";
 constexpr uint16_t OTA_PORT = 3232;
 constexpr size_t TEST_HISTORY_CAP = 3600, TEST_HISTORY_PAGE = 300;
 
-Adafruit_MAX31865 rtd1(CS1), rtd2(CS2);
-WebServer server(80);
+AsyncRtd rtd1(CS1), rtd2(CS2);
+ControlWebServer server(80);
 Preferences prefs;
 bool prefsReady = false, eventWriteFaultLogged = false;
 struct RecoveryStore {
@@ -155,7 +154,8 @@ uint8_t stepIndex = 0;
 uint32_t stepStarted = 0, cycleStarted = 0, pausedAt = 0, holdInBandMs = 0;
 uint32_t stepElapsedBefore = 0;
 uint32_t windowStarted = 0, lastSampleAt = 0, lastHistoryAt = 0;
-uint32_t lastNetworkCheck = 0, lastPidLog = 0, lastLagLog = 0, checkpointAt = 0;
+uint32_t lastNetworkCheck = 0, lastPidLog = 0, lastLagLog = 0;
+recovery::CheckpointSchedule checkpoints;
 uint32_t sampleAtMs = 0, bootCount = 0, eventSeq = 0, persistedSeq = 0;
 uint64_t previousCheckpoint = 0, outageUpperBoundSec = 0;
 struct InterruptionRecord { uint32_t resetReason = 0; uint64_t checkpointUtc = 0, rebootUtc = 0; };
@@ -165,7 +165,9 @@ Event events[EVENT_CAP]; size_t eventHead = 0, eventCount = 0;
 reports::Recorder cycleReport;
 reports::Snapshot lastReport;
 bool reportAvailable = false, reportSaved = false;
-Sample history[HISTORY_CAP]; size_t historyHead = 0, historyCount = 0; uint32_t historySeq = 0;
+Sample *history = nullptr;
+size_t historyCapacity = 0, historyHead = 0, historyCount = 0;
+uint32_t historySeq = 0;
 // Freeze the last cycle curve separately from the rotating dashboard history.
 Sample *reportHistory = nullptr;
 size_t reportHistoryCount = 0;
@@ -327,7 +329,7 @@ void finishCycleReport(Phase next, const String &reason);
 String telegramStatus(int64_t recipient = 0);
 void telegramNotice(const String &title, const String &reason = "", bool critical = false,
                     telegram::EventScope scope = telegram::EventScope::Selected);
-void stopCycle(Phase next, const String &reason) {
+void stopCycle(Phase next, String reason) {
   const float finalReference = setpointC;
   const auto output = outputSnapshot();
   if (next != Phase::Fault || output.emergency || output.recoveryBlocked || output.updating || output.diagnostic)
@@ -349,8 +351,11 @@ void stopCycle(Phase next, const String &reason) {
     if (!saved || !legacySaved) {
       portENTER_CRITICAL(&heaterMux); outputs.blockRecovery(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
       recoveryJournal.data.pending = true; phase = Phase::Fault;
+      next = Phase::Fault;
       faultResume.clear();
       faultText = "Registro di sicurezza non salvato: uscite bloccate; riconoscimento richiesto";
+      reason = faultText;
+      lastCycleError = faultText;
       logEvent("ALLARME", faultText, false); telegramNotice("ALLARME MEMORIA DI SICUREZZA", faultText, true);
     }
     logEvent(next == Phase::Fault ? "ALLARME" : "MANUALE", reason);
@@ -375,13 +380,15 @@ void stopCycle(Phase next, const String &reason) {
       recoveryJournal.data.pending = true;
       faultResume.clear();
       phase = Phase::Fault; faultText = "Registro di sicurezza non salvato: uscite bloccate; riconoscimento richiesto";
+      // Report, marker and notification must describe the actual final state.
+      next = Phase::Fault; reason = faultText; cycleStopped = false;
+      lastCycleError = faultText;
       logEvent("ALLARME", faultText, false);
-      telegramNotice("ALLARME MEMORIA DI SICUREZZA", faultText, true);
     }
     finishCycleReport(next, reason);
     if (reportHistory && reportAvailable) {
-      reportHistoryCount = reports::copyCurve(history, HISTORY_CAP, historyHead, historyCount,
-        lastReport.startMs, lastReport.endMs, reportHistory, HISTORY_CAP, reportHistoryPartial);
+      reportHistoryCount = reports::copyCurve(history, historyCapacity, historyHead, historyCount,
+        lastReport.startMs, lastReport.endMs, reportHistory, historyCapacity, reportHistoryPartial);
       const uint8_t flags = (sensors[0].valid ? 1 : 0) | (sensors[1].valid ? 2 : 0) |
                            (std::isfinite(finalReference) ? 8 : 0) |
                            (next == Phase::Complete ? HISTORY_COMPLETE : next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
@@ -425,68 +432,88 @@ void drainHeaterNotices() {
   }
 }
 String sensorMessage(const Sensor &sensor);
-void readSensorConversion(Adafruit_MAX31865 &rtd, Sensor &sensor) {
-  sensor.raw = rtd.readRTD();
-  sensor.fault = rtd.readFault();
-  rtd.enableBias(false);
-  float reference = &sensor == &sensors[0] ? RREF_1 : RREF_2;
-  sensor.ohms = sensor.raw * reference / 32768.0f;
-  sensor.c = rtd.calculateTemperature(sensor.raw, RNOMINAL, reference);
-  sensor.valid = sensor.fault == 0 && sensor.raw > 0 && sensor.raw < 32767 &&
-                 thermal::validReading(sensor.c, diagnosticMode());
-  // Switch off before logging to flash or waiting for the other probe's conversion.
-  if (!sensor.valid && cycleActive()) inhibitHeater();
+struct SensorRead {
+  bool previousValid = false, done = false, checking = false;
+  uint8_t previousFault = 0, initialFault = 0;
+  uint16_t initialRaw = 0;
+  probes::RecoveryResult result = probes::RecoveryResult::NotAttempted;
+};
+SensorRead sensorReads[2];
+bool sensorBatchActive = false, sensorBatchChecking = false;
+void startSensorPair() {
+  sensorBatchActive = true; sensorBatchChecking = false;
+  for (size_t i = 0; i < 2; ++i) {
+    sensorReads[i] = SensorRead{};
+    sensorReads[i].previousValid = sensors[i].valid; sensorReads[i].previousFault = sensors[i].fault;
+    sensors[i].recoveryFailed = false;
+  }
+  rtd1.start(millis()); rtd2.start(millis());
 }
-void readSensor(Adafruit_MAX31865 &rtd, Sensor &sensor) {
-  const bool wasValid = sensor.valid; const uint8_t previousFault = sensor.fault;
-  const size_t index = &sensor == &sensors[0] ? 0 : 1;
-  sensor.recoveryFailed = false;
-  readSensorConversion(rtd, sensor);
-  const uint8_t initialFault = sensor.fault;
-  const uint16_t initialRaw = sensor.raw;
-  const bool wasDiagnostic = diagnosticMode();
-  const auto recovery = sensorRecovery[index].verify(initialFault, true,
-    [] {
-      portENTER_CRITICAL(&heaterMux); outputs.beginSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
-      // A fault/recheck interval must not count toward an in-band hold.
-      holdTimer.update(millis(), false, false);
-    },
-    [&] {
-      readSensorConversion(rtd, sensor);
-      if (sensor.fault == probes::Recovery::kOvUv) return probes::Confirmation::OvUv;
-      if (!sensor.valid || !thermal::belowHardLimit(sensor.c)) return probes::Confirmation::Unsafe;
-      // Relative overtemperature uses the mean of the refreshed pair in
-      // sampleAndControl(), after both probes have completed their readings.
-      // Each confirmation still enforces the individual absolute limit above.
-      return probes::Confirmation::Safe;
-    });
-  sensor.recoveryFailed = recovery == probes::RecoveryResult::Failed;
-  // Preserve rejection even if the final conversion has no hardware fault bit:
-  // a failed safety check must not become acceptable after reading the other probe.
+void finishSensorRead(size_t index) {
+  auto &sensor = sensors[index]; const auto &read = sensorReads[index];
+  sensor.recoveryFailed = read.result == probes::RecoveryResult::Failed;
   if (sensor.recoveryFailed) sensor.valid = false;
-  // A persistent/unsafe verification must also stop diagnostic outputs.
-  if (sensor.recoveryFailed && wasDiagnostic) {
+  if (sensor.recoveryFailed && diagnosticMode()) {
     stopTests("Fault PT100 persistente/non sicuro: TEST fermato", true);
-    const String reason = "PT100 #" + String(index + 1) + ": " + sensorMessage(sensor);
-    trip(reason);
-    telegramNotice("ALLARME · TEST", reason, true);
+    trip("TEST · PT100 #" + String(index + 1) + ": " + sensorMessage(sensor));
   }
-  if (recovery != probes::RecoveryResult::NotAttempted) {
-    portENTER_CRITICAL(&heaterMux); outputs.endSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
-  }
-  if (recovery != probes::RecoveryResult::NotAttempted)
-    logEvent("SONDA", "PT100 #" + String(index + 1) + ": Fault 0x" + String(initialFault, HEX) +
-      " · RAW " + String(initialRaw) +
-      (recovery == probes::RecoveryResult::Confirmed ?
+  if (read.checking)
+    logEvent("SONDA", "PT100 #" + String(index + 1) + ": Fault 0x" + String(read.initialFault, HEX) +
+      " · RAW " + String(read.initialRaw) +
+      (read.result == probes::RecoveryResult::Confirmed ?
        " · transitorio recuperato con due nuove conversioni valide; uscita spenta durante verifica" :
        " · verifica non confermata; arresto e allarme"));
-  if (recovery == probes::RecoveryResult::Confirmed)
+  if (read.result == probes::RecoveryResult::Confirmed)
     telegramBot.notifyEvent("⚠️ AVVISO SONDA · PT100 #" + String(index + 1) +
       "\nFault 0x04 recuperato. Due nuove letture valide; uscite spente durante la verifica.\nEvento a uptime " +
       String(millis() / 1000) + " s.", false, telegram::EventScope::DetailedOnly);
-  if (sensor.valid != wasValid || sensor.fault != previousFault)
-    logEvent(sensor.valid ? "PT100" : "SONDA", String(&sensor == &sensors[0] ? "PT100 #1: " : "PT100 #2: ") + sensorMessage(sensor) +
+  if (sensor.valid != read.previousValid || sensor.fault != read.previousFault)
+    logEvent(sensor.valid ? "PT100" : "SONDA", "PT100 #" + String(index + 1) + ": " + sensorMessage(sensor) +
       " · Fault 0x" + String(sensor.fault, HEX) + " · RAW " + String(sensor.raw) + " · " + String(sensor.ohms, 2) + " ohm");
+}
+bool pollSensorPair() {
+  if (!sensorBatchActive) return false;
+  AsyncRtd *devices[] = {&rtd1, &rtd2};
+  for (size_t i = 0; i < 2; ++i) {
+    auto &read = sensorReads[i]; auto &device = *devices[i]; auto &sensor = sensors[i];
+    if (read.done || !device.tick(millis())) continue;
+    sensor.raw = device.conversion.raw; sensor.fault = device.conversion.fault;
+    const float reference = i == 0 ? RREF_1 : RREF_2;
+    sensor.ohms = sensor.raw * reference / 32768.0f;
+    sensor.c = device.calculateTemperature(sensor.raw, RNOMINAL, reference);
+    sensor.valid = sensor.fault == 0 && sensor.raw > 0 && sensor.raw < 32767 && thermal::validReading(sensor.c, diagnosticMode());
+    if (!sensor.valid && cycleActive()) inhibitHeater();
+    if (!read.checking) {
+      read.initialFault = sensor.fault; read.initialRaw = sensor.raw;
+      read.result = sensorRecovery[i].begin(sensor.fault);
+      if (read.result == probes::RecoveryResult::Pending) {
+        read.checking = true; sensorBatchChecking = true;
+        portENTER_CRITICAL(&heaterMux); outputs.beginSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+        holdTimer.update(millis(), false, false);
+      }
+    } else {
+      const auto confirmation = sensor.fault == probes::Recovery::kOvUv ? probes::Confirmation::OvUv :
+        !sensor.valid || !thermal::belowHardLimit(sensor.c) ? probes::Confirmation::Unsafe : probes::Confirmation::Safe;
+      read.result = sensorRecovery[i].confirm(confirmation);
+    }
+    if (read.result == probes::RecoveryResult::Pending) device.start(millis());
+    else { read.done = true; if (read.result == probes::RecoveryResult::Failed) sensor.valid = false; }
+  }
+  if (!sensorReads[0].done || !sensorReads[1].done) return false;
+  // Keep verification inhibition through fault handling/logging. No new output
+  // is published until both probes and relative protections have been checked.
+  for (size_t i = 0; i < 2; ++i) finishSensorRead(i);
+  if (sensorBatchChecking) {
+    portENTER_CRITICAL(&heaterMux); outputs.endSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+  }
+  sensorBatchActive = false; sampleAtMs = millis(); return true;
+}
+void readSensorPair() {
+  // Explicit START/RESUME/RESET still require a fresh completed pair. This
+  // bounded wait is used only by operator commands, never for periodic sampling.
+  // The network and independent GPIO supervisor continue on their own tasks.
+  if (!sensorBatchActive) startSensorPair();
+  while (!pollSensorPair()) delay(1);
 }
 String sensorMessage(const Sensor &sensor) {
   if (sensor.valid) return "Lettura valida";
@@ -533,6 +560,7 @@ const char *faultResumeProblem() {
   if (output.recoveryBlocked || recoveryJournal.data.pending || phase == Phase::Interrupted)
     return "Blackout/riavvio o memoria di sicurezza: continuazione non disponibile.";
   if (output.updating || output.diagnostic) return "Esci da TEST e attendi la fine dell'aggiornamento.";
+  if (output.sensorChecking) return "Verifica sonde in corso: attendi due nuove letture valide.";
   if (phase != Phase::Fault || !faultResume.available)
     return "Nessun punto di ripresa in RAM. Dopo riavvio, STOP o RESET & BLOCK serve un nuovo avvio.";
   if (!faultResume.manual && (faultResume.step >= activeRecipe.count || !cycleReport.canContinue()))
@@ -736,10 +764,9 @@ void advanceStep() {
 void applyWindow() {
   heater::Plan plan;
   plan.cycleActive = phase == Phase::Running || phase == Phase::Paused;
-  plan.manual = manualOperation;
   plan.heatingAllowed = heatingOperation();
   plan.healthy = sensorsHealthy(); plan.sampleAt = sampleAtMs;
-  plan.cycleAt = cycleStarted; plan.windowAt = windowStarted;
+  plan.windowAt = windowStarted;
   plan.windowMs = controlSettings.windowMs; plan.duty = duty;
   portENTER_CRITICAL(&heaterMux); outputs.publish(plan); portEXIT_CRITICAL(&heaterMux);
 }
@@ -752,9 +779,9 @@ void controlPid(float actual, uint32_t now, bool descending = false) {
              " °C; uscita " + String(duty, 0) + "%", false);
   }
 }
-void sampleAndControl() {
-  readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]);
-  uint32_t now = millis(); sampleAtMs = now;
+void sampleAndControl(bool fresh = true) {
+  if (fresh) readSensorPair();
+  uint32_t now = millis();
   if (!manualOperation && cycleActive() && stepIndex < activeRecipe.count) {
     const float reference = phase == Phase::Running ?
       profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, uint32_t(now - stepStarted)) : setpointC;
@@ -822,6 +849,7 @@ void sampleAndControl() {
   }
 }
 void recordHistory(bool force, uint8_t eventFlag) {
+  if (!historyCapacity) return;
   uint32_t now = millis();
   relayOn = heaterOn();
   if (!force && uint32_t(now - lastHistoryAt) < HISTORY_MS) return;
@@ -831,8 +859,8 @@ void recordHistory(bool force, uint8_t eventFlag) {
   history[historyHead] = {++historySeq, now, sensors[0].valid ? sensors[0].c : 0,
                           sensors[1].valid ? sensors[1].c : 0,
                           std::isfinite(setpointC) ? setpointC : 0, duty, flags, uint8_t(manualOperation ? 255 : stepIndex)};
-  historyHead = (historyHead + 1) % HISTORY_CAP;
-  if (historyCount < HISTORY_CAP) ++historyCount;
+  historyHead = (historyHead + 1) % historyCapacity;
+  if (historyCount < historyCapacity) ++historyCount;
 }
 
 void sendJson(int code, const JsonDocument &doc) {
@@ -902,7 +930,7 @@ void reportApi() {
   if (!reportAvailable) { error(404, "Nessun report di fine ciclo disponibile"); return; }
   const auto &report = lastReport;
   JsonDocument doc;
-  doc["version"] = report.version; doc["firmware"] = "full-1.3"; doc["saved"] = reportSaved;
+  doc["version"] = report.version; doc["firmware"] = firmwareinfo::kVersion; doc["saved"] = reportSaved;
   doc["holdBandC"] = report.version == 1 ? 1.0f : profile::kHoldBand;
   doc["bootCount"] = report.boot;
   doc["key"] = String(report.boot) + "-" + String(report.startMs) + "-" + String(report.endMs);
@@ -1089,7 +1117,8 @@ void statusApi(uint32_t testToken = 0) {
   continuation["operation"] = faultResume.manual ? "manual" : "program";
   continuation["stepIndex"] = faultResume.step;
   if (faultResume.available) continuation["targetC"] = faultResume.reference; else continuation["targetC"] = nullptr;
-  doc["ready"] = !output.diagnostic && !output.updating && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault && phase != Phase::Interrupted &&
+  doc["sensorChecking"] = output.sensorChecking;
+  doc["ready"] = !output.diagnostic && !output.updating && !output.sensorChecking && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault && phase != Phase::Interrupted &&
                  !output.emergency && !output.recoveryBlocked && !recoveryJournal.data.pending &&
                  heaterFault() == heater::Fault::None && uint32_t(millis() - sampleAtMs) < heater::Guard::kStaleMs;
   doc["actuator"] = controlSettings.ssr ? "ssr" : "relay";
@@ -1182,6 +1211,11 @@ void statusApi(uint32_t testToken = 0) {
   doc["apIp"] = apReady ? WiFi.softAPIP().toString() : "";
   doc["localName"] = mdnsReady ? String(MDNS_NAME) + ".local" : "";
   doc["uptimeMs"] = millis(); doc["sampleAtMs"] = sampleAtMs;
+  doc["uptimeTotalMs"] = uint64_t(esp_timer_get_time()) / 1000;
+  doc["http"]["running"] = server.active();
+  doc["http"]["clients"] = server.capacity();
+  doc["http"]["served"] = server.requestCount();
+  doc["http"]["rejected"] = server.rejectedCount();
   if (std::isfinite(chipTemperatureC)) doc["chipTemperatureC"] = chipTemperatureC;
   else doc["chipTemperatureC"] = nullptr;
   doc["reportAvailable"] = reportAvailable;
@@ -1273,6 +1307,9 @@ void commandApi() {
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) { error(400, "JSON non valido"); return; }
   String action = doc["action"] | "";
+  if (server.expired() && !server.expiredSafetyAction(action.c_str())) {
+    error(408, "Comando scaduto: aggiorna lo stato e riprova"); return;
+  }
   if (action == "emergency") {
     faultResume.clear();
     const bool alreadyBlocked = outputSnapshot().emergency;
@@ -1300,7 +1337,7 @@ void commandApi() {
   if (action == "resetContinue") {
     if (phase != Phase::Fault || !faultResume.available) { error(409, faultResumeProblem()); return; }
     // Fresh conversions authorize the action, never the browser's last status.
-    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+    readSensorPair(); sampleAtMs = millis();
     const char *problem = faultResumeProblem();
     if (problem[0]) { error(409, problem); return; }
     const uint32_t now = millis();
@@ -1332,16 +1369,16 @@ void commandApi() {
       setpointC = profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, uint32_t(now-stepStarted));
     }
     pauseHold.clear(); faultResume.clear(); faultText = ""; cycleStopped = false; phase = Phase::Running;
-    checkpointAt = now - CHECKPOINT_MS;
+    checkpoints.immediate(now);
     portENTER_CRITICAL(&heaterMux); outputs.guard.clear(); outputs.stopAll(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
     logEvent("CICLO", "RESET & CONTINUE: ripresa esplicita del controllo interrotto; attesa esclusa dal tempo attivo");
     telegramNotice(restored.manual ? "MANUALE RIPRESO DOPO ALLARME" : "CICLO RIPRESO", "RESET & CONTINUE: stesso punto, target e rate; tempo in banda conservato.");
-    sampleAndControl(); recordHistory(true); statusApi(); return;
+    readSensorPair(); sampleAndControl(false); recordHistory(true); statusApi(); return;
   }
   if (action == "reset") {
     if (phase == Phase::Running || phase == Phase::Paused) { error(409, "Ferma prima il ciclo"); return; }
     stopTests("RESET & BLOCK: TEST fermato e uscite spente", true);
-    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+    readSensorPair(); sampleAtMs = millis();
     if (!sensorsHealthy()) { error(409, "Sonde o temperature fuori limite"); return; }
     if (prefs.putBool("active", false) != sizeof(bool) || !recoveryJournal.acknowledge(recoveryStore)) {
       error(507, "Riconoscimento interruzione non salvato: uscite ancora bloccate"); return;
@@ -1357,7 +1394,7 @@ void commandApi() {
   if (action == "pause") {
     if (manualOperation && cycleActive()) { error(409, "Nel manuale usa COOLDOWN o STOP"); return; }
     if (phase != Phase::Running) { error(409, "Nessun ciclo da mettere in pausa"); return; }
-    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+    readSensorPair(); sampleAtMs = millis();
     if (!sensorsHealthy() || heaterFault() != heater::Fault::None) {
       error(409, "Sonde/controllo fuori limite: pausa non attivata"); return;
     }
@@ -1377,7 +1414,7 @@ void commandApi() {
   }
   if (action == "resume") {
     if (phase != Phase::Paused) { error(409, "Nessun ciclo in pausa"); return; }
-    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+    readSensorPair(); sampleAtMs = millis();
     if (!sensorsHealthy() || heaterFault() != heater::Fault::None) { error(409, "Sonde/controllo fuori limite: riconosci l'allarme"); return; }
     if (stepIndex >= activeRecipe.count) { error(409, "Step non disponibile"); return; }
     const auto &requested = activeRecipe.steps[stepIndex];
@@ -1403,7 +1440,7 @@ void commandApi() {
       error(400, "Conferma collaudo hardware e protezioni indipendenti prima di avviare"); return;
     }
     // Read again here: a stale status must never authorize a heat command.
-    readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]);
+    readSensorPair();
     sampleAtMs = millis();
     if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
     const char *id = doc["recipeId"] | "";
@@ -1439,7 +1476,7 @@ void commandApi() {
     snprintf(report.recipeName, sizeof(report.recipeName), "%s", activeRecipe.name.c_str());
     report.kp = kp; report.ki = ki; report.kd = kd; report.ssr = controlSettings.ssr;
     report.windowMs = controlSettings.windowMs; report.maxPower = controlSettings.maxPower;
-    checkpointAt = millis() - CHECKPOINT_MS;
+    checkpoints.immediate(millis());
     logEvent("CICLO", "Ciclo partito: " + activeRecipe.name + "; PT100 reali");
     beginStep(); recordHistory(true, HISTORY_START);
     telegramNotice("CICLO AVVIATO", "Programma: " + activeRecipe.name, false, telegram::EventScope::Always);
@@ -1452,6 +1489,9 @@ void manualApi() {
   JsonDocument doc;
   if (deserializeJson(doc, server.arg("plain"))) { error(400, "JSON non valido"); return; }
   const String action = doc["action"] | "";
+  if (server.expired() && !server.expiredSafetyAction(action.c_str())) {
+    error(408, "Comando scaduto: aggiorna lo stato e riprova"); return;
+  }
   if (action == "stop") {
     faultResume.clear();
     if (manualOperation && cycleActive()) stopCycle(Phase::Idle, "Controllo manuale fermato dall'operatore");
@@ -1489,7 +1529,7 @@ void manualApi() {
   if (action == "start" && (!doc["hardwareReady"].is<bool>() || !doc["hardwareReady"].as<bool>())) {
     error(400, "Conferma CHECK HARDWARE/AMBIENTE EFFETTUATO"); return;
   }
-  readSensor(rtd1, sensors[0]); readSensor(rtd2, sensors[1]); sampleAtMs = millis();
+  readSensorPair(); sampleAtMs = millis();
   if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
   const float requested = doc["targetC"].as<float>();
   const float rate = doc["rateCMin"].as<float>();
@@ -1510,7 +1550,7 @@ void manualApi() {
     faultResume.clear();
     manualOperation = true; phase = Phase::Running; cycleStopped = false;
     activeRecipe = Recipe{}; stepIndex = 0; cycleStarted = now;
-    checkpointAt = now - CHECKPOINT_MS;
+    checkpoints.immediate(now);
     setpointC = manualSession.reference;
     logEvent("MANUALE", "Manuale avviato: target " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min");
     recordHistory(true, HISTORY_START);
@@ -1538,24 +1578,24 @@ void logsApi() {
   doc["capacity"] = EVENT_CAP; doc["savedCapacity"] = PERSIST_CAP; sendJson(200, doc);
 }
 void historyApi() {
-  JsonDocument doc; doc["bootCount"] = bootCount; doc["capacity"] = HISTORY_CAP;
+  JsonDocument doc; doc["bootCount"] = bootCount; doc["capacity"] = historyCapacity;
   doc["intervalMs"] = HISTORY_MS;
-  doc["oldestSeq"] = historyCount ? history[(historyHead + HISTORY_CAP - historyCount) % HISTORY_CAP].seq : 0;
+  doc["oldestSeq"] = historyCount ? history[(historyHead + historyCapacity - historyCount) % historyCapacity].seq : 0;
   doc["latestSeq"] = historySeq;
   JsonArray list = doc["samples"].to<JsonArray>();
   size_t first = 0, end = historyCount;
   if (server.hasArg("before")) {
     uint32_t before = strtoul(server.arg("before").c_str(), nullptr, 10);
-    while (end && history[(historyHead + HISTORY_CAP - historyCount + end - 1) % HISTORY_CAP].seq >= before) --end;
+    while (end && history[(historyHead + historyCapacity - historyCount + end - 1) % historyCapacity].seq >= before) --end;
     first = end > HISTORY_PAGE ? end - HISTORY_PAGE : 0;
   } else if (server.hasArg("tail")) first = end > HISTORY_PAGE ? end - HISTORY_PAGE : 0;
   else {
     uint32_t after = server.hasArg("after") ? strtoul(server.arg("after").c_str(), nullptr, 10) : 0;
-    while (first < end && history[(historyHead + HISTORY_CAP - historyCount + first) % HISTORY_CAP].seq <= after) ++first;
+    while (first < end && history[(historyHead + historyCapacity - historyCount + first) % historyCapacity].seq <= after) ++first;
     if (end - first > HISTORY_PAGE) end = first + HISTORY_PAGE;
   }
   for (size_t i = first; i < end; ++i) {
-    const Sample &s = history[(historyHead + HISTORY_CAP - historyCount + i) % HISTORY_CAP];
+    const Sample &s = history[(historyHead + historyCapacity - historyCount + i) % historyCapacity];
     JsonArray row = list.add<JsonArray>();
     row.add(s.seq); row.add(s.ms);
     if (s.flags & 1) row.add(s.t1); else row.add(nullptr);
@@ -1609,6 +1649,9 @@ void testCommandApi() {
     error(400, "Richiesta JSON non valida"); return;
   }
   const String action = input["action"].as<String>();
+  if (server.expired() && !server.expiredSafetyAction(action.c_str())) {
+    error(408, "Comando scaduto: aggiorna lo stato e riprova"); return;
+  }
   // Test-only STOP cannot affect an autonomous recipe started by another page.
   if (action == "stop" || action == "exit") {
     if (!diagnosticMode()) { statusApi(); return; }
@@ -1747,7 +1790,7 @@ void handleTelegramRequest(const telegram::UserRequest &request){
   if(minutes){
     const uint8_t flags=(sensors[0].valid?1:0)|(sensors[1].valid?2:0)|(std::isfinite(setpointC)?8:0);
     const Sample current{historySeq,millis(),sensors[0].c,sensors[1].c,setpointC,duty,flags,uint8_t(manualOperation?255:stepIndex)};
-    if(!telegramBot.plot(history,HISTORY_CAP,historyHead,historyCount,current,minutes,chat))
+    if(!telegramBot.plot(history,historyCapacity,historyHead,historyCount,current,minutes,chat))
       telegramBot.reply("📈 Un grafico è già in preparazione o la memoria non è disponibile. Riprova tra poco.",false,false,chat);
   }
 }
@@ -1804,7 +1847,7 @@ void updateNetwork() {
     mdnsReady = MDNS.begin(MDNS_NAME);
     if (mdnsReady) { MDNS.addService("http", "tcp", 80); if (otaEnabled) MDNS.enableArduino(OTA_PORT, true); }
   }
-  portENTER_CRITICAL(&heaterMux); outputServerReady = apReady || connected; portEXIT_CRITICAL(&heaterMux);
+  portENTER_CRITICAL(&heaterMux); outputServerReady = server.active() && (apReady || connected); portEXIT_CRITICAL(&heaterMux);
   if (connected && (!ntpStarted || (!ntpSynced && uint32_t(millis() - lastNtpAttempt) >= 60000))) {
     lastNtpAttempt = millis();
     configTime(0, 0, WORKSHOP_NTP_SERVER); ntpStarted = true;
@@ -1891,8 +1934,14 @@ void setup() {
   lastCycleError = prefs.getString("cycleError", "");
   if (lastCycleError.isEmpty() && reportAvailable && lastReport.outcome == reports::Outcome::Fault)
     lastCycleError = lastReport.reason;
-  reportHistory = static_cast<Sample *>(ps_malloc(sizeof(Sample) * (HISTORY_CAP + 1)));
-  if (!reportHistory) reportHistory = static_cast<Sample *>(calloc(HISTORY_CAP + 1, sizeof(Sample)));
+  history = static_cast<Sample *>(ps_calloc(HISTORY_CAP, sizeof(Sample)));
+  historyCapacity = history ? HISTORY_CAP : HISTORY_PAGE;
+  if (!history) history = static_cast<Sample *>(calloc(historyCapacity, sizeof(Sample)));
+  if (!history) historyCapacity = 0;
+  if (historyCapacity != HISTORY_CAP)
+    logEvent("ATTENZIONE", "Storico dashboard ridotto: PSRAM non disponibile; campioni " + String(historyCapacity));
+  reportHistory = static_cast<Sample *>(ps_malloc(sizeof(Sample) * (historyCapacity + 1)));
+  if (!reportHistory) reportHistory = static_cast<Sample *>(calloc(historyCapacity + 1, sizeof(Sample)));
   if (!reportHistory) logEvent("ATTENZIONE", "Memoria curva report non disponibile; riepilogo conservato senza grafico");
   if (prefsReady && !logs::makeRoom(logStore, persistedSeq, PERSIST_CAP, logs::kReserveEntries))
     Serial.println("[ATTENZIONE] NVS quasi piena anche dopo la pulizia dei vecchi log full");
@@ -1974,7 +2023,7 @@ void setup() {
   if (!firstReady || !secondReady)
     logEvent("ATTENZIONE", "Inizializzazione SPI MAX31865 fallita; verifica le due Click");
   rtd1.enable50Hz(true); rtd2.enable50Hz(true);
-  sampleAndControl(); recordHistory(true);
+  readSensorPair(); sampleAndControl(false); recordHistory(true);
   // Credentials come from the firmware; writing them again into the shared
   // NVS can fail when persistent event logs have filled that partition.
   // This must precede mode(), which initializes the Wi-Fi driver.
@@ -1990,39 +2039,39 @@ void setup() {
     logEvent("RETE", "Connessione Wi-Fi capannone in corso");
   }
   setupOta();
-  server.on("/api/report", HTTP_GET, reportApi);
-  server.on("/api/report/history", HTTP_GET, reportHistoryApi);
-  server.on("/api/test/command", HTTP_POST, testCommandApi);
-  server.on("/api/test/heartbeat", HTTP_POST, testHeartbeatApi);
-  server.on("/api/test/history", HTTP_GET, testHistoryApi);
-  server.on("/", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html; charset=utf-8", WEB_HTML); });
+  server.on("/api/report", ovenhttp::Method::Get, reportApi);
+  server.on("/api/report/history", ovenhttp::Method::Get, reportHistoryApi);
+  server.on("/api/test/command", ovenhttp::Method::Post, testCommandApi, true);
+  server.on("/api/test/heartbeat", ovenhttp::Method::Post, testHeartbeatApi);
+  server.on("/api/test/history", ovenhttp::Method::Get, testHistoryApi);
+  server.on("/", ovenhttp::Method::Get, [] { server.sendHeader("Cache-Control", "no-store"); server.sendHeader("Content-Encoding", "gzip"); server.send_P(200, "text/html; charset=utf-8", reinterpret_cast<const char *>(WEB_HTML), sizeof(WEB_HTML)); });
   const auto serveFavicon = [] {
     server.sendHeader("Cache-Control", "public, max-age=86400");
     server.send_P(200, "image/jpeg", reinterpret_cast<const char *>(WEB_FAVICON), sizeof(WEB_FAVICON));
   };
-  server.on("/favicon.jpg", HTTP_GET, serveFavicon);
-  server.on("/favicon.ico", HTTP_GET, serveFavicon);
-  server.on("/style.css", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/css; charset=utf-8", WEB_CSS); });
-  server.on("/app.js", HTTP_GET, [] { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "application/javascript; charset=utf-8", WEB_JS); });
-  server.on("/report-export.js", HTTP_GET, [] { server.send_P(200, "application/javascript; charset=utf-8", WEB_EXPORT_JS); });
-  server.on("/jspdf.umd.min.js", HTTP_GET, [] {
+  server.on("/favicon.jpg", ovenhttp::Method::Get, serveFavicon);
+  server.on("/favicon.ico", ovenhttp::Method::Get, serveFavicon);
+  server.on("/style.css", ovenhttp::Method::Get, [] { server.sendHeader("Cache-Control", "no-store"); server.sendHeader("Content-Encoding", "gzip"); server.send_P(200, "text/css; charset=utf-8", reinterpret_cast<const char *>(WEB_CSS), sizeof(WEB_CSS)); });
+  server.on("/app.js", ovenhttp::Method::Get, [] { server.sendHeader("Cache-Control", "no-store"); server.sendHeader("Content-Encoding", "gzip"); server.send_P(200, "application/javascript; charset=utf-8", reinterpret_cast<const char *>(WEB_JS), sizeof(WEB_JS)); });
+  server.on("/report-export.js", ovenhttp::Method::Get, [] { server.sendHeader("Cache-Control", "no-store"); server.sendHeader("Content-Encoding", "gzip"); server.send_P(200, "application/javascript; charset=utf-8", reinterpret_cast<const char *>(WEB_EXPORT_JS), sizeof(WEB_EXPORT_JS)); });
+  server.on("/jspdf.umd.min.js", ovenhttp::Method::Get, [] {
     server.sendHeader("Content-Encoding", "gzip");
     server.send_P(200, "application/javascript", reinterpret_cast<const char *>(WEB_PDF_JS), sizeof(WEB_PDF_JS));
   });
-  server.on("/api/status", HTTP_GET, [] { statusApi(); });
-  server.on("/api/telegram/users",HTTP_GET,telegramUsersApi);
-  server.on("/api/telegram/users",HTTP_POST,telegramUsersCommandApi);
-  server.on("/api/recipes", HTTP_GET, recipesApi);
-  server.on("/api/recipes", HTTP_POST, saveRecipesApi);
-  server.on("/api/command", HTTP_POST, commandApi);
-  server.on("/api/manual", HTTP_POST, manualApi);
-  server.on("/api/pid", HTTP_POST, pidApi);
-  server.on("/api/control", HTTP_POST, controlSettingsApi);
-  server.on("/api/protections", HTTP_POST, protectionsApi);
-  server.on("/api/logs", HTTP_GET, logsApi);
-  server.on("/api/history", HTTP_GET, historyApi);
+  server.on("/api/status", ovenhttp::Method::Get, [] { statusApi(); });
+  server.on("/api/telegram/users",ovenhttp::Method::Get,telegramUsersApi);
+  server.on("/api/telegram/users",ovenhttp::Method::Post,telegramUsersCommandApi);
+  server.on("/api/recipes", ovenhttp::Method::Get, recipesApi);
+  server.on("/api/recipes", ovenhttp::Method::Post, saveRecipesApi);
+  server.on("/api/command", ovenhttp::Method::Post, commandApi, true);
+  server.on("/api/manual", ovenhttp::Method::Post, manualApi, true);
+  server.on("/api/pid", ovenhttp::Method::Post, pidApi);
+  server.on("/api/control", ovenhttp::Method::Post, controlSettingsApi);
+  server.on("/api/protections", ovenhttp::Method::Post, protectionsApi);
+  server.on("/api/logs", ovenhttp::Method::Get, logsApi);
+  server.on("/api/history", ovenhttp::Method::Get, historyApi);
   server.onNotFound([] { error(404, "Percorso non trovato"); });
-  server.begin();
+  if (!server.begin()) logEvent("ALLARME", "Server dashboard non avviato: memoria/task non disponibili", false);
   if (WORKSHOP_WIFI_SSID[0]) {
     wifiRecoveryRunning = xTaskCreatePinnedToCore(wifiRecoveryTask, "wifi-recovery", 4096, nullptr, 1, nullptr, 0) == pdPASS;
     if (!wifiRecoveryRunning) logEvent("ATTENZIONE", "Recupero Wi-Fi non avviato; riconnessione della libreria ancora attiva", false);
@@ -2060,15 +2109,18 @@ void loop() {
     trip("Lettura sonde troppo vecchia: uscita spenta");
   if (uint32_t(now - lastSampleAt) >= SAMPLE_MS) {
     lastSampleAt = now;
-    sampleAndControl(); recordHistory(); recordTestHistory();
+    if (!sensorBatchActive) startSensorPair();
   }
+  if (pollSensorPair()) { sampleAndControl(false); recordHistory(); recordTestHistory(); }
   applyWindow();
   if ((phase == Phase::Running || phase == Phase::Paused) && ntpSynced &&
-      uint32_t(now - checkpointAt) >= CHECKPOINT_MS) {
+      checkpoints.take(now)) {
     uint64_t current = utcNow();
     if (current) {
+      // Rate-limit attempts too: a full/unavailable NVS must not be hammered
+      // every loop while regulation and the safety supervisor are running.
       if (recoveryJournal.checkpoint(recoveryStore, current)) {
-        checkpointAt = now; checkpointWriteFaultLogged = false;
+        checkpointWriteFaultLogged = false;
       } else if (!checkpointWriteFaultLogged) {
         checkpointWriteFaultLogged = true;
         logEvent("ATTENZIONE", "Checkpoint ora non salvato: stima interruzione meno precisa o sconosciuta");

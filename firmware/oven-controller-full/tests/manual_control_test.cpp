@@ -63,13 +63,13 @@ int main() {
   // Manual and program control have no cycle timeout; health/freshness remain enforced.
   const uint32_t later = 13UL * 3600000;
   heater::Plan plan;
-  plan.cycleActive = plan.healthy = plan.heatingAllowed = plan.manual = true;
+  plan.cycleActive = plan.healthy = plan.heatingAllowed = true;
   plan.windowMs = 5000; plan.duty = 60; plan.sampleAt = later;
   heater::Guard manualGuard; manualGuard.publish(plan); assert(manualGuard.tick(later));
   assert(manualGuard.fault == heater::Fault::None);
-  plan.manual = false; heater::Guard programGuard; programGuard.publish(plan);
+  heater::Guard programGuard; programGuard.publish(plan);
   assert(programGuard.tick(later) && programGuard.fault == heater::Fault::None);
-  plan.manual = true; plan.healthy = false; manualGuard.publish(plan);
+  plan.healthy = false; manualGuard.publish(plan);
   assert(!manualGuard.tick(later) && manualGuard.fault == heater::Fault::InvalidPlan);
   heater::Guard stale; plan.healthy = true; stale.publish(plan);
   assert(!stale.tick(later + 3000) && stale.fault == heater::Fault::StaleControl);

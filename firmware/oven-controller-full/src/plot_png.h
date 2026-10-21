@@ -5,8 +5,9 @@
 #include <cstdio>
 #include <cstring>
 #include "report_pdf.h"
+#include "deflate_rle.h"
 
-// Palette PNG with stored DEFLATE blocks: bounded memory, no chart service or
+// Palette PNG with compressed DEFLATE blocks: bounded memory, no chart service or
 // filesystem. Only the Telegram worker renders; the loop supplies a snapshot.
 namespace plotpng {
 constexpr unsigned kWidth = 960, kHeight = 480;
@@ -115,8 +116,19 @@ inline size_t generate(char *output, size_t capacity, uint8_t *raster, size_t ra
   static const uint8_t signature[] = {137,80,78,71,13,10,26,10}; memcpy(out, signature, 8); at = 8;
   const uint8_t header[] = {0,0,uint8_t(kWidth >> 8),uint8_t(kWidth),0,0,uint8_t(kHeight >> 8),uint8_t(kHeight),8,3,0,0,0};
   chunk("IHDR", header, sizeof(header)); chunk("PLTE", kPalette, sizeof(kPalette));
+  const size_t lengthAt = at;
+  big(0); const size_t begin = at;
+  memcpy(out + at, "IDAT", 4); at += 4;
+  const size_t compressed = deflateRuns(out + at, capacity - at - 16, raster, kRasterBytes, yield);
+  if (compressed) {
+    at += compressed;
+    for (unsigned i = 0; i < 4; ++i) out[lengthAt + i] = uint8_t(compressed >> (24 - i * 8));
+    big(crc32(out + begin, at - begin, yield)); chunk("IEND", nullptr, 0); return at;
+  }
+  // Lossless fallback for a raster that does not compress within the buffer.
+  at = lengthAt;
   const size_t blocks = (kRasterBytes + 65534) / 65535;
-  big(uint32_t(kRasterBytes + blocks * 5 + 6)); const size_t begin = at;
+  big(uint32_t(kRasterBytes + blocks * 5 + 6));
   memcpy(out + at, "IDAT", 4); at += 4; byte(0x78); byte(0x01);
   uint32_t a = 1, b = 0;
   for (size_t pos = 0; pos < kRasterBytes;) {

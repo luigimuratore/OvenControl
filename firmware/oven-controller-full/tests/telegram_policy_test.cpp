@@ -15,6 +15,12 @@ int main() {
   assert(fresh(100, 220)); assert(!fresh(100, 221)); assert(!fresh(221, 220));
   assert(command("/status") == Command::Status);
   assert(command("/plot") == Command::Plot);
+  for (auto text : {"/plot15", kPlot15Button}) assert(command(text) == Command::Plot15);
+  for (auto text : {"/plot30", kPlot30Button}) assert(command(text) == Command::Plot30);
+  for (auto text : {"/plot60", kPlot60Button}) assert(command(text) == Command::Plot60);
+  assert(command("/plot90") == Command::None);
+  assert(validPlotMinutes(15) && validPlotMinutes(30) && validPlotMinutes(60));
+  assert(!validPlotMinutes(0) && !validPlotMinutes(90));
   for (auto mode : {Mode::Essential, Mode::Brief, Mode::Detailed}) {
     assert(allowEvent(mode, false, EventScope::Always));
     assert(allowEvent(mode, true, EventScope::DetailedOnly));

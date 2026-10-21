@@ -25,8 +25,9 @@ inline bool meanOverTarget(float first, float second, float target, float limit 
   return std::isfinite(first) && std::isfinite(second) && std::isfinite(target) &&
     (first + second) * 0.5f > target + limit;
 }
-inline bool meanOvershootExceeded(float first, float second, float target, const ProtectionSettings &s) {
-  return s.meanOvershootEnabled && meanOverTarget(first,second,target,s.maxMeanOvershootC);
+inline bool meanOvershootExceeded(float first, float second, float target, const ProtectionSettings &s, bool cooling = false) {
+  // Heating can slow passive cooling, but cannot make the oven cool faster.
+  return !cooling && s.meanOvershootEnabled && meanOverTarget(first,second,target,s.maxMeanOvershootC);
 }
 
 inline bool validTarget(float c) {

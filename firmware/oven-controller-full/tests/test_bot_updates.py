@@ -3,6 +3,7 @@ import unittest
 import zlib
 from collections import deque
 from unittest.mock import patch
+from urllib.parse import urlsplit, parse_qs
 from test_telegram_tool import tool, preview
 
 
@@ -33,6 +34,39 @@ class BotUpdatesTest(unittest.TestCase):
         self.assertEqual(command.consume([dict(update_id=1, message=message)], 101), ['/plot'])
         message['from']['id'] = 7
         self.assertEqual(command.consume([dict(update_id=2, message=message)], 101), [])
+
+    def test_plot_submenu_buttons_are_authorized_commands(self):
+        self.assertEqual(tool.plot_keyboard()['keyboard'][0], list(tool.PLOT_BUTTONS))
+        for button, expected in tool.PLOT_BUTTONS.items():
+            for sender, date, result in ((42,100,[expected]),(7,100,[]),(42,1,[])):
+                commands=tool.Commands(42)
+                message=dict(date=date,text=button,chat=dict(id=42,type='private'),**{'from':dict(id=sender)})
+                self.assertEqual(commands.consume([dict(update_id=1,message=message)],122),result)
+
+    def test_plot_windows_read_previous_pages_and_preserve_gaps(self):
+        d=preview.DemoDevice('full',speed=1)
+        d.now=3600
+        d.samples=[[i+1,i*10000,100,102,105,0,11,0] for i in range(361)]
+        d.samples[350][6]=0
+        d.seq=361
+        def local(base,endpoint):
+            url=urlsplit(endpoint)
+            return d.request('GET',url.path,parse_qs(url.query))
+        for minutes in (15,30,60):
+            with self.subTest(minutes=minutes), patch.object(tool,'local_json',side_effect=local), patch.object(tool,'plot_png',return_value=b'PNG') as render:
+                result=tool.preview_plot('unused',minutes)
+                points=render.call_args.args[0]
+                self.assertEqual(len(points),minutes*6+1)
+                self.assertEqual(points[0]['ms'],(60-minutes)*60000)
+                self.assertIsNone(points[-11]['actual'])
+                self.assertIn(f'Ultimi {minutes} minuti',result['caption'])
+        with self.assertRaises(ValueError):tool.preview_plot('unused',90)
+
+    def test_plot_rejects_reboot_between_history_pages(self):
+        with patch.object(tool,'local_json',side_effect=[dict(bootCount=1,uptimeMs=3600000),
+                dict(bootCount=1,samples=[[181,1800000,100,100,100,0,11,0]],moreBefore=True),
+                dict(bootCount=2,samples=[])]):
+            with self.assertRaisesRegex(ValueError,'riavviata'):tool.preview_plot('unused',60)
 
     def test_png_pixels_crc_and_photo_multipart(self):
         png = tool.plot_png([dict(ms=0,actual=100,target=101),dict(ms=10000,actual=None,target=102),dict(ms=20000,actual=104,target=103)])

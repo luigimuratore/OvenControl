@@ -28,6 +28,8 @@ class ParametersPreviewTest(unittest.TestCase):
             for first,second,alarm in ((160,190,False),(160,190.01,True),(185,185,False),(185.01,185.01,True),(160,160,False)):
                 with self.subTest(mode=mode,first=first,second=second):
                     d=self.device(mode);self.sample(d,first,second)
+                    if mode in ('cooldown','manual-cooldown') and abs(first-second)<=30:
+                        alarm=False
                     self.assertEqual(d.phase,'fault' if alarm else 'paused' if mode=='pause' else 'running')
                     if alarm:self.assertFalse(d.relay);self.assertEqual(d.duty,0)
 

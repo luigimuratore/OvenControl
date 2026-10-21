@@ -24,6 +24,11 @@ inline bool allowEvent(Mode mode, bool critical, EventScope scope = EventScope::
 constexpr const char *kEssentialButton = "🛡️ Essenziale";
 constexpr const char *kBriefButton = "🔔 Sintetica";
 constexpr const char *kDetailedButton = "📋 Dettagliata";
+constexpr const char *kPlot15Button = "📈 15 min";
+constexpr const char *kPlot30Button = "📈 30 min";
+constexpr const char *kPlot60Button = "📈 60 min";
+constexpr const char *kPlotMenuText = "📈 Scegli l'intervallo del grafico: 15, 30 o 60 minuti. Riceverai una nuova immagine con lo storico disponibile fino a questo momento.";
+inline bool validPlotMinutes(unsigned minutes) { return minutes == 15 || minutes == 30 || minutes == 60; }
 constexpr const char *kModeMenuText = R"modes(Scegli come ricevere gli eventi:
 🛡️ Essenziale — Allarmi/blackout e PDF; avvio ESP e controllo sempre visibili.
 🔔 Sintetica — Eventi brevi, allarmi dettagliati e PDF.
@@ -34,7 +39,7 @@ constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 
 📋 COMANDI
 /status — Stato completo: ciclo, temperature, uscite, PID e allarmi.
-/plot — Immagine aggiornata del grafico target/media PT100 (ultimi 30 minuti).
+/plot — Scegli il grafico target/media PT100 degli ultimi 15, 30 o 60 minuti.
 /help — Aiuto sul bot.
 /start — Mostra e fissa questa guida; non avvia il forno.
 /modalita — Mostra la modalità attiva e i pulsanti di scelta.
@@ -74,11 +79,14 @@ inline bool authorized(int64_t configured, int64_t chat, int64_t sender, const c
 inline bool fresh(int64_t date, int64_t now) {
   return date > 0 && now >= date && now - date <= kCommandAgeSec;
 }
-enum class Command { None, Status, Plot, Help, ModeMenu, Essential, Brief, Detailed };
+enum class Command { None, Status, Plot, Plot15, Plot30, Plot60, Help, ModeMenu, Essential, Brief, Detailed };
 inline Command command(const char *text) {
   if (!text) return Command::None;
   if (std::strcmp(text, "/status") == 0) return Command::Status;
   if (std::strcmp(text, "/plot") == 0) return Command::Plot;
+  if (std::strcmp(text, "/plot15") == 0 || std::strcmp(text, kPlot15Button) == 0) return Command::Plot15;
+  if (std::strcmp(text, "/plot30") == 0 || std::strcmp(text, kPlot30Button) == 0) return Command::Plot30;
+  if (std::strcmp(text, "/plot60") == 0 || std::strcmp(text, kPlot60Button) == 0) return Command::Plot60;
   if (std::strcmp(text, "/start") == 0 || std::strcmp(text, "/help") == 0) return Command::Help;
   if (std::strcmp(text, "/modalita") == 0) return Command::ModeMenu;
   if (std::strcmp(text, "/essenziale") == 0 || std::strcmp(text, kEssentialButton) == 0) return Command::Essential;

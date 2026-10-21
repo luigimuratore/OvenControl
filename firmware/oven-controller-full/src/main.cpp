@@ -507,18 +507,18 @@ String sensorMessage(const Sensor &sensor) {
 }
 float meanC() { return (sensors[0].c + sensors[1].c) * 0.5f; }
 float hottestC() { return fmaxf(sensors[0].c, sensors[1].c); }
-String protectionProblem(float reference) {
+String protectionProblem(float reference, bool cooling = false) {
   if (thermal::probeDeltaExceeded(sensors[0].c,sensors[1].c,protectionSettings))
     return "Differenza PT100: " + String(fabsf(sensors[0].c-sensors[1].c),2) + " °C (limite >" +
       String(protectionSettings.maxProbeDeltaC,1) + " °C): uscita spenta";
-  if (thermal::meanOvershootExceeded(sensors[0].c,sensors[1].c,reference,protectionSettings))
+  if (thermal::meanOvershootExceeded(sensors[0].c,sensors[1].c,reference,protectionSettings,cooling))
     return "Sovratemperatura media PT100: " + String((sensors[0].c+sensors[1].c)*.5f,2) +
       " °C; setpoint " + String(reference,2) + " °C; scostamento +" + String((sensors[0].c+sensors[1].c)*.5f-reference,2) +
       " °C (limite >" + String(protectionSettings.maxMeanOvershootC,1) + " °C): uscita spenta";
   return "";
 }
-bool checkProtections(float reference) {
-  const String problem = protectionProblem(reference);
+bool checkProtections(float reference, bool cooling = false) {
+  const String problem = protectionProblem(reference,cooling);
   if (!problem.length()) return true;
   trip(problem); return false;
 }
@@ -786,7 +786,7 @@ void sampleAndControl() {
   if (manualOperation) {
     manualSession.tick(hottestC(), now);
     setpointC = manualSession.reference;
-    if (!checkProtections(setpointC)) return;
+    if (!checkProtections(setpointC,manualSession.descending())) return;
     if (!manualSession.heatingAllowed()) { duty = 0; inhibitHeater(); return; }
     controlPid(meanC(), now, manualSession.descending()); return;
   }
@@ -794,7 +794,7 @@ void sampleAndControl() {
   float actual = meanC();
   uint32_t elapsed = uint32_t(now - stepStarted);
   setpointC = profile::setpoint(step, stepStartC, elapsed);
-  if (!checkProtections(setpointC)) return;
+  if (!checkProtections(setpointC,step.type == profile::Type::Cooldown)) return;
   if (step.type == profile::Type::Cooldown) {
     if (profile::cooldownDone(step, stepStartC, elapsed, hottestC())) { advanceStep(); return; }
     controlPid(actual, now, true);
@@ -1377,7 +1377,7 @@ void commandApi() {
     const auto &requested = activeRecipe.steps[stepIndex];
     const float reference = requested.type == profile::Type::Hold ? requested.target : requested.type == profile::Type::Ramp ?
       fminf(requested.target,pauseHold.targetC) : fmaxf(requested.target,pauseHold.targetC);
-    const String problem = protectionProblem(reference);
+    const String problem = protectionProblem(reference,requested.type == profile::Type::Cooldown);
     if (problem.length()) { error(409,problem); return; }
     const uint32_t now = millis();
     if (stepIndex >= activeRecipe.count || !pauseHold.resume(activeRecipe.steps[stepIndex], now,
@@ -1966,11 +1966,11 @@ void loop() {
     }
   }
   if (telegramBot.takeStatusRequest()) telegramBot.reply(telegramStatus());
-  if (telegramBot.takePlotRequest()) {
+  if (const unsigned plotMinutes = telegramBot.takePlotRequest()) {
     const uint8_t flags = (sensors[0].valid ? 1 : 0) | (sensors[1].valid ? 2 : 0) | (std::isfinite(setpointC) ? 8 : 0);
     const Sample current{historySeq, millis(), sensors[0].c, sensors[1].c, setpointC, duty, flags,
       uint8_t(manualOperation ? 255 : stepIndex)};
-    if (!telegramBot.plot(history, HISTORY_CAP, historyHead, historyCount, current))
+    if (!telegramBot.plot(history, HISTORY_CAP, historyHead, historyCount, current, plotMinutes))
       telegramBot.reply("📈 Grafico non accodato: un invio è già in corso o la memoria non è disponibile. Riprova /plot tra poco.");
   }
   if (outputSnapshot().updating) { delay(5); return; }

@@ -93,7 +93,7 @@ const char WEB_HTML[] PROGMEM = R"OVEN_ASSET_2026(<!doctype html>
     </section>
     <section class="control-settings-section protection-settings-section" aria-labelledby="protectionSettingsTitle">
       <h2 id="protectionSettingsTitle">Blocchi termici configurabili</h2>
-      <p>Ogni blocco è indipendente. Le soglie si applicano a rampa, mantenimento, pausa e cooldown di Programmi e Manuale. Scattano solo quando il valore è maggiore della soglia. Il target è il riferimento istantaneo mostrato nel grafico.</p>
+      <p>Ogni blocco è indipendente e scatta solo oltre la soglia. Il blocco ΔT sonde vale anche in cooldown. Il blocco media − target vale in salita, mantenimento e pausa; durante il raffreddamento è escluso, perché il forno non può accelerare la discesa naturale. Il target è il riferimento istantaneo mostrato nel grafico.</p>
       <div class="protection-grid">
         <article class="protection-card"><h3>Differenza tra le sonde</h3><p class="hint">ΔT = valore assoluto di PT100 #1 − PT100 #2.</p>
           <label class="protection-toggle"><input id="probeDeltaEnabled" type="checkbox"><span>Abilita blocco ΔT sonde</span></label>

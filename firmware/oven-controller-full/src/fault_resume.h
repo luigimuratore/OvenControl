@@ -5,7 +5,7 @@
 namespace regulation {
 // Volatile checkpoint; never reconstructed from a report after a reboot.
 struct FaultResume {
-  bool available = false, manual = false, wasPaused = false;
+  bool available = false, manual = false, wasPaused = false, cooling = false;
   uint8_t step = 0;
   uint32_t faultAt = 0, segmentAt = 0, activeBefore = 0, holdMs = 0;
   float origin = NAN, reference = NAN;
@@ -14,7 +14,7 @@ struct FaultResume {
   void clear() { *this = FaultResume{}; }
   void capture(const profile::Step &requested, uint8_t index, bool paused, const ProgramPause &savedPause,
                float startC, uint32_t segmentStarted, uint32_t elapsedBefore, uint32_t held, uint32_t now) {
-    clear(); step = index; wasPaused = paused; pause = savedPause;
+    clear(); step = index; wasPaused = paused; pause = savedPause; cooling = requested.type == profile::Type::Cooldown;
     origin = startC; segmentAt = segmentStarted; activeBefore = elapsedBefore; holdMs = held; faultAt = now;
     reference = !paused ? profile::setpoint(requested, startC, uint32_t(now-segmentStarted)) :
       requested.type == profile::Type::Hold ? requested.target : requested.type == profile::Type::Ramp ?
@@ -23,14 +23,14 @@ struct FaultResume {
       (!paused || (savedPause.active && thermal::validTarget(savedPause.targetC)));
   }
   void capture(const ::manual::Session &saved, uint32_t now) {
-    clear(); manual = true; faultAt = now; session = saved; session.freeze(now);
+    clear(); manual = true; faultAt = now; session = saved; session.freeze(now); cooling = session.descending();
     reference = session.reference;
     available = session.active() && std::isfinite(reference) && thermal::belowHardLimit(reference);
   }
   bool safePair(float first, bool firstValid, float second, bool secondValid,
                 const thermal::ProtectionSettings &settings = thermal::ProtectionSettings{}) const {
     return available && thermal::healthyPair(first, firstValid, second, secondValid) &&
-      !thermal::probeDeltaExceeded(first,second,settings) && !thermal::meanOvershootExceeded(first, second, reference, settings);
+      !thermal::probeDeltaExceeded(first,second,settings) && !thermal::meanOvershootExceeded(first, second, reference, settings, cooling);
   }
   bool restore(const profile::Step &requested, uint32_t now, float &startC,
                uint32_t &segmentStarted, uint32_t &elapsedBefore, profile::HoldTimer &timer) const {

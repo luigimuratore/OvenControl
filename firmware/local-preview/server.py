@@ -292,7 +292,7 @@ class DemoDevice:
             reason = "Nessun punto di ripresa in RAM: usa RESET & BLOCK."
         elif not healthy:
             reason = "Ripristina entrambe le sonde e attendi letture valide sotto 415 °C."
-        elif reference is None or self.protection_problem(reference):
+        elif reference is None or self.protection_problem(reference, self.cooling_control(saved["values"])):
             reason = "Attendi il rientro delle temperature nelle soglie abilitate in Parameters."
         else:
             reason = ""
@@ -377,7 +377,14 @@ class DemoDevice:
         self.log("MANUALE", ("Manuale avviato: target " if action == "start" else "Target manuale modificato: ") + str(target) + " °C · rate " + str(rate) + " °C/min")
         return self.status()
 
-    def protection_problem(self, reference):
+    def cooling_control(self, values=None):
+        state = vars(self) if values is None else values
+        if state["operation"] == "manual":
+            return state["manual_mode"] == "cooldown" or state["manual_cooling"]
+        active, index = state["active"], state["step_index"]
+        return bool(active and index < len(active["steps"]) and active["steps"][index]["type"] == "cooldown")
+
+    def protection_problem(self, reference, cooling=False):
         pair = self.sensors()
         if not all(sensor["valid"] for sensor in pair):
             return None
@@ -388,13 +395,13 @@ class DemoDevice:
         if cfg["probeDeltaEnabled"] and abs(first-second) > cfg["maxProbeDeltaC"]:
             return f'Differenza PT100: {abs(first-second):.2f} °C (limite >{cfg["maxProbeDeltaC"]:g} °C): uscita spenta (simulata)'
         mean = (first+second)/2
-        if cfg["meanOvershootEnabled"] and reference is not None and mean > reference+cfg["maxMeanOvershootC"]:
+        if not cooling and cfg["meanOvershootEnabled"] and reference is not None and mean > reference+cfg["maxMeanOvershootC"]:
             return (f'Sovratemperatura media PT100: {mean:.2f} °C; setpoint {reference:.2f} °C; '
                     f'scostamento +{mean-reference:.2f} °C (limite >{cfg["maxMeanOvershootC"]:g} °C): uscita spenta (simulata)')
         return None
 
     def overtemperature(self):
-        return self.protection_problem(self.target)
+        return self.protection_problem(self.target, self.phase == "running" and self.cooling_control())
 
     def advance_full(self, dt):
         if self.manual_mode != "idle":
@@ -696,7 +703,8 @@ class DemoDevice:
             require(self.phase == "paused" and not self.missing, "Nessun ciclo in pausa o sonda non valida", 409)
             step = self.active["steps"][self.step_index]
             reference = step["target"] if step["type"] == "hold" else min(step["target"], self.pause_target) if step["type"] == "ramp" else max(step["target"], self.pause_target)
-            require(not self.protection_problem(reference),self.protection_problem(reference) or "Blocchi attivi",409)
+            problem = self.protection_problem(reference, step["type"] == "cooldown")
+            require(not problem,problem or "Blocchi attivi",409)
             self.target = reference
             self.phase = "running"
         else:

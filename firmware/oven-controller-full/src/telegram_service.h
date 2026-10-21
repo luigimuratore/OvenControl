@@ -21,12 +21,13 @@ extern "C" esp_err_t esp_crt_bundle_attach(void *conf);
 // The worker owns all HTTPS/JSON state. The loop only copies fixed-size messages
 // into PSRAM queues with zero wait. No sensor, PID, Preferences or GPIO access here.
 class TelegramService {
-  struct Message { uint32_t created; bool pin = false, menu = false, event = false; telegram::EventScope scope = telegram::EventScope::Selected; char text[telegram::kMessageBytes]; };
+  struct Message { uint32_t created; bool pin = false, menu = false, plotMenu = false, event = false; telegram::EventScope scope = telegram::EventScope::Selected; char text[telegram::kMessageBytes]; };
   struct ReportJob {
     reports::Snapshot report;
     reportpdf::Point *points = nullptr;
     size_t count = 0;
     bool partial = false, plot = false;
+    unsigned plotMinutes = 30;
     uint32_t created = 0;
   };
   struct Worker {
@@ -62,7 +63,8 @@ class TelegramService {
   StaticQueue_t documentControl{};
   uint8_t documentStorage[3 * sizeof(ReportJob *)]{};
   uint8_t *alarmStorage = nullptr, *noticeStorage = nullptr, *replyStorage = nullptr;
-  std::atomic<bool> available{false}, statusRequest{false}, plotRequest{false}, running{false};
+  std::atomic<bool> available{false}, statusRequest{false}, running{false};
+  std::atomic<unsigned> plotRequest{0};
   std::atomic<int> modeValue{int(telegram::Mode::Brief)}, requestedMode{-1};
   std::atomic<uint32_t> sent{0}, failed{0}, dropped{0}, lastSuccess{0};
   std::atomic<int> lastHttp{0};
@@ -186,13 +188,19 @@ class TelegramService {
     JsonDocument body(&allocator), response(&allocator);
     body["chat_id"] = chatId; body["text"] = message.text;
     body["disable_notification"] = !critical;
-    if (message.menu) {
+    if (message.menu || message.plotMenu) {
       JsonObject markup = body["reply_markup"].to<JsonObject>();
       markup["resize_keyboard"] = true; markup["is_persistent"] = true; markup["one_time_keyboard"] = false;
       JsonArray rows = markup["keyboard"].to<JsonArray>();
-      JsonArray first = rows.add<JsonArray>(); first.add(telegram::kEssentialButton); first.add(telegram::kBriefButton);
-      JsonArray second = rows.add<JsonArray>(); second.add(telegram::kDetailedButton); second.add("/status");
-      JsonArray third = rows.add<JsonArray>(); third.add("/plot"); third.add("/modalita");
+      if (message.plotMenu) {
+        JsonArray choices = rows.add<JsonArray>();
+        choices.add(telegram::kPlot15Button); choices.add(telegram::kPlot30Button); choices.add(telegram::kPlot60Button);
+        JsonArray navigation = rows.add<JsonArray>(); navigation.add("/status"); navigation.add("/modalita");
+      } else {
+        JsonArray first = rows.add<JsonArray>(); first.add(telegram::kEssentialButton); first.add(telegram::kBriefButton);
+        JsonArray second = rows.add<JsonArray>(); second.add(telegram::kDetailedButton); second.add("/status");
+        JsonArray third = rows.add<JsonArray>(); third.add("/plot"); third.add("/modalita");
+      }
     }
     String payload; serializeJson(body, payload);
     if (!request("sendMessage", payload, response)) { backoff(worker->messages); return false; }
@@ -249,7 +257,7 @@ class TelegramService {
     if (plot) snprintf(name, sizeof(name), "Plot_%u.png", unsigned(w.document->created));
     else reportpdf::filename(w.document->report, name, sizeof(name));
     const String caption = plot ? String("📈 TARGET / MEDIA PT100\nAggiornato: ") + stamp +
-      "\nUltimi 30 minuti disponibili · " + String(w.document->count) + " campioni. Nuova immagine con /plot." :
+      "\nUltimi " + String(w.document->plotMinutes) + " minuti · storico disponibile, " + String(w.document->count) + " campioni. Nuova immagine dal menu /plot." :
       String("📄 REPORT DI FINE CICLO\n") + w.document->report.recipeName + "\n" + reportpdf::outcome(w.document->report.outcome);
     const String boundary = "OvenPdf" + String(esp_random(), HEX) + String(esp_random(), HEX);
     const String prefix = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
@@ -341,7 +349,10 @@ class TelegramService {
       if (command != telegram::Command::None) ++commandsReceived;
       switch (command) {
         case telegram::Command::Status: statusRequest = true; break;
-        case telegram::Command::Plot: plotRequest = true; break;
+        case telegram::Command::Plot: reply(telegram::kPlotMenuText, false, true); break;
+        case telegram::Command::Plot15: plotRequest = 15; break;
+        case telegram::Command::Plot30: plotRequest = 30; break;
+        case telegram::Command::Plot60: plotRequest = 60; break;
         case telegram::Command::Help:
           notify(String(telegram::kGuideText) + "\n\nModalità attiva: " + telegram::modeName(mode()),
             false, strcmp(message["text"] | "", "/start") == 0, true);
@@ -439,7 +450,7 @@ public:
   void setMode(telegram::Mode selected) { modeValue = int(selected); }
   int takeModeRequest() { return requestedMode.exchange(-1); }
   bool takeStatusRequest() { return running && statusRequest.exchange(false); }
-  bool takePlotRequest() { return running && plotRequest.exchange(false); }
+  unsigned takePlotRequest() { return running ? plotRequest.exchange(0) : 0; }
   bool notify(const String &text, bool critical = false, bool pin = false, bool menu = false, bool event = false, telegram::EventScope scope = telegram::EventScope::Selected) {
     if (!running) return false;
     if (event && !telegram::allowEvent(mode(), critical, scope)) return true;
@@ -469,14 +480,16 @@ public:
     return true;
   }
   template <typename Sample>
-  bool plot(const Sample *curve, size_t capacity, size_t head, size_t count, const Sample &current) {
-    if (!running || plotsPending || !curve || !capacity || count > capacity) return false;
+  bool plot(const Sample *curve, size_t capacity, size_t head, size_t count, const Sample &current, unsigned minutes) {
+    if (!running || plotsPending || !curve || !capacity || count > capacity || count > 4320 || !telegram::validPlotMinutes(minutes)) return false;
     auto *job = static_cast<ReportJob *>(ps_malloc(sizeof(ReportJob)));
     if (!job) return false;
-    new (job) ReportJob(); job->plot = true; job->created = millis();
-    job->points = static_cast<reportpdf::Point *>(ps_malloc(257 * sizeof(reportpdf::Point)));
+    new (job) ReportJob(); job->plot = true; job->plotMinutes = minutes; job->created = millis();
+    // Keep the entire selected interval, including gaps and event markers.
+    const size_t pointCapacity = std::max(size_t(2),count + 1);
+    job->points = static_cast<reportpdf::Point *>(ps_malloc(pointCapacity * sizeof(reportpdf::Point)));
     if (!job->points) { releaseReport(job); return false; }
-    job->count = plotpng::snapshot(curve, capacity, head, count, current, job->points, 257);
+    job->count = plotpng::snapshot(curve, capacity, head, count, current, job->points, pointCapacity, minutes * 60000UL);
     if (!job->count) { releaseReport(job); return false; }
     job->report.startMs = job->points[0].ms; job->report.endMs = current.ms;
     const auto epoch = time(nullptr); job->report.endUtc = epoch >= 1700000000 ? uint64_t(epoch) : 0;
@@ -484,9 +497,9 @@ public:
     if (xQueueSend(documents, &job, 0) != pdTRUE) { --plotsPending; releaseReport(job); ++plotsDropped; return false; }
     return true;
   }
-  void reply(const String &text, bool menu = false) {
+  void reply(const String &text, bool menu = false, bool plotMenu = false) {
     if (!running) return;
-    Message message{}; copyText(message, text); message.menu = menu; xQueueOverwrite(replies, &message);
+    Message message{}; copyText(message, text); message.menu = menu; message.plotMenu = plotMenu; xQueueOverwrite(replies, &message);
   }
   void status(JsonObject object) const {
     object["configured"] = configured; object["running"] = running.load();

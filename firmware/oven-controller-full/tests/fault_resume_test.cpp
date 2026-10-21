@@ -36,6 +36,9 @@ int main() {
   const uint32_t now=start+900000;
   assert(checkpoint.restore(cooling,now,origin,at,before,hold));
   assert(profile::setpoint(cooling,origin,uint32_t(now-at)) == 174);
+  assert(checkpoint.safePair(195,true,195,true)); // Passive cooling can lag the reference.
+  assert(!checkpoint.safePair(160,true,200,true)); // Probe delta remains enforced.
+  assert(!checkpoint.safePair(415,true,415,true));
 
   const profile::Step holding{profile::Type::Hold,175,0,3};
   checkpoint.capture(holding,1,false,pause,175,1000,0,60000,62000);
@@ -61,6 +64,7 @@ int main() {
   checkpoint.capture(resumed,1321000);
   assert(checkpoint.restore(1921000,session));
   assert(session.descending() && session.reference == 111 && session.target == 25);
+  assert(checkpoint.safePair(150,true,150,true)); // Manual cooldown continuation uses the same exception.
   checkpoint.clear(); assert(!checkpoint.available && !checkpoint.restore(2000000,session));
 
   // Reopen the full report after a fault, preserving accumulated hold/stats.

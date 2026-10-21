@@ -24,4 +24,17 @@ int main() {
   n=plotpng::snapshot(ring,4,0,0,live,points,4); assert(n==1 && points[0].mean==101);
   assert(!plotpng::snapshot(ring,4,0,5,live,points,4));
   assert(!plotpng::snapshot(ring,4,0,0,live,points,1));
+  // A full hour contains more than 257 samples: retain the start, gaps and markers.
+  Sample hour[361]; reportpdf::Point full[362];
+  for (size_t i=0;i<361;++i) hour[i]={uint32_t(i*10000),100,102,105,0,11};
+  hour[1].flags=27; hour[350].flags=0;
+  live=hour[360];
+  for (unsigned minutes : {15U,30U,60U}) {
+    n=plotpng::snapshot(hour,361,0,361,live,full,362,minutes*60000UL);
+    assert(n==minutes*6+1 && full[0].ms==(60-minutes)*60000UL);
+    assert(full[n-1].ms==live.ms && !std::isfinite(full[n-11].mean));
+    if (minutes==60) assert(full[1].flags==27);
+  }
+  assert(!plotpng::snapshot(hour,361,0,361,live,full,362,0));
+  assert(!plotpng::snapshot(hour,361,0,361,live,full,362,3600001));
 }

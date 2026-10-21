@@ -38,6 +38,13 @@ MODE_MENU_TEXT = re.search(r'R"modes\((.*?)\)modes"',
     (ROOT / "src/telegram_policy.h").read_text(), re.S)[1]
 MODE_LABELS = {"essenziale": "Essenziale", "sintetica": "Sintetica", "dettagliata": "Dettagliata"}
 MODE_BUTTONS = {"🛡️ Essenziale": "/essenziale", "🔔 Sintetica": "/sintetica", "📋 Dettagliata": "/dettagliata"}
+PLOT_BUTTONS = {"📈 15 min": "/plot15", "📈 30 min": "/plot30", "📈 60 min": "/plot60"}
+PLOT_MENU_TEXT = "📈 Scegli l'intervallo del grafico: 15, 30 o 60 minuti. Riceverai una nuova immagine con lo storico disponibile fino a questo momento."
+
+
+def plot_keyboard():
+    return dict(keyboard=[list(PLOT_BUTTONS), ["/status", "/modalita"]],
+                resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 
 def mode_keyboard():
@@ -434,14 +441,32 @@ def plot_png(points):
     return b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,3,0,0,0))+chunk(b'PLTE',palette)+chunk(b'IDAT',zlib.compress(raster))+chunk(b'IEND',b'')
 
 
-def preview_plot(base):
+def preview_plot(base, minutes=30):
+    if minutes not in (15, 30, 60):
+        raise ValueError('Intervallo grafico non valido: scegli 15, 30 o 60 minuti.')
     status = local_json(base, "status")
-    history = local_json(base, "history?tail=1")
-    if status.get('bootCount') != history.get('bootCount'):
-        raise ValueError('Anteprima riavviata durante la richiesta. Riprova /plot.')
     now, points = status['uptimeMs'], []
-    for seq,ms,t1,t2,target,duty,flags,step in history.get('samples',[]):
-        if ((now-ms)&0xffffffff)>1800000: continue
+    rows, endpoint, before = [], "history?tail=1", None
+    for _ in range(25):
+        history = local_json(base, endpoint)
+        if status.get('bootCount') != history.get('bootCount'):
+            raise ValueError('Anteprima riavviata durante la richiesta. Riprova /plot.')
+        page = history.get('samples', [])
+        if not page:
+            break
+        if before is not None and page[-1][0] >= before:
+            raise ValueError('Paginazione grafico non valida.')
+        rows[:0] = page
+        if len(rows) > 4320:
+            raise ValueError('Storico grafico troppo grande.')
+        if not history.get('moreBefore') or ((now-page[0][1])&0xffffffff) >= minutes*60000:
+            break
+        before = page[0][0]
+        endpoint = f"history?before={before}"
+    else:
+        raise ValueError('Paginazione grafico troppo grande.')
+    for seq,ms,t1,t2,target,duty,flags,step in rows:
+        if ((now-ms)&0xffffffff)>minutes*60000: continue
         points.append(dict(ms=ms, actual=(t1+t2)/2 if flags&3==3 else None,
                            target=target if flags&8 else None,marker=flags&0xf0))
     sensors = status.get('sensors',[])
@@ -451,7 +476,7 @@ def preview_plot(base):
     else: points.append(current)
     stamp=datetime.now(ZoneInfo('Europe/Rome')).strftime('%d/%m/%Y %H:%M:%S (Italia)')
     return dict(filename='Plot_anteprima.png',png=plot_png(points),
-                caption=f'📈 TARGET / MEDIA PT100\nAggiornato: {stamp}\nUltimi 30 minuti disponibili. ANTEPRIMA SIMULATA')
+                caption=f'📈 TARGET / MEDIA PT100\nAggiornato: {stamp}\nUltimi {minutes} minuti · storico disponibile. ANTEPRIMA SIMULATA')
 
 
 def preview_pdf(report, points):
@@ -727,8 +752,8 @@ class Commands:
             if not private_message(message, self.chat) or not (0 < date <= now and now - date <= 120):
                 continue
             text = message.get("text")
-            command = MODE_BUTTONS.get(text, text) if isinstance(text, str) else None
-            if command in ("/status", "/plot", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
+            command = PLOT_BUTTONS.get(text, MODE_BUTTONS.get(text, text)) if isinstance(text, str) else None
+            if command in ("/status", "/plot", "/plot15", "/plot30", "/plot60", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
                 commands.append(command)
         return commands
 
@@ -852,8 +877,10 @@ def preview(api, chat, url):
                                 text = format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE", "Nessuno stato aggiornato disponibile.")
                             enqueue(text, 1)
                         elif command == "/plot":
+                            enqueue(dict(text=PLOT_MENU_TEXT, reply_markup=plot_keyboard()), 1)
+                        elif command in ("/plot15", "/plot30", "/plot60"):
                             try:
-                                enqueue(preview_plot(base), -1)
+                                enqueue(preview_plot(base, int(command[5:])), -1)
                             except ValueError as error:
                                 enqueue(str(error), 1)
                         elif command == "/start":

@@ -1776,7 +1776,7 @@ void telegramUsersCommandApi(){
   if(!saveTelegramUsers(proposed)){error(507,"Salvataggio utenti fallito: autorizzazioni precedenti mantenute");return;}
   if(action=="approve"){
     telegramPending.remove(chat);
-    telegramBot.reply(String("✅ Accesso autorizzato a OvenControl.\n/status e /plot sono disponibili.\nModalità notifiche: ")+telegram::modeName(telegramBot.mode(chat))+".\nUsa /modalita per cambiarla o /start per la guida.",true,false,chat);
+    telegramBot.reply(String("✅ Accesso autorizzato a OvenControl.\n/status e /plot sono disponibili.\nModalità notifiche: ")+telegram::modeName(telegramBot.mode(chat))+".\nUsa /notifiche per cambiarla o /start per la guida.",true,false,chat);
   }
   logEvent("TELEGRAM",String("Utenti aggiornati: ")+action+" · ID "+String(static_cast<long long>(chat)),false);
   telegramUsersApi();
@@ -1796,8 +1796,8 @@ void handleTelegramRequest(const telegram::UserRequest &request){
   if(selected>=0){
     auto proposed=telegramUsers;proposed.setMode(chat,selected);
     if(telegramBot.mode(chat)==telegram::modeFrom(selected)||saveTelegramUsers(proposed))
-      telegramBot.reply(String("✅ Modalità personale: ")+telegram::modeName(telegramBot.mode(chat))+".\n/status e /plot sempre disponibili.",true,false,chat);
-    else telegramBot.reply("⚠️ Modalità non salvata: resta attiva quella precedente.",true,false,chat);
+      telegramBot.reply(String("✅ Modalità personale: ")+telegram::modeName(telegramBot.mode(chat))+".\n/status e /plot sempre disponibili.",true,true,chat);
+    else telegramBot.reply("⚠️ Modalità non salvata: resta attiva quella precedente.",true,true,chat);
     return;
   }
   const unsigned minutes=request.command==telegram::Command::Plot15?15:request.command==telegram::Command::Plot30?30:request.command==telegram::Command::Plot60?60:0;

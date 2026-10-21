@@ -1,6 +1,7 @@
 #include "../src/telegram_policy.h"
 #include <cassert>
 #include <initializer_list>
+#include <string>
 
 int main() {
   using namespace telegram;
@@ -28,6 +29,33 @@ int main() {
   }
   for (auto text : {"/start", "/help"}) assert(command(text) == Command::Help);
   assert(command("/modalita") == Command::ModeMenu);
+  assert(command("/notifiche") == Command::ModeMenu);
+  assert(command("/menu") == Command::MainMenu);
+  assert(command(kBackButton) == Command::MainMenu);
+  assert(messageKeyboard(false, false) == Keyboard::None);
+  assert(messageKeyboard(true, false) == Keyboard::Main);
+  assert(messageKeyboard(false, true) == Keyboard::Plot);
+  assert(messageKeyboard(true, true) == Keyboard::Notifications);
+  const auto main = keyboardLayout(Keyboard::Main);
+  assert(main.rows == 2);
+  assert(!strcmp(main.buttons[0][0], "/notifiche") && !strcmp(main.buttons[0][1], "/status") && !main.buttons[0][2]);
+  assert(!strcmp(main.buttons[1][0], "/plot15") && !strcmp(main.buttons[1][1], "/plot30") && !strcmp(main.buttons[1][2], "/plot60"));
+  const auto notifications = keyboardLayout(Keyboard::Notifications);
+  assert(notifications.rows == 3 && command(notifications.buttons[2][0]) == Command::MainMenu);
+  assert(command(notifications.buttons[0][0]) == Command::Essential);
+  assert(command(notifications.buttons[0][1]) == Command::Brief);
+  assert(command(notifications.buttons[1][0]) == Command::Detailed);
+  for (auto keyboard : {Keyboard::Main, Keyboard::Notifications, Keyboard::Plot}) {
+    const auto layout = keyboardLayout(keyboard);
+    for (size_t row = 0; row < layout.rows; ++row)
+      for (const auto *button : layout.buttons[row]) if (button) assert(command(button) != Command::None);
+  }
+  assert(keyboardLayout(Keyboard::None).rows == 0);
+  assert(!strcmp(kBotCommands[0].name, "notifiche") && !strcmp(kBotCommands[1].name, "status"));
+  for (const auto &entry : kBotCommands) {
+    const auto text = std::string("/") + entry.name;
+    assert(command(text.c_str()) != Command::None && strlen(entry.description) > 0 && strlen(entry.description) <= 256);
+  }
   for (auto text : {"/essenziale", kEssentialButton}) assert(command(text) == Command::Essential);
   for (auto text : {"/sintetica", kBriefButton}) assert(command(text) == Command::Brief);
   for (auto text : {"/dettagliata", kDetailedButton}) assert(command(text) == Command::Detailed);
@@ -39,7 +67,7 @@ int main() {
   assert(modeFrom(99) == Mode::Brief && modeFrom(-1) == Mode::Brief);
   assert(modeFrom(0) == Mode::Essential && modeFrom(2) == Mode::Detailed);
   assert(strlen(kGuideText) + 80 < kMessageBytes);
-  for (auto text : {"/stop", "/start prova", "/reset", "/status extra", "hello"})
+  for (auto text : {"/stop", "/start prova", "/reset", "/status extra", "/notifiche extra", "/menu extra", "hello"})
     assert(command(text) == Command::None);
   assert(!expired(10001, 1, true, false)); assert(expired(10002, 1, true, false));
   assert(expired(3600002, 1, false, false)); assert(!expired(3600002, 1, false, true));

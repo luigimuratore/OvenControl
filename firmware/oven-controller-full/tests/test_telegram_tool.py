@@ -59,14 +59,14 @@ class CommandsTest(unittest.TestCase):
         with self.assertRaises(tool.TelegramError):
             guide.send(api, 42)
         guide.send(api, 42)
-        api.send.assert_called_once_with(42, tool.guide_text("sintetica"), reply_markup=tool.mode_keyboard())
+        api.send.assert_called_once_with(42, tool.guide_text("sintetica"), reply_markup=tool.main_keyboard())
         self.assertEqual(api.call.call_count, 2)
         api.call.assert_called_with("pinChatMessage", chat_id=42, message_id=123, disable_notification=True)
         self.assertLess(len(tool.guide_text("dettagliata").encode()), 2399)
 
     def test_modes_and_buttons_require_the_same_private_fresh_authorization(self):
         commands = tool.Commands(42)
-        texts = ["/modalita", "/essenziale", "/sintetica", "/dettagliata", *tool.MODE_BUTTONS]
+        texts = ["/notifiche", "/modalita", "/essenziale", "/sintetica", "/dettagliata", *tool.MODE_BUTTONS]
         valid = [update(i + 1, text) for i, text in enumerate(texts)]
         expected = [tool.MODE_BUTTONS.get(text, text) for text in texts]
         self.assertEqual(commands.consume(valid, 100), expected)

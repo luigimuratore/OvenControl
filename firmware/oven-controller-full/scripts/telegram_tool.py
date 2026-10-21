@@ -39,16 +39,23 @@ MODE_MENU_TEXT = re.search(r'R"modes\((.*?)\)modes"',
 MODE_LABELS = {"essenziale": "Essenziale", "sintetica": "Sintetica", "dettagliata": "Dettagliata"}
 MODE_BUTTONS = {"🛡️ Essenziale": "/essenziale", "🔔 Sintetica": "/sintetica", "📋 Dettagliata": "/dettagliata"}
 PLOT_BUTTONS = {"📈 15 min": "/plot15", "📈 30 min": "/plot30", "📈 60 min": "/plot60"}
+BACK_BUTTON = "⬅️ Indietro"
+MAIN_MENU_TEXT = "🏠 Menu principale: scegli notifiche, stato del forno o un grafico."
 PLOT_MENU_TEXT = "📈 Scegli l'intervallo del grafico: 15, 30 o 60 minuti. Riceverai una nuova immagine con lo storico disponibile fino a questo momento."
 
 
 def plot_keyboard():
-    return dict(keyboard=[list(PLOT_BUTTONS), ["/status", "/modalita"]],
+    return dict(keyboard=[list(PLOT_BUTTONS), [BACK_BUTTON]],
                 resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 
 def mode_keyboard():
-    return dict(keyboard=[["🛡️ Essenziale", "🔔 Sintetica"], ["📋 Dettagliata", "/status"], ["/plot", "/modalita"]],
+    return dict(keyboard=[["🛡️ Essenziale", "🔔 Sintetica"], ["📋 Dettagliata"], [BACK_BUTTON]],
+                resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
+
+
+def main_keyboard():
+    return dict(keyboard=[["/notifiche", "/status"], ["/plot15", "/plot30", "/plot60"]],
                 resize_keyboard=True, is_persistent=True, one_time_keyboard=False)
 
 
@@ -58,6 +65,18 @@ def mode_menu(mode):
 
 def guide_text(mode):
     return GUIDE_TEXT + "\n\nModalità attiva: " + MODE_LABELS[mode] + "\n\nANTEPRIMA SIMULATA"
+
+
+def menu_reply(command, mode):
+    if command == "/plot":
+        return dict(text=PLOT_MENU_TEXT, reply_markup=plot_keyboard())
+    if command in ("/notifiche", "/modalita"):
+        return dict(text=mode_menu(mode), reply_markup=mode_keyboard())
+    if command == "/menu":
+        return dict(text=MAIN_MENU_TEXT, reply_markup=main_keyboard())
+    if command == "/help":
+        return dict(text=guide_text(mode), reply_markup=main_keyboard())
+    raise ValueError("Comando menu non valido.")
 
 
 class NotificationSettings:
@@ -732,7 +751,7 @@ class GuideMessage:
 
     def send(self, api, chat):
         if self.message_id is None:
-            self.message_id = api.send(chat, guide_text(self.mode), reply_markup=mode_keyboard())["message_id"]
+            self.message_id = api.send(chat, guide_text(self.mode), reply_markup=main_keyboard())["message_id"]
         api.call("pinChatMessage", chat_id=chat, message_id=self.message_id, disable_notification=True)
 
 
@@ -753,7 +772,9 @@ class Commands:
                 continue
             text = message.get("text")
             command = PLOT_BUTTONS.get(text, MODE_BUTTONS.get(text, text)) if isinstance(text, str) else None
-            if command in ("/status", "/plot", "/plot15", "/plot30", "/plot60", "/start", "/help", "/modalita", "/essenziale", "/sintetica", "/dettagliata"):
+            if command == BACK_BUTTON:
+                command = "/menu"
+            if command in ("/status", "/plot", "/plot15", "/plot30", "/plot60", "/start", "/help", "/notifiche", "/modalita", "/menu", "/essenziale", "/sintetica", "/dettagliata"):
                 commands.append(command)
         return commands
 
@@ -876,8 +897,8 @@ def preview(api, chat, url):
                             except ValueError:
                                 text = format_notice("DASHBOARD LOCALE NON RAGGIUNGIBILE", "Nessuno stato aggiornato disponibile.")
                             enqueue(text, 1)
-                        elif command == "/plot":
-                            enqueue(dict(text=PLOT_MENU_TEXT, reply_markup=plot_keyboard()), 1)
+                        elif command in ("/plot", "/notifiche", "/modalita", "/menu", "/help"):
+                            enqueue(menu_reply(command, settings.mode), 1)
                         elif command in ("/plot15", "/plot30", "/plot60"):
                             try:
                                 enqueue(preview_plot(base, int(command[5:])), -1)
@@ -885,10 +906,6 @@ def preview(api, chat, url):
                                 enqueue(str(error), 1)
                         elif command == "/start":
                             enqueue(GuideMessage(settings.mode))
-                        elif command == "/help":
-                            enqueue(dict(text=guide_text(settings.mode), reply_markup=mode_keyboard()), 1)
-                        elif command == "/modalita":
-                            enqueue(dict(text=mode_menu(settings.mode), reply_markup=mode_keyboard()), 1)
                         else:
                             try:
                                 changed = settings.select(command[1:])

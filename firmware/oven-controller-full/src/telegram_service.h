@@ -321,18 +321,14 @@ class TelegramService {
     JsonDocument body(&allocator), response(&allocator);
     body["chat_id"] = message.chat; body["text"] = message.text;
     body["disable_notification"] = !critical;
-    if (message.menu || message.plotMenu) {
+    const auto keyboard = telegram::keyboardLayout(telegram::messageKeyboard(message.menu, message.plotMenu));
+    if (keyboard.rows) {
       JsonObject markup = body["reply_markup"].to<JsonObject>();
       markup["resize_keyboard"] = true; markup["is_persistent"] = true; markup["one_time_keyboard"] = false;
       JsonArray rows = markup["keyboard"].to<JsonArray>();
-      if (message.plotMenu) {
-        JsonArray choices = rows.add<JsonArray>();
-        choices.add(telegram::kPlot15Button); choices.add(telegram::kPlot30Button); choices.add(telegram::kPlot60Button);
-        JsonArray navigation = rows.add<JsonArray>(); navigation.add("/status"); navigation.add("/modalita");
-      } else {
-        JsonArray first = rows.add<JsonArray>(); first.add(telegram::kEssentialButton); first.add(telegram::kBriefButton);
-        JsonArray second = rows.add<JsonArray>(); second.add(telegram::kDetailedButton); second.add("/status");
-        JsonArray third = rows.add<JsonArray>(); third.add("/plot"); third.add("/modalita");
+      for (size_t i = 0; i < keyboard.rows; ++i) {
+        JsonArray row = rows.add<JsonArray>();
+        for (const auto *button : keyboard.buttons[i]) if (button) row.add(button);
       }
     }
     String payload; serializeJson(body, payload);
@@ -387,10 +383,10 @@ class TelegramService {
     if(slot<0)return;
     JsonDocument body(&allocator), response(&allocator);
     body["scope"]["type"] = "chat"; body["scope"]["chat_id"] = recipient;
-    const char *names[] = {"status", "plot", "modalita", "help", "start", "essenziale", "sintetica", "dettagliata"};
-    const char *descriptions[] = {"Stato completo del forno", "Grafico attuale target e media PT100", "Scegli le notifiche", "Guida ai comandi", "Mostra e fissa la guida", "Allarmi e report", "Eventi brevi e report", "Tutti i dettagli e avvisi sonde"};
     auto commands = body["commands"].to<JsonArray>();
-    for (unsigned i = 0; i < 8; ++i) { auto item = commands.add<JsonObject>(); item["command"] = names[i]; item["description"] = descriptions[i]; }
+    for (const auto &entry : telegram::kBotCommands) {
+      auto item = commands.add<JsonObject>(); item["command"] = entry.name; item["description"] = entry.description;
+    }
     String payload; serializeJson(body, payload);
     if (request("setMyCommands", payload, response)) { worker->commandChats[slot]=recipient; worker->setup.success(millis(),1000); }
     else if(lastHttp==400||lastHttp==403){worker->commandChats[slot]=recipient;worker->setup.success(millis(),1000);}
@@ -541,7 +537,9 @@ class TelegramService {
           notify(String(telegram::kGuideText)+"\n\nModalità attiva: "+telegram::modeName(mode(chat)),false,
             !strcmp(text,"/start"),true,false,telegram::EventScope::Selected,chat);break;
         case telegram::Command::ModeMenu:
-          reply(String("🎛 Modalità attiva: ")+telegram::modeName(mode(chat))+"\n\n"+telegram::kModeMenuText,true,false,chat);break;
+          reply(String("🎛 Modalità attiva: ")+telegram::modeName(mode(chat))+"\n\n"+telegram::kModeMenuText,true,true,chat);break;
+        case telegram::Command::MainMenu:
+          reply(telegram::kMainMenuText,true,false,chat);break;
         default:break;
       }
       if(incoming.command!=telegram::Command::None)++commandsReceived;

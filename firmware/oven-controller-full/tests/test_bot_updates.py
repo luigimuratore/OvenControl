@@ -28,7 +28,7 @@ class BotUpdatesTest(unittest.TestCase):
 
     def test_plot_is_a_command_and_has_a_persistent_button(self):
         self.assertIn('/plot', tool.GUIDE_TEXT)
-        self.assertIn('/plot', [item for row in tool.mode_keyboard()['keyboard'] for item in row])
+        self.assertEqual(tool.main_keyboard()['keyboard'], [['/notifiche', '/status'], ['/plot15', '/plot30', '/plot60']])
         command = tool.Commands(42)
         message = dict(date=100, text='/plot', chat=dict(id=42, type='private'), **{'from': dict(id=42)})
         self.assertEqual(command.consume([dict(update_id=1, message=message)], 101), ['/plot'])
@@ -42,6 +42,32 @@ class BotUpdatesTest(unittest.TestCase):
                 commands=tool.Commands(42)
                 message=dict(date=date,text=button,chat=dict(id=42,type='private'),**{'from':dict(id=sender)})
                 self.assertEqual(commands.consume([dict(update_id=1,message=message)],122),result)
+
+    def test_main_menu_notifications_back_and_legacy_aliases(self):
+        for mode in tool.MODE_LABELS:
+            with self.subTest(mode=mode):
+                main = tool.menu_reply('/menu', mode)
+                submenu = tool.menu_reply('/notifiche', mode)
+                self.assertEqual(main['reply_markup'], tool.main_keyboard())
+                self.assertEqual(submenu['reply_markup'], tool.mode_keyboard())
+                self.assertIn(tool.MODE_LABELS[mode], submenu['text'])
+                self.assertEqual(tool.mode_keyboard()['keyboard'], [list(tool.MODE_BUTTONS)[:2], [list(tool.MODE_BUTTONS)[2]], [tool.BACK_BUTTON]])
+                self.assertEqual(tool.menu_reply('/modalita', mode), submenu)
+                self.assertEqual(tool.menu_reply('/help', mode)['reply_markup'], tool.main_keyboard())
+                self.assertEqual(tool.plot_keyboard()['keyboard'][-1], [tool.BACK_BUTTON])
+                for keyboard in (main['reply_markup'], submenu['reply_markup'], tool.plot_keyboard()):
+                    self.assertTrue(keyboard['is_persistent'])
+                    self.assertFalse(keyboard['one_time_keyboard'])
+
+    def test_every_visible_button_uses_private_fresh_command_authorization(self):
+        buttons = [b for keyboard in (tool.main_keyboard(), tool.mode_keyboard(), tool.plot_keyboard())
+                   for row in keyboard['keyboard'] for b in row]
+        for button in buttons:
+            expected = '/menu' if button == tool.BACK_BUTTON else tool.PLOT_BUTTONS.get(button, tool.MODE_BUTTONS.get(button, button))
+            for sender, date, result in ((42, 100, [expected]), (7, 100, []), (42, 1, [])):
+                with self.subTest(button=button, sender=sender, date=date):
+                    message = dict(date=date, text=button, chat=dict(id=42, type='private'), **{'from': dict(id=sender)})
+                    self.assertEqual(tool.Commands(42).consume([dict(update_id=1, message=message)], 122), result)
 
     def test_plot_windows_read_previous_pages_and_preserve_gaps(self):
         d=preview.DemoDevice('full',speed=1)

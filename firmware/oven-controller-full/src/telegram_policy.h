@@ -27,6 +27,32 @@ constexpr const char *kDetailedButton = "📋 Dettagliata";
 constexpr const char *kPlot15Button = "📈 15 min";
 constexpr const char *kPlot30Button = "📈 30 min";
 constexpr const char *kPlot60Button = "📈 60 min";
+constexpr const char *kBackButton = "⬅️ Indietro";
+constexpr const char *kMainMenuText = "🏠 Menu principale: scegli notifiche, stato del forno o un grafico.";
+enum class Keyboard : uint8_t { None, Main, Notifications, Plot };
+struct KeyboardLayout { const char *buttons[3][3]; size_t rows; };
+inline KeyboardLayout keyboardLayout(Keyboard keyboard) {
+  switch (keyboard) {
+    case Keyboard::Main:
+      return {{{"/notifiche", "/status", nullptr}, {"/plot15", "/plot30", "/plot60"}, {nullptr, nullptr, nullptr}}, 2};
+    case Keyboard::Notifications:
+      return {{{kEssentialButton, kBriefButton, nullptr}, {kDetailedButton, nullptr, nullptr}, {kBackButton, nullptr, nullptr}}, 3};
+    case Keyboard::Plot:
+      return {{{kPlot15Button, kPlot30Button, kPlot60Button}, {kBackButton, nullptr, nullptr}, {nullptr, nullptr, nullptr}}, 2};
+    default: return {{{nullptr, nullptr, nullptr}, {nullptr, nullptr, nullptr}, {nullptr, nullptr, nullptr}}, 0};
+  }
+}
+// Reuse the existing two stored flags so pending outbox records keep their format.
+inline Keyboard messageKeyboard(bool menu, bool plotMenu) {
+  return menu ? (plotMenu ? Keyboard::Notifications : Keyboard::Main) : (plotMenu ? Keyboard::Plot : Keyboard::None);
+}
+struct BotCommand { const char *name, *description; };
+constexpr BotCommand kBotCommands[] = {
+  {"notifiche", "Scegli le notifiche"}, {"status", "Stato completo del forno"},
+  {"plot15", "Grafico degli ultimi 15 minuti"}, {"plot30", "Grafico degli ultimi 30 minuti"},
+  {"plot60", "Grafico degli ultimi 60 minuti"}, {"menu", "Torna al menu principale"},
+  {"help", "Guida ai comandi"}, {"start", "Mostra e fissa la guida"}
+};
 constexpr const char *kPlotMenuText = "📈 Scegli l'intervallo del grafico: 15, 30 o 60 minuti. Riceverai una nuova immagine con lo storico disponibile fino a questo momento.";
 inline bool validPlotMinutes(unsigned minutes) { return minutes == 15 || minutes == 30 || minutes == 60; }
 constexpr const char *kModeMenuText = R"modes(Scegli come ricevere gli eventi:
@@ -34,7 +60,8 @@ constexpr const char *kModeMenuText = R"modes(Scegli come ricevere gli eventi:
 🔔 Sintetica — Eventi brevi, allarmi dettagliati e PDF.
 📋 Dettagliata — Tutti gli eventi con stato completo e PDF.
 
-/status e /plot restano sempre disponibili. Avvio ESP e avvio del controllo vengono sempre segnalati, senza suono. Gli eventi ordinari e i PDF restano silenziosi; gli allarmi mantengono la notifica sonora.)modes";
+/status e /plot restano sempre disponibili. ⬅️ Indietro torna al menu principale.
+Avvio ESP e avvio del controllo vengono sempre segnalati, senza suono. Gli eventi ordinari e i PDF restano silenziosi; gli allarmi mantengono la notifica sonora.)modes";
 constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 
 📋 COMANDI
@@ -42,7 +69,9 @@ constexpr const char *kGuideText = R"guide(📌 OVENCONTROL · GUIDA RAPIDA
 /plot — Scegli il grafico target/media PT100 degli ultimi 15, 30 o 60 minuti.
 /help — Aiuto sul bot.
 /start — Mostra e fissa questa guida; non avvia il forno.
-/modalita — Mostra la modalità attiva e i pulsanti di scelta.
+/notifiche — Mostra la modalità attiva e i pulsanti di scelta.
+/plot15 · /plot30 · /plot60 — Grafico diretto dell'intervallo scelto.
+/menu oppure ⬅️ Indietro — Torna al menu principale.
 
 🎛 MODALITÀ NOTIFICHE
 🛡️ /essenziale — Allarmi/blackout e PDF, più avvio ESP e controllo.
@@ -79,7 +108,7 @@ inline bool authorized(int64_t configured, int64_t chat, int64_t sender, const c
 inline bool fresh(int64_t date, int64_t now) {
   return date > 0 && now >= date && now - date <= kCommandAgeSec;
 }
-enum class Command { None, Status, Plot, Plot15, Plot30, Plot60, Help, ModeMenu, Essential, Brief, Detailed };
+enum class Command { None, Status, Plot, Plot15, Plot30, Plot60, Help, ModeMenu, Essential, Brief, Detailed, MainMenu };
 inline Command command(const char *text) {
   if (!text) return Command::None;
   if (std::strcmp(text, "/status") == 0) return Command::Status;
@@ -88,7 +117,8 @@ inline Command command(const char *text) {
   if (std::strcmp(text, "/plot30") == 0 || std::strcmp(text, kPlot30Button) == 0) return Command::Plot30;
   if (std::strcmp(text, "/plot60") == 0 || std::strcmp(text, kPlot60Button) == 0) return Command::Plot60;
   if (std::strcmp(text, "/start") == 0 || std::strcmp(text, "/help") == 0) return Command::Help;
-  if (std::strcmp(text, "/modalita") == 0) return Command::ModeMenu;
+  if (std::strcmp(text, "/modalita") == 0 || std::strcmp(text, "/notifiche") == 0) return Command::ModeMenu;
+  if (std::strcmp(text, "/menu") == 0 || std::strcmp(text, kBackButton) == 0) return Command::MainMenu;
   if (std::strcmp(text, "/essenziale") == 0 || std::strcmp(text, kEssentialButton) == 0) return Command::Essential;
   if (std::strcmp(text, "/sintetica") == 0 || std::strcmp(text, kBriefButton) == 0) return Command::Brief;
   if (std::strcmp(text, "/dettagliata") == 0 || std::strcmp(text, kDetailedButton) == 0) return Command::Detailed;

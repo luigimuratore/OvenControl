@@ -422,7 +422,8 @@ class TelegramService {
     else reportpdf::filename(w.document->report, name, sizeof(name));
     const String caption = plot ? String("📈 TARGET / MEDIA PT100\nAggiornato: ") + stamp +
       "\nUltimi " + String(w.document->plotMinutes) + " minuti · storico disponibile, " + String(w.document->count) + " campioni. Nuova immagine dal menu /plot." :
-      String("📄 REPORT DI FINE CICLO\n") + w.document->report.recipeName + "\n" + reportpdf::outcome(w.document->report.outcome);
+      String(reports::isManual(w.document->report) ? "📄 REPORT CONTROLLO MANUALE\n" : "📄 REPORT DI FINE CICLO\n") +
+      w.document->report.recipeName + "\n" + reportpdf::outcome(w.document->report);
     const String boundary = "OvenPdf" + String(esp_random(), HEX) + String(esp_random(), HEX);
     const String prefix = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
       String(static_cast<long long>(recipient)) + "\r\n--" + boundary +

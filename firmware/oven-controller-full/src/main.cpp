@@ -22,6 +22,8 @@
 #include "report_curve.h"
 #include "output_supervisor.h"
 #include "log_storage.h"
+#include "program_storage.h"
+#include "dedicated_storage.h"
 #include "sensor_recovery.h"
 #include "thermal_limits.h"
 #include "telegram_service.h"
@@ -70,6 +72,7 @@ constexpr size_t TEST_HISTORY_CAP = 3600, TEST_HISTORY_PAGE = 300;
 AsyncRtd rtd1(CS1), rtd2(CS2);
 ControlWebServer server(80);
 Preferences prefs;
+ovenstorage::Initialization storageInitialization;
 bool prefsReady = false, eventWriteFaultLogged = false;
 struct RecoveryStore {
   int load(recovery::Record &record) {
@@ -88,12 +91,16 @@ struct LogStore {
   static String key(size_t slot) { return "log" + String(slot); }
   bool freeEntries(size_t &free) {
     nvs_stats_t stats{};
-    if (!prefsReady || nvs_get_stats(nullptr, &stats) != ESP_OK) return false;
+    if (!prefsReady || nvs_get_stats(storageInitialization.partition(), &stats) != ESP_OK) return false;
     free = stats.free_entries; return true;
   }
   bool has(size_t slot) { return prefs.isKey(key(slot).c_str()); }
   bool remove(size_t slot) { return prefs.remove(key(slot).c_str()); }
 } logStore;
+esp_err_t lastStorageError = ESP_OK;
+char lastStorageKey[16]{};
+uint32_t reclaimedLogRecords = 0;
+bool storageCleanupPaused = false, storageCleanupFailed = false;
 
 struct Sensor { float c = NAN, ohms = NAN; uint16_t raw = 0; uint8_t fault = 0; bool valid = false, recoveryFailed = false; };
 struct PidGains { float kp, ki, kd; };
@@ -229,6 +236,37 @@ bool heaterOn() { return outputSnapshot().relay; }
 heater::Fault heaterFault() { return outputSnapshot().guard.fault; }
 bool diagnosticMode() { return outputSnapshot().diagnostic; }
 bool cycleActive() { return phase == Phase::Running || phase == Phase::Paused; }
+bool saveSettingsBlob(const char *key, const void *data, size_t bytes) {
+  snprintf(lastStorageKey, sizeof(lastStorageKey), "%s", key);
+  storageCleanupPaused = storageCleanupFailed = false;
+  lastStorageError = prefsReady ? ESP_OK : ESP_ERR_NVS_NOT_INITIALIZED;
+  nvs_handle_t handle = 0;
+  if (prefsReady) lastStorageError = nvs_open_from_partition(storageInitialization.partition(), "oven-full", NVS_READWRITE, &handle);
+  if (lastStorageError != ESP_OK) {
+    logEvent("MEMORIA", String("Salvataggio ") + key + " fallito: " + esp_err_to_name(lastStorageError), false);
+    return false;
+  }
+  const bool allowCleanup = !cycleActive() && !diagnosticMode() && !outputSnapshot().updating;
+  const auto result = logs::writeWithRecovery(logStore, persistedSeq, PERSIST_CAP, allowCleanup, [&] {
+    lastStorageError = nvs_set_blob(handle, key, data, bytes);
+    if (lastStorageError == ESP_OK) lastStorageError = nvs_commit(handle);
+    return lastStorageError == ESP_OK ? logs::WriteStatus::Saved :
+      lastStorageError == ESP_ERR_NVS_NOT_ENOUGH_SPACE ? logs::WriteStatus::NoSpace : logs::WriteStatus::Error;
+  });
+  nvs_close(handle);
+  reclaimedLogRecords += result.reclaimed; storageCleanupFailed = result.cleanupFailed;
+  storageCleanupPaused = !result.saved && !allowCleanup && lastStorageError == ESP_ERR_NVS_NOT_ENOUGH_SPACE;
+  if (result.reclaimed) logEvent("MEMORIA", "Recupero NVS: rimossi " + String(result.reclaimed) + " vecchi log persistenti; impostazioni conservate", false);
+  if (!result.saved) logEvent("MEMORIA", String("Salvataggio ") + key + " fallito: " + esp_err_to_name(lastStorageError), false);
+  return result.saved;
+}
+String storageFailure(const String &message) {
+  String text = message + " · NVS: " + esp_err_to_name(lastStorageError);
+  if (!storageInitialization.present) text += ". Serve la migrazione USB alla memoria dedicata; il solo OTA non aggiorna le partizioni.";
+  if (storageCleanupPaused) text += ". Riprova con forno fermo e TEST disattivato per recuperare spazio dai vecchi log.";
+  else if (storageCleanupFailed) text += ". Recupero dei vecchi log non riuscito.";
+  return text;
+}
 float meanC();
 bool heatingOperation() {
   if (phase == Phase::Paused) return !manualOperation && pauseHold.active &&
@@ -325,7 +363,8 @@ void resetPid() {
   inhibitHeater();
 }
 void recordHistory(bool force = false, uint8_t eventFlag = 0);
-void finishCycleReport(Phase next, const String &reason);
+bool finishCycleReport(Phase next, const String &reason, float finalReference);
+void queueCycleReport(bool finished);
 String telegramStatus(int64_t recipient = 0);
 void telegramNotice(const String &title, const String &reason = "", bool critical = false,
                     telegram::EventScope scope = telegram::EventScope::Selected);
@@ -358,11 +397,13 @@ void stopCycle(Phase next, String reason) {
       lastCycleError = faultText;
       logEvent("ALLARME", faultText, false); telegramNotice("ALLARME MEMORIA DI SICUREZZA", faultText, true);
     }
+    const bool reportFinished = finishCycleReport(next, reason, finalReference);
     logEvent(next == Phase::Fault ? "ALLARME" : "MANUALE", reason);
     recordHistory(true, next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
     if (!outputSnapshot().emergency && saved && legacySaved)
       telegramNotice(next == Phase::Fault ? "ALLARME · CONTROLLO MANUALE" : "MANUALE FERMATO · STOP", reason, next == Phase::Fault);
-    return; // Manual operation never creates/replaces a program report.
+    queueCycleReport(reportFinished);
+    return;
   }
   if (phase == Phase::Running || phase == Phase::Paused) {
     cycleStopped = next == Phase::Idle;
@@ -385,16 +426,7 @@ void stopCycle(Phase next, String reason) {
       lastCycleError = faultText;
       logEvent("ALLARME", faultText, false);
     }
-    finishCycleReport(next, reason);
-    if (reportHistory && reportAvailable) {
-      reportHistoryCount = reports::copyCurve(history, historyCapacity, historyHead, historyCount,
-        lastReport.startMs, lastReport.endMs, reportHistory, historyCapacity, reportHistoryPartial);
-      const uint8_t flags = (sensors[0].valid ? 1 : 0) | (sensors[1].valid ? 2 : 0) |
-                           (std::isfinite(finalReference) ? 8 : 0) |
-                           (next == Phase::Complete ? HISTORY_COMPLETE : next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
-      reportHistory[reportHistoryCount++] = {historySeq + 1, lastReport.endMs, sensors[0].c, sensors[1].c,
-                                           finalReference, 0, flags, stepIndex};
-    }
+    const bool reportFinished = finishCycleReport(next, reason, finalReference);
     logEvent(next == Phase::Fault ? "ALLARME" : "CICLO", reason);
     recordHistory(true, next == Phase::Complete ? HISTORY_COMPLETE :
                         next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
@@ -402,9 +434,7 @@ void stopCycle(Phase next, String reason) {
       telegramNotice(next == Phase::Fault ? "ALLARME FORNO" : next == Phase::Complete ? "CICLO COMPLETATO" :
         next == Phase::Interrupted ? "CICLO INTERROTTO" : "CICLO FERMATO · STOP", reason,
         next == Phase::Fault || next == Phase::Interrupted);
-    if (reportAvailable && telegramBot.configured &&
-        !telegramBot.report(lastReport, reportHistory, reportHistoryCount, reportHistoryPartial))
-      logEvent("ATTENZIONE", "PDF Telegram non accodato: memoria/coda non disponibili; report consultabile dalla dashboard", false);
+    queueCycleReport(reportFinished);
   } else if (next == Phase::Fault && phase != Phase::Fault) {
     phase = Phase::Fault; logEvent("ALLARME", reason);
     faultText = reason;
@@ -577,7 +607,7 @@ const char *faultResumeProblem() {
   if (output.sensorChecking) return "Verifica sonde in corso: attendi una nuova coppia valida.";
   if (phase != Phase::Fault || !faultResume.available)
     return "Nessun punto di ripresa in RAM. Dopo riavvio, STOP o RESET & BLOCK serve un nuovo avvio.";
-  if (!faultResume.manual && (faultResume.step >= activeRecipe.count || !cycleReport.canContinue()))
+  if (!cycleReport.canContinue() || (!faultResume.manual && faultResume.step >= activeRecipe.count))
     return "Stato del programma non disponibile: usa RESET & BLOCK.";
   if (!sensorsHealthy() || uint32_t(millis()-sampleAtMs) >= heater::Guard::kStaleMs)
     return "Ripristina entrambe le sonde e attendi letture valide e fresche sotto 415 °C.";
@@ -796,7 +826,11 @@ void controlPid(float actual, uint32_t now, bool descending = false) {
 void sampleAndControl(bool fresh = true) {
   if (fresh) readSensorPair();
   uint32_t now = millis();
-  if (!manualOperation && cycleActive() && stepIndex < activeRecipe.count) {
+  if (manualOperation && cycleActive()) {
+    manualSession.tick(hottestC(), now);
+    cycleReport.observe(now, sensors[0].c, sensors[1].c, sensors[0].valid, sensors[1].valid,
+      manualSession.reference, duty, manualSession.descending() || !manualSession.heatingAllowed());
+  } else if (cycleActive() && stepIndex < activeRecipe.count) {
     const float reference = phase == Phase::Running ?
       profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, uint32_t(now - stepStarted)) : setpointC;
     cycleReport.observe(now, sensors[0].c, sensors[1].c, sensors[0].valid, sensors[1].valid, reference, duty);
@@ -831,7 +865,6 @@ void sampleAndControl(bool fresh = true) {
   }
   if (phase != Phase::Running) { holdTimer.update(now, false, false); inhibitHeater(); return; }
   if (manualOperation) {
-    manualSession.tick(hottestC(), now);
     setpointC = manualSession.reference;
     if (!checkProtections(setpointC,manualSession.descending())) return;
     if (!manualSession.heatingAllowed()) { duty = 0; inhibitHeater(); return; }
@@ -894,10 +927,10 @@ void recipeToJson(JsonObject item, const Recipe &recipe) {
     else step["rate"] = recipe.steps[i].rate;
   }
 }
-void finishCycleReport(Phase next, const String &reason) {
+bool finishCycleReport(Phase next, const String &reason, float finalReference) {
   const auto outcome = next == Phase::Complete ? reports::Outcome::Completed :
                        next == Phase::Fault ? reports::Outcome::Fault : reports::Outcome::Stopped;
-  if (!cycleReport.finish(millis(), outcome, holdInBandMs)) return;
+  if (!cycleReport.finish(millis(), outcome, manualOperation ? 0 : holdInBandMs)) return false;
   cycleReport.data.endUtc = utcNow();
   snprintf(cycleReport.data.reason, sizeof(cycleReport.data.reason), "%s", reason.c_str());
   lastReport = cycleReport.data; reportAvailable = true;
@@ -906,15 +939,31 @@ void finishCycleReport(Phase next, const String &reason) {
                     logs::kReserveEntries + 2 + (sizeof(lastReport) + 31) / 32) &&
                 prefs.putBytes("report", &lastReport, sizeof(lastReport)) == sizeof(lastReport);
   if (!reportSaved) logEvent("ATTENZIONE", "Report di fine ciclo disponibile solo in RAM: salvataggio NVS fallito", false);
+  reportHistoryCount = 0; reportHistoryPartial = true;
+  if (reportHistory && historyCapacity) {
+    reportHistoryCount = reports::copyCurve(history, historyCapacity, historyHead, historyCount,
+      lastReport.startMs, lastReport.endMs, reportHistory, historyCapacity, reportHistoryPartial);
+    const uint8_t flags = (sensors[0].valid ? 1 : 0) | (sensors[1].valid ? 2 : 0) |
+      (std::isfinite(finalReference) ? 8 : 0) |
+      (next == Phase::Complete ? HISTORY_COMPLETE : next == Phase::Fault ? HISTORY_FAULT : HISTORY_STOP);
+    reportHistory[reportHistoryCount++] = {historySeq + 1, lastReport.endMs, sensors[0].c, sensors[1].c,
+      finalReference, 0, uint8_t(flags), uint8_t(manualOperation ? 255 : stepIndex)};
+  }
+  return true;
+}
+void queueCycleReport(bool finished) {
+  if (finished && reportAvailable && telegramBot.configured &&
+      !telegramBot.report(lastReport, reportHistory, reportHistoryCount, reportHistoryPartial))
+    logEvent("ATTENZIONE", "PDF Telegram non accodato: memoria/coda non disponibili; report consultabile dalla dashboard", false);
 }
 void loadCycleReport() {
   reports::Snapshot candidate;
   if (!prefsReady || prefs.getBytesLength("report") != sizeof(candidate) ||
       prefs.getBytes("report", &candidate, sizeof(candidate)) != sizeof(candidate)) return;
-  if (!reports::supportedVersion(candidate.version) || !candidate.stepCount || candidate.stepCount > reports::kMaxSteps ||
+  candidate.recipeId[sizeof(candidate.recipeId) - 1] = 0;
+  if (!reports::supportedVersion(candidate.version) || (!candidate.stepCount && !reports::isManual(candidate)) || candidate.stepCount > reports::kMaxSteps ||
       candidate.completedSteps > candidate.stepCount || candidate.outcome == reports::Outcome::None ||
       static_cast<unsigned>(candidate.outcome) > static_cast<unsigned>(reports::Outcome::Fault)) return;
-  candidate.recipeId[sizeof(candidate.recipeId) - 1] = 0;
   candidate.recipeName[sizeof(candidate.recipeName) - 1] = 0;
   candidate.reason[sizeof(candidate.reason) - 1] = 0;
   lastReport = candidate; reportAvailable = reportSaved = true;
@@ -949,6 +998,7 @@ void reportApi() {
   doc["bootCount"] = report.boot;
   doc["key"] = String(report.boot) + "-" + String(report.startMs) + "-" + String(report.endMs);
   doc["recipeId"] = report.recipeId; doc["recipeName"] = report.recipeName;
+  doc["operation"] = reports::isManual(report) ? "manual" : "program";
   doc["outcome"] = report.outcome == reports::Outcome::Completed ? "completed" : report.outcome == reports::Outcome::Fault ? "fault" : "stopped";
   doc["reason"] = report.reason;
   doc["startUptimeMs"] = report.startMs; doc["endUptimeMs"] = report.endMs;
@@ -1028,7 +1078,6 @@ bool parseRecipes(JsonVariantConst list, Recipe *out, size_t &count, String &rea
     JsonArrayConst steps = item["steps"].as<JsonArrayConst>();
     if (steps.isNull() || steps.size() == 0 || steps.size() > MAX_STEPS) { reason = "Servono 1-12 step per programma"; return false; }
     Recipe &recipe = out[count]; recipe.id = id; recipe.name = name; recipe.count = 0;
-    float previousTarget = NAN;
     for (JsonVariantConst entry : steps) {
       if (!entry.is<JsonObjectConst>()) { reason = "Step non valido"; return false; }
       JsonObjectConst data = entry.as<JsonObjectConst>();
@@ -1056,19 +1105,33 @@ bool parseRecipes(JsonVariantConst list, Recipe *out, size_t &count, String &rea
           reason = "Rate minimo: 0,1 °C/min"; return false;
         }
       }
-      if (std::isfinite(previousTarget)) {
-        if (type == profile::Type::Ramp && target <= previousTarget) { reason = "Ramp deve salire rispetto allo step precedente"; return false; }
-        if (type == profile::Type::Cooldown && target >= previousTarget) { reason = "Cooldown deve scendere rispetto allo step precedente"; return false; }
-        if (type == profile::Type::Hold && fabsf(target - previousTarget) > 0.1f) {
-          reason = "Hold deve usare il target dello step precedente"; return false;
-        }
-      }
-      previousTarget = target;
       recipe.steps[recipe.count++] = step;
     }
     ++count;
   }
   return true;
+}
+bool packPrograms(const Recipe *source, size_t count, programs::Snapshot &packed) {
+  packed = programs::Snapshot{}; packed.count = count;
+  for (size_t i = 0; i < count; ++i) {
+    auto &to = packed.programs[i]; const auto &from = source[i];
+    snprintf(to.id, sizeof(to.id), "%s", from.id.c_str());
+    snprintf(to.name, sizeof(to.name), "%s", from.name.c_str()); to.count = from.count;
+    for (size_t j = 0; j < from.count; ++j) {
+      to.steps[j].type = uint8_t(from.steps[j].type); to.steps[j].target = from.steps[j].target;
+      to.steps[j].rate = from.steps[j].rate; to.steps[j].minutes = from.steps[j].minutes;
+    }
+  }
+  return programs::valid(packed);
+}
+bool persistPrograms(const programs::Snapshot &packed) {
+  static uint8_t blob[programs::kMaxBlobBytes];
+  const size_t length = programs::encode(packed, blob, sizeof(blob));
+  return length && saveSettingsBlob(programs::kStorageKey, blob, length);
+}
+void removeLegacyPrograms() {
+  if (prefs.isKey("recipes") && !prefs.remove("recipes"))
+    logEvent("ATTENZIONE", "Programmi salvati; vecchia copia JSON conservata per mancata pulizia NVS", false);
 }
 void saveRecipesApi() {
   if (phase == Phase::Running || phase == Phase::Paused) { error(409, "Ferma il ciclo prima di cambiare i programmi"); return; }
@@ -1077,11 +1140,19 @@ void saveRecipesApi() {
   if (deserializeJson(doc, server.arg("plain"))) { error(400, "JSON non valido"); return; }
   static Recipe proposed[MAX_RECIPES]; size_t count = 0; String reason;
   if (!parseRecipes(doc["recipes"], proposed, count, reason)) { error(400, reason); return; }
-  JsonDocument stored; JsonArray list = stored.to<JsonArray>();
-  for (size_t i = 0; i < count; ++i) recipeToJson(list.add<JsonObject>(), proposed[i]);
-  String encoded; serializeJson(stored, encoded);
-  if (encoded.length() > 12000 || prefs.putString("recipes", encoded) != encoded.length()) {
-    error(507, "Salvataggio programmi fallito"); return;
+  static programs::Snapshot packed;
+  if (!packPrograms(proposed, count, packed)) { error(400, "Programmi non validi per il salvataggio"); return; }
+  // If a larger edit cannot coexist with the old JSON, first migrate the
+  // applied collection. No stage deletes its only committed copy.
+  const bool saved = programs::saveWithLegacyMigration(prefs.isKey("recipes"), [&] {
+    if (!packPrograms(proposed, count, packed)) return programs::WriteStatus::Error;
+    if (persistPrograms(packed)) return programs::WriteStatus::Saved;
+    return lastStorageError == ESP_ERR_NVS_NOT_ENOUGH_SPACE ? programs::WriteStatus::NoSpace : programs::WriteStatus::Error;
+  }, [&] {
+    return packPrograms(recipes, recipeCount, packed) && persistPrograms(packed) ? programs::WriteStatus::Saved : programs::WriteStatus::Error;
+  }, removeLegacyPrograms);
+  if (!saved) {
+    error(507, storageFailure("Salvataggio programmi fallito: restano applicati quelli precedenti")); return;
   }
   recipeCount = count;
   for (size_t i = 0; i < count; ++i) recipes[i] = proposed[i];
@@ -1104,6 +1175,19 @@ void statusApi(uint32_t testToken = 0) {
   bool stationReady = workshopReady();
   doc["mode"] = "FULL"; doc["firmware"] = firmwareinfo::kVersion;
   doc["firmwareModifiedOn"] = firmwareinfo::kModifiedOn;
+  auto storage = doc["storage"].to<JsonObject>(); nvs_stats_t nvsStats{};
+  storage["ready"] = prefsReady;
+  storage["partition"] = storageInitialization.partition();
+  storage["dedicated"] = storageInitialization.ready;
+  storage["migrationRequired"] = !storageInitialization.present;
+  storage["migrationError"] = esp_err_to_name(storageInitialization.error);
+  storage["migratedKeys"] = storageInitialization.copiedKeys;
+  storage["statsAvailable"] = nvs_get_stats(storageInitialization.partition(), &nvsStats) == ESP_OK;
+  storage["usedEntries"] = nvsStats.used_entries; storage["freeEntries"] = nvsStats.free_entries;
+  storage["totalEntries"] = nvsStats.total_entries; storage["namespaces"] = nvsStats.namespace_count;
+  storage["lastWriteError"] = esp_err_to_name(lastStorageError); storage["lastWriteKey"] = lastStorageKey;
+  storage["reclaimedLogRecords"] = reclaimedLogRecords;
+  storage["cleanupRequiresIdle"] = storageCleanupPaused; storage["cleanupFailed"] = storageCleanupFailed;
   doc["phase"] = phaseName(); doc["relay"] = heaterOn();
   doc["cooldownRegulated"] = true;
   doc["pauseMaintainsTemperature"] = phase == Phase::Paused && pauseHold.active;
@@ -1132,7 +1216,7 @@ void statusApi(uint32_t testToken = 0) {
   continuation["stepIndex"] = faultResume.step;
   if (faultResume.available) continuation["targetC"] = faultResume.reference; else continuation["targetC"] = nullptr;
   doc["sensorChecking"] = output.sensorChecking;
-  doc["ready"] = !output.diagnostic && !output.updating && !output.sensorChecking && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault && phase != Phase::Interrupted &&
+  doc["ready"] = prefsReady && !output.diagnostic && !output.updating && !output.sensorChecking && (apReady || stationReady) && sensorsHealthy() && phase != Phase::Fault && phase != Phase::Interrupted &&
                  !output.emergency && !output.recoveryBlocked && !recoveryJournal.data.pending &&
                  heaterFault() == heater::Fault::None && uint32_t(millis() - sampleAtMs) < heater::Guard::kStaleMs;
   doc["actuator"] = controlSettings.ssr ? "ssr" : "relay";
@@ -1261,8 +1345,8 @@ void pidApi() {
     error(400, "Limiti: Kp 0-50, Ki 0-0,5, Kd 0-200"); return;
   }
   PidGains gains{p, i, d};
-  if (prefs.putBytes("pid", &gains, sizeof(gains)) != sizeof(gains)) {
-    error(507, "Salvataggio PID fallito"); return;
+  if (!saveSettingsBlob("pid", &gains, sizeof(gains))) {
+    error(507, storageFailure("Salvataggio PID fallito")); return;
   }
   kp = p; ki = i; kd = d; faultResume.clear(); resetPid();
   logEvent("PID", "Coefficienti salvati: Kp=" + String(kp, 3) +
@@ -1285,7 +1369,7 @@ void controlSettingsApi() {
   }
   ControlSettings proposed{}; proposed.ssr = actuator == "ssr";
   proposed.windowMs = seconds * 1000; proposed.maxPower = maxPower;
-  if (prefs.putBytes("control", &proposed, sizeof(proposed)) != sizeof(proposed)) { error(507, "Salvataggio comando fallito"); return; }
+  if (!saveSettingsBlob("control", &proposed, sizeof(proposed))) { error(507, storageFailure("Salvataggio comando fallito")); return; }
   controlSettings = proposed; faultResume.clear(); resetPid();
   logEvent("COMANDO", String("Attuatore ") + actuator + "; finestra " + String(seconds) + " s; potenza max " + String(maxPower, 1) + "%");
   statusApi();
@@ -1307,8 +1391,8 @@ void protectionsApi() {
   proposed.maxProbeDeltaC = doc["maxProbeDeltaC"].as<float>();
   proposed.maxMeanOvershootC = doc["maxMeanOvershootC"].as<float>();
   if (!thermal::validSettings(proposed)) { error(400, "Soglie da 0,1 a 430 °C, anche quando il blocco e disabilitato"); return; }
-  if (prefs.putBytes("protections", &proposed, sizeof(proposed)) != sizeof(proposed)) {
-    error(507, "Salvataggio blocchi fallito: restano applicate le impostazioni precedenti"); return;
+  if (!saveSettingsBlob("protections", &proposed, sizeof(proposed))) {
+    error(507, storageFailure("Salvataggio blocchi fallito: restano applicate le impostazioni precedenti")); return;
   }
   protectionSettings = proposed;
   logEvent("PARAMETERS", String("Blocco delta sonde ") + (proposed.probeDeltaEnabled ? "ON >" : "OFF; soglia ") +
@@ -1370,7 +1454,7 @@ void commandApi() {
       recoveryJournal.data.pending = true; faultResume.clear();
       error(507, "Ripresa non salvata nella memoria di sicurezza: uscite bloccate. Usa RESET & BLOCK."); return;
     }
-    if (!restored.manual && !cycleReport.continueAfterFault(now)) {
+    if (!cycleReport.continueAfterFault(now)) {
       portENTER_CRITICAL(&heaterMux); outputs.blockRecovery(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
       recoveryJournal.finish(recoveryStore); faultResume.clear();
       error(409, "Report del controllo non ripristinato: uscite bloccate"); return;
@@ -1564,6 +1648,11 @@ void manualApi() {
     faultResume.clear();
     manualOperation = true; phase = Phase::Running; cycleStopped = false;
     activeRecipe = Recipe{}; stepIndex = 0; cycleStarted = now;
+    cycleReport.beginManual(now);
+    auto &report = cycleReport.data;
+    report.boot = bootCount; report.startUtc = utcNow();
+    report.kp = kp; report.ki = ki; report.kd = kd; report.ssr = controlSettings.ssr;
+    report.windowMs = controlSettings.windowMs; report.maxPower = controlSettings.maxPower;
     checkpoints.immediate(now);
     setpointC = manualSession.reference;
     logEvent("MANUALE", "Manuale avviato: target " + String(requested, 1) + " °C · rate " + String(rate, 2) + " °C/min");
@@ -1725,7 +1814,7 @@ void testHeartbeatApi() {
 }
 bool saveTelegramUsers(const telegram::Users &proposed) {
   if(!prefsReady||!telegram::commitUsers(telegramUsers,proposed,[](const telegram::Users &value){
-    return prefs.putBytes("tgUsers",&value,sizeof(value))==sizeof(value);
+    return saveSettingsBlob("tgUsers", &value, telegram::storedUsersBytes(value));
   }))return false;
   telegramBot.setUsers(telegramUsers);return true;
 }
@@ -1773,7 +1862,7 @@ void telegramUsersCommandApi(){
   }else if(action=="mode"){
     if(!proposed.setMode(chat,selected)){error(400,"Utente o modalità non validi");return;}
   }else{error(400,"Azione Telegram sconosciuta");return;}
-  if(!saveTelegramUsers(proposed)){error(507,"Salvataggio utenti fallito: autorizzazioni precedenti mantenute");return;}
+  if(!saveTelegramUsers(proposed)){error(507,storageFailure("Salvataggio utenti fallito: autorizzazioni precedenti mantenute"));return;}
   if(action=="approve"){
     telegramPending.remove(chat);
     telegramBot.reply(String("✅ Accesso autorizzato a OvenControl.\n/status e /plot sono disponibili.\nModalità notifiche: ")+telegram::modeName(telegramBot.mode(chat))+".\nUsa /notifiche per cambiarla o /start per la guida.",true,false,chat);
@@ -1797,7 +1886,7 @@ void handleTelegramRequest(const telegram::UserRequest &request){
     auto proposed=telegramUsers;proposed.setMode(chat,selected);
     if(telegramBot.mode(chat)==telegram::modeFrom(selected)||saveTelegramUsers(proposed))
       telegramBot.reply(String("✅ Modalità personale: ")+telegram::modeName(telegramBot.mode(chat))+".\n/status e /plot sempre disponibili.",true,true,chat);
-    else telegramBot.reply("⚠️ Modalità non salvata: resta attiva quella precedente.",true,true,chat);
+    else telegramBot.reply(storageFailure("⚠️ Modalità non salvata: resta attiva quella precedente."),true,true,chat);
     return;
   }
   const unsigned minutes=request.command==telegram::Command::Plot15?15:request.command==telegram::Command::Plot30?30:request.command==telegram::Command::Plot60?60:0;
@@ -1921,16 +2010,36 @@ void updateNetwork() {
 }
 void loadRecipes() {
   static Recipe loaded[MAX_RECIPES]; size_t count = 0; String reason;
-  String saved = prefs.isKey("recipes") ? prefs.getString("recipes", "") : ""; JsonDocument doc;
-  if (saved.length() && !deserializeJson(doc, saved) && parseRecipes(doc.as<JsonVariantConst>(), loaded, count, reason)) {
-    recipeCount = count; for (size_t i = 0; i < count; ++i) recipes[i] = loaded[i]; return;
+  bool invalid = false;
+  if (prefs.isKey(programs::kStorageKey)) {
+    static programs::Snapshot packed;
+    const size_t length = prefs.getBytesLength(programs::kStorageKey);
+    if (length <= sizeof(packed) && prefs.getBytes(programs::kStorageKey, &packed, length) == length &&
+        programs::decode(&packed, length, packed)) {
+      recipeCount = packed.count;
+      for (size_t i = 0; i < recipeCount; ++i) {
+        const auto &from = packed.programs[i]; auto &to = recipes[i];
+        to.id = from.id; to.name = from.name; to.count = from.count;
+        for (size_t j = 0; j < from.count; ++j)
+          to.steps[j] = {profile::Type(from.steps[j].type), from.steps[j].target, from.steps[j].rate, from.steps[j].minutes};
+      }
+      if (prefs.isKey("recipes")) prefs.remove("recipes"); // Valid committed successor already loaded.
+      return;
+    }
+    invalid = true; // Never silently restore an obsolete legacy copy over a corrupt successor.
+  } else {
+    const String saved = prefs.isKey("recipes") ? prefs.getString("recipes", "") : ""; JsonDocument doc;
+    if (saved.length() && !deserializeJson(doc, saved) && parseRecipes(doc.as<JsonVariantConst>(), loaded, count, reason)) {
+      recipeCount = count; for (size_t i = 0; i < count; ++i) recipes[i] = loaded[i]; return;
+    }
+    invalid = saved.length() > 0;
   }
   recipes[0].id = "prova-50"; recipes[0].name = "Prova a 50 C"; recipes[0].count = 3;
   recipes[0].steps[0] = {profile::Type::Ramp, 50, 1.0f, 0};
   recipes[0].steps[1] = {profile::Type::Hold, 50, 0, 10};
   recipes[0].steps[2] = {profile::Type::Cooldown, 35, 1.0f, 0};
   recipeCount = 1;
-  if (saved.length()) logEvent("ALLARME", "Programmi salvati non validi: caricato il programma di prova");
+  if (invalid) logEvent("ALLARME", "Programmi salvati non validi: caricato il programma di prova");
 }
 void setup() {
   digitalWrite(HEAT, RELAY_ACTIVE_HIGH ? LOW : HIGH); pinMode(HEAT, OUTPUT);
@@ -1942,9 +2051,18 @@ void setup() {
     Serial.println("Supervisore non avviato: firmware fermo, uscita spenta");
     for (;;) delay(1000);
   }
-  prefsReady = prefs.begin("oven-full", false);
+  storageInitialization = ovenstorage::initialize();
+  // If a dedicated partition exists but migration fails, expose the legacy
+  // values read-only and block all starts through the normal persistence guards.
+  const bool migrationFailed = storageInitialization.present && !storageInitialization.ready;
+  const bool opened = prefs.begin("oven-full", migrationFailed, storageInitialization.partition());
+  prefsReady = opened && !migrationFailed;
+  lastStorageError = storageInitialization.error;
   if (!prefsReady) Serial.println("[ALLARME] Memoria NVS non disponibile; salvataggi e avvio ciclo bloccati");
   loadEvents(); loadCycleReport();
+  if (migrationFailed) logEvent("ALLARME", String("Migrazione memoria fallita: ") + esp_err_to_name(storageInitialization.error) + "; dati originali conservati, avvio bloccato", false);
+  else if (!storageInitialization.present) logEvent("MEMORIA", "Memoria condivisa precedente: serve un aggiornamento USB per installare la NVS dedicata", false);
+  else if (storageInitialization.copiedKeys) logEvent("MEMORIA", "Migrazione NVS dedicata completata e verificata; chiavi copiate: " + String(storageInitialization.copiedKeys), false);
   lastCycleError = prefs.getString("cycleError", "");
   if (lastCycleError.isEmpty() && reportAvailable && lastReport.outcome == reports::Outcome::Fault)
     lastCycleError = lastReport.reason;
@@ -2096,7 +2214,9 @@ void setup() {
   telegramUsers.begin(strtoll(OVEN_TELEGRAM_CHAT_ID,nullptr,10),telegram::modeFrom(prefs.getUChar("tgMode",uint8_t(telegram::Mode::Brief))));
   if(prefs.isKey("tgUsers")){
     telegram::Users saved;
-    if(prefs.getBytesLength("tgUsers")==sizeof(saved)&&prefs.getBytes("tgUsers",&saved,sizeof(saved))==sizeof(saved)&&saved.valid(telegramUsers.entries[0].chat))telegramUsers=saved;
+    const size_t length=prefs.getBytesLength("tgUsers");
+    if(length<=sizeof(saved)&&prefs.getBytes("tgUsers",&saved,length)==length&&
+        telegram::decodeUsers(&saved,length,telegramUsers.entries[0].chat,saved))telegramUsers=saved;
     else logEvent("ATTENZIONE","Elenco Telegram non valido: resta autorizzato solo il proprietario configurato",false);
   }
   telegramBot.setUsers(telegramUsers);

@@ -68,6 +68,70 @@ python3 scripts/check_all.py --build
 
 La pipeline copre programmi, mantenimento, PID, pause, cooldown, manuale, ripresa da allarme, supervisore, TEST/heartbeat, sonde, blackout/NVS, Wi-Fi, autorizzazioni e invii Telegram, HTTP frammentato, scritture interrotte dell'outbox e round-trip di PNG/gzip. Non invia messaggi Telegram reali. Le prove native e l'anteprima non sostituiscono il collaudo sull'ESP: prima dell'uso reale della nuova versione verificare letture RAW/temperature, STOP/emergenza e temporizzazione uscita, poi un ciclo sorvegliato e una prova di riavvio con allegato pendente. L'aggiornamento rimane esplicito e a forno fermo.
 
+## Salvataggi e memoria NVS — full-1.28
+
+La **full-1.28** sposta tutti i dati del forno in una NVS dedicata da **256 KiB** (`oven_nvs`), separata dalla NVS condivisa da 20 KiB usata dai firmware precedenti e dal Wi-Fi. Programmi, 8 utenti Telegram e relative modalità, PID, attuatore, protezioni, report, log e registro blackout non competono più con i namespace degli altri firmware. Restano i limiti dell'editor di 8 Programmi con 12 step ciascuno.
+
+La tabella `partitions_oven.csv` ricava lo spazio dalla coda inutilizzata di `app0`, riducendolo da 6,25 a 6 MiB; il firmware attuale occupa circa 1,4 MiB. Gli indirizzi di inizio delle due app, la NVS originale, SPIFFS e coredump restano invariati. Le successive compilazioni sono limitate allo slot più piccolo. **La prima installazione richiede USB: l'OTA aggiorna l'app, non la tabella delle partizioni.**
+
+Al primo avvio vengono copiate tutte le chiavi `oven-full`, con il loro tipo originale, e rilette per confrontarle con la sorgente. Solo dopo la verifica viene salvato il marcatore di completamento. Un'interruzione prima del marcatore fa ripetere la migrazione al prossimo avvio; dopo il marcatore non viene mai ripristinata automaticamente la vecchia copia. La NVS originale non viene cancellata. Se la migrazione fallisce, le impostazioni originali vengono esposte in sola lettura e l'avvio resta bloccato. Non installare firmware anteriori alla full-1.28 dopo la migrazione: leggerebbero la vecchia copia, ormai non aggiornata.
+
+### Installare la memoria dedicata via USB — una sola volta
+
+Dal **Mac collegato al Wi-Fi del capannone**, esporta le eventuali modifiche dei Programmi in JSON e i report che vuoi conservare. Ferma Programmi, Manuale e TEST, collega l'ESP al Mac con un cavo USB dati e chiudi eventuali monitor seriali.
+
+```bash
+cd "/Users/gigi/Documents/PROJECTS/Forno oriana/firmware/oven-controller-full"
+
+# Compila e verifica, senza eseguire upload.
+python3 scripts/check_all.py --build
+
+# Rileva una sola porta USB, crea il backup e installa.
+python3 scripts/upload_usb_migration.py --port auto
+```
+
+Se ci sono più dispositivi USB, indica la porta precisa:
+
+```bash
+ls /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null
+python3 scripts/upload_usb_migration.py --port /dev/cu.usbmodemXXXX
+```
+
+Sostituisci `XXXX` con la porta effettiva. Lo script controlla che il forno sia fermo, confronta il MAC dell'ESP USB con quello della dashboard e legge un **backup completo della flash da 16 MiB** prima di scrivere. Il backup e la configurazione sono in `output/usb-backups/<data-ora>/`, con hash nel `manifest.json`; conservali localmente perché includono anche le credenziali compilate. Sono esclusi da Git. Un backup incompleto, un MAC diverso, file cambiati o una tabella non riconosciuta interrompono la procedura senza scritture sulla flash.
+
+Solo sul vecchio layout viene inizializzata l'area che prima apparteneva alla coda di `app0`; una seconda installazione non la cancella. Non viene eseguito `erase_flash` e non vengono toccate le partizioni dati preesistenti. Al termine lo script verifica la versione corrente **full-1.29**, NVS dedicata, uscita spenta e uguaglianza di Programmi, utenti e impostazioni rispetto a prima. Non riavvia alcun controllo. Durante la lettura/scrittura USB la dashboard non risponde: è normale. Se la procedura si interrompe, conserva il backup; se dopo un reset la dashboard torna disponibile puoi ripetere lo script. Se non torna, serve il ripristino USB descritto sotto prima di riprovare.
+
+Dopo il riavvio aggiorna la dashboard con **⌘⇧R**: **Memoria salvataggi** deve indicare **Dedicata · attiva**. `/api/status.storage` deve mostrare `partition: "oven_nvs"`, `dedicated: true`, `migrationRequired: false`. Prova ad aggiungere un Programma e autorizzare un utente, poi riavvia a controllo fermo e verifica che siano conservati. Da quel momento si torna alla normale procedura OTA; la memoria dedicata resta persistente tra gli aggiornamenti.
+
+**Recupero solo se un'installazione USB si interrompe e la scheda non riparte:** il file `flash-originale-16MB.bin` permette di riportare firmware e dati esattamente al momento del backup. Il ripristino sostituisce anche le modifiche successive a quel backup, quindi non usarlo come normale aggiornamento. Con il controllo fermo e la porta USB corretta, verifica prima l'hash del file rispetto a `backupSha256` nel `manifest.json` della stessa cartella:
+
+```bash
+shasum -a 256 "/percorso/del/backup/flash-originale-16MB.bin"
+cat "/percorso/del/backup/manifest.json"
+```
+
+Se coincidono, sostituisci percorso e porta nel comando di ripristino:
+
+```bash
+"$HOME/.platformio/penv/bin/python" "$HOME/.platformio/packages/tool-esptoolpy/esptool.py" --chip esp32s3 --port /dev/cu.usbmodemXXXX --baud 460800 write_flash 0x0 "/percorso/del/backup/flash-originale-16MB.bin"
+```
+
+Questo recupero non richiede la dashboard raggiungibile. Dopo il ripristino ricontrolla che il forno sia fermo e ripeti la migrazione con un nuovo backup.
+
+Programmi, utenti Telegram, PID, comando e protezioni vengono applicati in RAM solo dopo una scrittura NVS completata. Se la scrittura segnala davvero memoria esaurita, il firmware ritenta liberando progressivamente soltanto i propri vecchi record `log0`…`log39`, dai più vecchi ai più recenti. Non cancella altri namespace, programmi, utenti, report, configurazioni o registro blackout. I log eliminati dalla persistenza restano nella cronologia RAM fino al riavvio o alla normale rotazione. Un errore diverso da spazio insufficiente non avvia questa pulizia. Durante Programmi/Manuale, TEST o OTA la pulizia viene rinviata: il salvataggio può chiedere di riprovare a forno fermo, senza bloccare a lungo il controllo.
+
+I Programmi vengono salvati come blob compatto e validato nella chiave `programsV1`. Da full-1.27 il formato interno V2 memorizza solo nomi e step effettivamente usati: **al massimo 1.536 byte per 8 programmi con 12 step**, oppure 120 byte per i due Programmi «Test carbonio 80°C» e «Recupero PA12» verificati durante la diagnosi. La full-1.26 riservava invece 464 byte per quei due programmi. Le API, l'editor e l'import/export restano JSON; vengono ancora letti sia il blob V1 sia il vecchio JSON `recipes`.
+
+La copia JSON viene rimossa soltanto dopo il salvataggio riuscito del blob. Se una modifica più grande non entra insieme al JSON, viene prima salvata in formato compatto la raccolta attualmente applicata, poi viene rimossa la copia JSON e ritentata la modifica. Se anche questo tentativo fallisce, restano applicati i dati precedenti, con una copia persistente ancora disponibile. Il normale salvataggio non cancella altri namespace o modifica partizioni. Se lo spazio recuperabile non basta, il salvataggio resta rifiutato. Al riavvio un blob nuovo corrotto non viene sostituito silenziosamente con un JSON obsoleto; viene segnalato il caricamento del programma di prova.
+
+La selezione e l'anteprima della Dashboard mostrano i **Programmi applicati dall'ESP**. La scheda Programmi conserva separatamente le modifiche dell'editor anche quando un salvataggio fallisce; in questo caso l'avvio resta disabilitato e puoi esportare la bozza in JSON prima di ricaricare la pagina o aggiornare il firmware. Durante un salvataggio non partono richieste duplicate e una risposta tardiva non sovrascrive modifiche successive. `GET /api/recipes` restituisce la raccolta applicata dal firmware.
+
+Anche gli utenti Telegram vengono salvati senza riservare spazio agli slot vuoti in fondo all'elenco: 104 byte per il solo proprietario, 200 per proprietario e un altro utente, fino ai precedenti 776 byte con tutti gli 8 slot usati. Le copie precedenti restano leggibili; autorizzazioni, revoche e modalità personali sono applicate solo dopo la scrittura riuscita.
+
+Gli errori di salvataggio mostrano il codice NVS reale. `GET /api/status.storage` espone disponibilità, statistiche delle entry, ultimo codice/chiave, numero di record log recuperati e necessità di attendere forno fermo. Le statistiche aggregate non garantiscono spazio contiguo: l'esito effettivo della scrittura resta decisivo. Nessun contenuto privato viene incluso nella diagnostica. Se mancano spazio recuperabile o accesso alla memoria, il salvataggio viene rifiutato senza applicare una configurazione soltanto temporanea.
+
+Riferimento: [NVS ESP32-S3 / ESP-IDF 4.4.7](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32s3/api-reference/storage/nvs_flash.html). Il vecchio percorso accettava JSON fino a 12 KB, ma una stringa NVS è limitata a 4.000 byte incluso il terminatore; anche stringhe più piccole possono fallire per frammentazione.
+
 ## Controllo manuale
 
 Nella scheda **Manuale**, accanto a **Dashboard**, trovi temperature, grafico e **Controllo manuale**. Le due schede usano lo stesso storico del forno, con comandi distinti. Serve a raggiungere e mantenere una temperatura per il tempo deciso dall'operatore, senza salvare un Programma o eseguire step automatici.
@@ -81,7 +145,7 @@ Il manuale usa gli stessi **PID, attuatore, finestra SSR e limite di potenza** i
 
 Il controllo continua se chiudi la pagina o perdi il Wi-Fi. Dopo reset o blackout **non riparte automaticamente**: lo stesso registro di sicurezza salva l'attività «Controllo manuale», blocca le uscite al riavvio e richiede riconoscimento e nuovo avvio. Telegram `/status` mostra il manuale, il target, il raffreddamento e il tempo trascorso; avvio, cambio target, cooldown e STOP seguono la modalità notifiche scelta, mentre gli allarmi restano prioritari.
 
-Il manuale non genera report PDF di ciclo e non sostituisce l'ultimo report dei Programmi. Puoi scaricare la curva dalla Dashboard con **Scarica CSV + grafico**: i campioni manuali hanno la colonna step vuota e il marcatore **INIZIO MANUALE**. Per i colori del riquadro modifica `--manual-control-bg` e `--manual-control-border` in `data/style.css`; pulsanti e indicatore di stato sono nelle regole `.manual-buttons` e `.manual-state`.
+Da **full-1.25**, STOP MANUALE, STOP generale, allarme ed emergenza chiudono la sessione con un **report PDF automatico su Telegram per tutti gli utenti autorizzati**, in ogni modalità notifiche. Il report include tempi, impostazioni PID/attuatore, temperature, qualità delle letture e grafico target/media PT100, con tutti i cambi di target e il cooldown presenti nello storico. Non introduce step automatici: è un riepilogo unico della sessione. Le metriche di inseguimento e comando escludono discesa, cooldown e attesa dopo un allarme. Il riepilogo compare anche nella scheda Report e sostituisce il precedente solo alla chiusura della sessione; salvataggio NVS e durata dello storico seguono le stesse regole dei Programmi. STOP ripetuti non generano nuovi report; dopo RESET & CONTINUE il successivo termine produce un report aggiornato che comprende anche i dati precedenti. Il nome è `Stopped_Controllo_manuale_[data-ora].pdf` oppure `Error_Controllo_manuale_[data-ora].pdf`. Un blackout senza chiusura non produce un report completo della sessione persa. Puoi scaricare la curva dalla Dashboard con **Scarica CSV + grafico**: i campioni manuali hanno la colonna step vuota e il marcatore **INIZIO MANUALE**. Per i colori del riquadro modifica `--manual-control-bg` e `--manual-control-border` in `data/style.css`; pulsanti e indicatore di stato sono nelle regole `.manual-buttons` e `.manual-state`.
 
 API: `POST /api/manual` con `action: "start"` e `targetC`, `rateCMin`, `hardwareReady: true`; `action: "target"`, `targetC` e `rateCMin` per modificarlo; `action: "cooldown"`, `targetC` e `rateCMin`, oppure `action: "stop"`. `/api/status` espone `operation` e `manual` (`active`, `mode`, `targetC`, `setpointC`, `rateCMin`, `coolingToTarget`, `cooldownComplete`, `elapsedSec`, `startedAtMs`). `cooldownRegulated: true` indica il nuovo comportamento con correzione PID in discesa. I target sono validati anche sul firmware; non si può avviare il manuale durante un programma, TEST, OTA o un blocco di sicurezza.
 
@@ -103,6 +167,8 @@ Questa anteprima serve per controllare l’interfaccia: temperature e comandi so
 In fondo alla pagina, a sinistra, la dashboard mostra la **versione del firmware in esecuzione** e la **data dell'ultima modifica** ricevute da `/api/status`. Versione e data si aggiornano in `include/firmware_version.h` (`kVersion` e `kModifiedOn`, data `AAAA-MM-GG`); la data non dipende da compilazione, NTP o riavvio. Per font, colore e spaziatura modifica `.firmware-footer` in `data/style.css`. L'anteprima indica esplicitamente «Anteprima locale» e legge gli stessi metadati; firmware precedenti senza data mostrano «non disponibile».
 
 Apri questa cartella in PlatformIO. Dal terminale nella cartella `firmware`:
+
+**Per il passaggio alla full-1.28 usa prima la procedura USB con backup descritta in «Installare la memoria dedicata via USB».** I comandi ordinari sotto valgono dopo quella migrazione.
 
 ```sh
 pio run
@@ -294,6 +360,8 @@ Se ESP o Internet sono spenti, **`/status` non può rispondere** e Telegram non 
 Riferimenti: [Telegram Bot API](https://core.telegram.org/bots/api), [creazione del bot](https://core.telegram.org/bots/tutorial#obtain-your-bot-token).
 
 ## Aggiornamenti Wi-Fi OTA
+
+**Da full-1.28 serve prima una migrazione USB per installare la NVS dedicata.** Dopo quel passaggio gli aggiornamenti successivi restano OTA e conservano la nuova memoria. Il solo OTA su una tabella precedente non risolve lo spazio NVS.
 
 È integrato ArduinoOTA, porta **3232**, host **oven-full.local**. La configurazione privata è in `include/ota_config.h`, esclusa da Git; in questa copia è stata ripresa dal field-test. Non cambiare il file durante il passaggio da field-test a full via OTA: la password deve corrispondere al firmware già installato. In una nuova copia crea il file da `include/ota_config.example.h` e imposta una password privata di 16..64 lettere, numeri, `_` o `-`. Senza password OTA è disabilitato; il caricamento USB resta disponibile.
 
@@ -565,7 +633,7 @@ Da **full-1.19**, il blocco ΔT sonde si applica anche a pausa e cooldown di Pro
 
 `POST /api/protections` riceve `probeDeltaEnabled`, `maxProbeDeltaC`, `meanOvershootEnabled`, `maxMeanOvershootC`. Le abilitazioni devono essere booleani JSON e le soglie numeri finiti. Un salvataggio fallito lascia applicate le impostazioni precedenti; dati salvati illeggibili/non validi fanno usare i default attivi 30/10 con avviso nel log. `/api/status.protections` e Telegram `/status` mostrano la configurazione. **RESET & CONTINUE** verifica le soglie attualmente abilitate, oltre alle sonde sane e al limite assoluto; modificare questi blocchi a forno fermo non cancella il punto di recupero.
 
-L'editor accetta target **0–400 °C**, rampa almeno **0,1 °C/min**, mantenimento **1–360 minuti interi**. Il rate non ha un massimo software, ma il forno può seguire una rampa più lentamente. Dopo il primo step, una rampa deve salire rispetto al target precedente, un cooldown deve scendere e un hold deve conservare il target precedente. Le modifiche ai programmi, al PID e all'attuatore sono consentite solo a ciclo fermo. Le bozze della pagina non modificano la memoria ESP finché non premi Salva; la pagina impedisce di avviare con programmi non salvati.
+L'editor accetta target **0–400 °C**, rampa almeno **0,1 °C/min**, mantenimento **1–360 minuti interi**. Il rate non ha un massimo software, ma il forno può seguire una rampa più lentamente. Da **full-1.29**, ogni step ha un target indipendente: qualsiasi sequenza di Ramp, Hold e Cooldown può essere salvata e importata, con target uguali, maggiori o minori rispetto allo step precedente. Anche un Hold può avere un target diverso: il tempo conta solo con entrambe le PT100 entro ±5 °C dal suo target. Ramp mantiene il funzionamento in salita e Cooldown quello in discesa; le protezioni termiche configurate restano attive. Le modifiche ai programmi, al PID e all'attuatore sono consentite solo a ciclo fermo. Le bozze della pagina non modificano la memoria ESP finché non premi Salva; la pagina impedisce di avviare con programmi non salvati.
 
 **Ramp:** il riferimento cresce dalla media delle temperature misurate all'inizio dello step. Se lo step successivo è un **Hold allo stesso target**, il passaggio avviene quando il riferimento ha raggiunto il target e **entrambe le PT100 sono entro ±5 °C dal target dell'hold**. La rampa non viene saltata solo perché le sonde sono già in banda; il tempo previsto dal rate deve essere trascorso. Questo evita che l'ingresso nel mantenimento resti bloccato da una soglia più stretta del mantenimento stesso. Le rampe che non precedono un hold mantengono la condizione sulla **sonda più fredda a target −1 °C**.
 

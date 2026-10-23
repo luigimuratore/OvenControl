@@ -551,7 +551,8 @@ class PreviewReports:
                     first, second = t1 if flags & 1 else None, t2 if flags & 2 else None
                     points.append(dict(seq=seq, ms=ms, t1=first, t2=second,
                         actual=(first + second) / 2 if first is not None and second is not None else None,
-                        target=target if flags & 8 else None, duty=duty, step=step, marker=flags & 0xf0))
+                        target=target if flags & 8 else None, duty=duty, step=step, marker=flags & 0xf0,
+                        operation="manual" if step == 255 else "program"))
                 if not page.get("more"):
                     break
                 if not page.get("samples"):
@@ -559,12 +560,15 @@ class PreviewReports:
             else:
                 raise ValueError("Curva report troppo grande.")
             if legacy_curve:
+                first = next((i for i, p in enumerate(points) if p['ms'] == report['startUptimeMs'] and p['marker'] & 16), None)
+                if first is not None:
+                    points = points[first:]
                 report.update(curveAvailable=bool(points), curveSamples=len(points), curveIntervalMs=10000,
                               curvePartial=not any(p["marker"] & 16 for p in points))
         if local_json(base, "report").get("key") != key:
             raise ValueError("Il report è cambiato durante l'acquisizione.")
         document = dict(filename=report_filename(report), pdf=preview_pdf(report, points),
-                        caption="📄 Report di fine ciclo · ANTEPRIMA SIMULATA")
+                        caption=("📄 Report controllo manuale" if report.get("operation") == "manual" else "📄 Report di fine ciclo") + " · ANTEPRIMA SIMULATA")
         # Retried sends own this immutable PDF; a subsequent cycle cannot change it.
         return key, document
 

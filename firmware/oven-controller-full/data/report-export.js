@@ -177,12 +177,13 @@ const OvenExport = (() => {
         drawPlot(curve,options);if(noteLines.length)text(noteLines,22,y+2,8);
       });
     }
-    const outcomes={completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
+    const outcomes=r.operation === 'manual' ? {completed:'CONTROLLO MANUALE COMPLETATO',stopped:'CONTROLLO MANUALE FERMATO',fault:'CONTROLLO MANUALE IN ALLARME'} :
+      {completed:'CICLO COMPLETATO',stopped:'CICLO FERMATO',fault:'CICLO IN ALLARME'};
     const outcomeTone=r.outcome==='completed'?'green':r.outcome==='fault'?'red':'amber';
     header(r.recipeName,true);
     const reason=lines(r.reason,166,9);
     panel(outcomes[r.outcome]||r.outcome,16+reason.length*4,outcomeTone,()=>text(reason,22,y,9));
-    pairsPanel('Il ciclo in sintesi',[summary[1],summary[2],summary[3],summary[6],summary[7],summary[8]],'blue');
+    pairsPanel(r.operation === 'manual' ? 'La sessione in sintesi' : 'Il ciclo in sintesi',[summary[1],summary[2],summary[3],summary[6],summary[7],summary[8]],'blue');
     plotPanel('Andamento completo / target e media PT100',points,{startMs:r.startUptimeMs,durationMs:r.durationMs,intervalMs:r.curveIntervalMs},curveMessage);
 
     header('Riepilogo completo');

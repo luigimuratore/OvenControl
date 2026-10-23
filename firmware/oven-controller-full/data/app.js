@@ -4,7 +4,7 @@ const labels = { idle: "PRONTO", running: "CICLO IN CORSO", paused: "IN PAUSA", 
 const resetNames = { 1: "Accensione", 2: "Reset esterno", 3: "Reset software", 4: "Watchdog panic", 5: "Watchdog interrupt", 6: "Watchdog task", 7: "Watchdog altro", 8: "Deep sleep", 9: "Brownout", 10: "Reset SDIO" };
 const types = { ramp: "Ramp", hold: "Hold", cooldown: "Cooldown" };
 const markerNames = { 16: "INIZIO CICLO", 32: "STOP", 64: "FINE CICLO", 128: "ALLARME" };
-let recipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
+let recipes = [], appliedRecipes = [], selectedId = "", editId = "", latest = null, connected = false, busy = false;
 let pidLoaded = false;
 let telegramUsersBusy=false, telegramUsersData=null, telegramRenderedKey='';
 const telegramModeDrafts=new Map();
@@ -12,7 +12,7 @@ let protectionsLoaded = false;
 let manualTargetDirty = false;
 let selectedView = 'Dashboard';
 let settingsLoaded = false, recipesLoaded = false, recipesDirty = false, commandBusy = false, commandGeneration = 0, exportBusy = false;
-let recipeLoadBusy = false;
+let recipeLoadBusy = false, recipeSaveBusy = false, recipeRevision = 0, recipeSaveGeneration = 0;
 let events = [], eventKey = "", logsBusy = false;
 let history = [], live = [], historyBusy = false, hasOlder = false, boot = null;
 let chartAtEnd = true, chartStart = 0, timeOffset = Date.now(), chartFrame = 0;
@@ -275,6 +275,12 @@ function display(s) {
   put("powerInfo", `${s.maxPower}% · finestra ${s.windowSec} s`);
   put("heapInfo", `${Math.round(s.freeHeap / 1024)} / ${Math.round(s.minFreeHeap / 1024)} kB`);
   put("sampleAge", `${s.sampleAgeMs} ms`); put("rssiInfo", s.workshopConnected ? `${s.rssi} dBm` : "—");
+  const storage = s.storage;
+  put('storageInfo', !storage ? '—' : !storage.ready ? 'Non disponibile' : storage.dedicated ? 'Dedicata · attiva' : 'Condivisa · precedente');
+  $('storageNotice').hidden = !storage || (storage.ready && !storage.migrationRequired);
+  $('storageNotice').className = `notice${storage && !storage.ready ? ' error' : ''}`;
+  put('storageNotice', storage?.ready ? 'Per aumentare lo spazio dei salvataggi serve la migrazione USB alla memoria dedicata. Il solo OTA non aggiorna le partizioni.' :
+    `Memoria salvataggi non disponibile: ${storage?.migrationError || 'verifica il log'}. Dati originali conservati; avvio bloccato.`);
   put("workshopState", s.workshopConnected ? "Connesso" : s.workshopConfigured ? "In attesa" : "Non configurato");
   const wifiInfo = [], wifi = s.wifi;
   if (s.stationMac) wifiInfo.push(`MAC: ${s.stationMac}`);
@@ -370,7 +376,7 @@ function updateControls() {
   const active = latest?.phase === "running" || latest?.phase === "paused";
   const blocked = active || !!latest?.test?.enabled || !!latest?.otaUpdating || testCommandBusy;
   $("startBtn").disabled = !connected || commandBusy || !latest?.ready || needsErrorReset() || blocked || latest?.phase === "interrupted" ||
-                            !recipesLoaded || recipesDirty || !recipes.length || !$("hardwareReady").checked;
+                            !recipesLoaded || recipesDirty || recipeSaveBusy || !appliedRecipes.length || !$("hardwareReady").checked;
   $("hardwareReady").disabled = active;
   const manualActive = !!latest?.manual?.active, supported = !!latest?.manual;
   const targetText = String($('manualTarget').value).trim(), manualTarget = targetText ? Number(targetText) : NaN;
@@ -399,7 +405,7 @@ function updateControls() {
   $('saveProtections').disabled = parametersBlocked || !latest?.protections;
   $("exportSamples").disabled = !connected || exportBusy;
   document.querySelectorAll('#recipesView input, #recipesView select, #recipesView button').forEach(el => {
-    if (el.id !== "exportRecipes") el.disabled = active || !connected;
+    if (el.id !== "exportRecipes") el.disabled = active || !connected || recipeSaveBusy;
   });
   $("pauseBtn").disabled = !connected || commandBusy || latest?.phase !== "running";
   $("resumeBtn").disabled = !connected || commandBusy || latest?.otaUpdating || latest?.test?.enabled || testCommandBusy || needsErrorReset() || latest?.phase !== "paused";
@@ -409,36 +415,38 @@ function updateControls() {
   updateErrorReset();
   $("stopBtn").disabled = !latest;
 }
-function markDirty() { recipesDirty = true; updateControls(); }
+function markDirty() { recipesDirty = true; ++recipeRevision; updateControls(); renderPreview(); }
 function renderPreview() {
   const list = $("recipePreview"); list.replaceChildren();
-  const recipe = recipes.find(r => r.id === selectedId);
+  const recipe = appliedRecipes.find(r => r.id === selectedId);
   if (!recipe) return;
   for (const step of recipe.steps) {
     const item = document.createElement("li");
     item.textContent = `${types[step.type]} → ${step.target} °C · ${step.type === "hold" ? `${step.duration} min in banda` : `${step.rate} °C/min`}`;
     list.append(item);
   }
-  if (recipesDirty) { const item = document.createElement("li"); item.textContent = "Modifiche non salvate: salva sull'ESP prima di avviare."; list.append(item); }
+  if (recipesDirty) { const item = document.createElement("li"); item.textContent = "Questi sono i valori applicati dall'ESP. L'editor contiene modifiche non salvate: salva prima di avviare."; list.append(item); }
 }
 
 function redrawSelectors() {
-  for (const [id, value] of [["recipeSelect", selectedId], ["editRecipeSelect", editId]]) {
+  for (const [id, value, source] of [["recipeSelect", selectedId, appliedRecipes], ["editRecipeSelect", editId, recipes]]) {
     const select = $(id); select.replaceChildren();
-    for (const r of recipes) { const option = document.createElement("option"); option.value = r.id; option.textContent = r.name; select.append(option); }
-    if (recipes.some(r => r.id === value)) select.value = value;
-    else if (recipes.length) select.value = recipes[0].id;
+    for (const r of source) { const option = document.createElement("option"); option.value = r.id; option.textContent = r.name; select.append(option); }
+    if (source.some(r => r.id === value)) select.value = value;
+    else select.value = source[0]?.id || "";
   }
   selectedId = $("recipeSelect").value; editId = $("editRecipeSelect").value;
   renderEditor(); renderPreview(); updateControls();
 }
 async function loadRecipes() {
-  if (recipeLoadBusy || recipesDirty) return;
+  if (recipeLoadBusy || recipeSaveBusy) return;
+  const generation = recipeSaveGeneration;
   recipeLoadBusy = true;
   try {
     const data = await api("/api/recipes");
-    if (recipesDirty) return;
-    recipes = data.recipes; recipesLoaded = true; recipesDirty = false;
+    if (generation !== recipeSaveGeneration) return;
+    appliedRecipes = data.recipes; recipesLoaded = true;
+    if (!recipesDirty) recipes = JSON.parse(JSON.stringify(appliedRecipes));
     redrawSelectors();
   } finally { recipeLoadBusy = false; }
 }
@@ -480,9 +488,21 @@ function renderEditor() {
 }
 function saveName() { const recipe = editRecipe(); if (recipe && recipe.name !== $("recipeName").value.trim()) { recipe.name = $("recipeName").value.trim(); markDirty(); } }
 async function saveRecipes() {
+  if (recipeSaveBusy) return;
   saveName();
-  try { validateRecipes(recipes); const data = await api("/api/recipes", { recipes }); recipes = data.recipes; recipesDirty = false; recipesLoaded = true; redrawSelectors(); note("recipeMessage", "Programmi salvati nella memoria dell'ESP."); }
-  catch (e) { note("recipeMessage", e.message, true); }
+  const revision = recipeRevision;
+  let failed = false;
+  try {
+    validateRecipes(recipes); recipeSaveBusy = true; ++recipeSaveGeneration; updateControls();
+    const data = await api("/api/recipes", { recipes });
+    appliedRecipes = data.recipes; recipesLoaded = true;
+    recipesDirty = revision !== recipeRevision;
+    if (!recipesDirty) recipes = JSON.parse(JSON.stringify(appliedRecipes));
+    redrawSelectors();
+    note("recipeMessage", recipesDirty ? "Programmi salvati. Restano ulteriori modifiche nell'editor da salvare." : "Programmi salvati nella memoria dell'ESP.");
+  } catch (e) { failed = true; note("recipeMessage", `${e.message}. Le modifiche restano nell'editor; l'anteprima mostra i valori applicati dall'ESP.`, true); }
+  finally { recipeSaveBusy = false; updateControls(); renderPreview(); }
+  if (failed) loadRecipes().catch(() => {});
 }
 function download(name, data, mime) {
   const url = URL.createObjectURL(new Blob([data], { type: mime }));
@@ -492,6 +512,9 @@ function download(name, data, mime) {
 async function command(action) {
   const wasManual = !!latest?.manual?.active;
   const safetyAction = action === 'stop' || action === 'emergency';
+  if (action === 'start' && (!recipesLoaded || recipesDirty || recipeSaveBusy || !appliedRecipes.some(r => r.id === selectedId))) {
+    note('messageBox', "Salva i Programmi sull'ESP prima di avviare: le modifiche nell'editor non sono ancora applicate.", true); return;
+  }
   if ((commandBusy || testCommandBusy) && !safetyAction) return;
   if (safetyAction) cancelTestOwnership();
   const generation = ++commandGeneration; commandBusy = true; updateControls();
@@ -772,10 +795,14 @@ async function telegramUserAction(action,chatId,mode){
   finally{telegramUsersBusy=false;$('refreshTelegram').disabled=false;if(telegramUsersData)renderTelegramUsers(telegramUsersData);}
 }
 const reportOutcomes = {completed: "CICLO COMPLETATO", stopped: "CICLO FERMATO", fault: "CICLO IN ALLARME"};
+function reportOutcomeLabel(r) {
+  return r.operation === 'manual' ? (r.outcome === 'fault' ? 'CONTROLLO MANUALE IN ALLARME' : 'CONTROLLO MANUALE FERMATO') : reportOutcomes[r.outcome] || r.outcome;
+}
 function reportOvershootLabel(r) {
   return r.version >= 3 ? "Superamento massimo della media" : "Superamento massimo sonda più calda";
 }
 function reportDefinitions(r, definitions) {
+  if (r.operation === 'manual') return 'Sessione manuale: il grafico comprende cambi di target e cooldown. Errori e comando PID usano solo coppie valide durante la regolazione attiva, escluse discesa, cooldown e attesa dopo allarme. Gli scarti sono riferiti alla media PT100 e al setpoint istantaneo. Temperature e differenza sonde comprendono tutti i campioni acquisiti. Non sono previsti step automatici o conteggio hold. Comando e saturazione non misurano potenza o energia elettrica.';
   return definitions.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`)
     .replace('Il superamento usa la media delle PT100', r.version >= 3 ? 'Il superamento usa la media delle PT100' : 'Il superamento usa la sonda più calda');
 }
@@ -790,15 +817,16 @@ function reportSummaryPairs(r) {
     [`PT100 #${i + 1} · min / max`, `${reportNumber(s.minC, " °C")} / ${reportNumber(s.maxC, " °C")}`]
   ]);
   return [
-    ["Programma", r.recipeName], ["Inizio", reportTime(r.startUtc, r.startUptimeMs, r.bootCount)],
+    [r.operation === 'manual' ? "Controllo" : "Programma", r.recipeName], ["Inizio", reportTime(r.startUtc, r.startUptimeMs, r.bootCount)],
     ["Fine", reportTime(r.endUtc, r.endUptimeMs, r.bootCount)],
     ["Durata totale", clock(r.durationMs / 1000)], ["Tempo attivo", clock(r.activeMs / 1000)],
-    ["Pause", `${r.pauseCount} · ${clock(r.pausedMs / 1000)}`], ["Step completati", `${r.completedSteps} / ${r.stepCount}`],
+    ["Pause", `${r.pauseCount} · ${clock(r.pausedMs / 1000)}`],
+    r.operation === 'manual' ? ["Tipo sessione", "Manuale · senza step automatici"] : ["Step completati", `${r.completedSteps} / ${r.stepCount}`],
     ["PID usato", `Kp ${cfg.kp} · Ki ${cfg.ki} · Kd ${cfg.kd}`],
     ["Comando usato", `${cfg.actuator === "ssr" ? "SSR" : "Relè meccanico"} · ${cfg.windowSec} s · limite ${cfg.maxPower}%`],
-    ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
+    r.operation === 'manual' ? ['Gestione target', "Target e rate impostati dall'operatore"] : ['Banda mantenimento', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`],
     ...thermal, ["ΔT massimo sonde", reportNumber(stats.maxDeltaC, " °C")],
-    ["Errore medio assoluto · rampa e mantenimento", reportNumber(stats.meanAbsoluteErrorC, " °C")],
+    [r.operation === 'manual' ? "Errore medio assoluto · regolazione attiva" : "Errore medio assoluto · rampa e mantenimento", reportNumber(stats.meanAbsoluteErrorC, " °C")],
     [reportOvershootLabel(r), reportNumber(stats.maxOvershootC, " °C")],
     ["Ritardo massimo della media", reportNumber(stats.maxLagC, " °C")],
     ["PID medio richiesto", reportNumber(stats.meanCommandPct, "%")],
@@ -845,8 +873,8 @@ async function loadReport(expectedKey = latest?.reportKey) {
     lastReport = r;
     put('reportOvershootHeader', r.version >= 3 ? 'Superamento max media' : 'Superamento max sonda');
     put('reportDefinitions', reportDefinitions(r, REPORT_DEFINITIONS));
-    put("reportNoticeText", `${r.recipeName} · ${reportOutcomes[r.outcome]} · ${clock(r.durationMs / 1000)}`);
-    put("reportOutcome", reportOutcomes[r.outcome] || r.outcome);
+    put("reportNoticeText", `${r.recipeName} · ${reportOutcomeLabel(r)} · ${clock(r.durationMs / 1000)}`);
+    put("reportOutcome", reportOutcomeLabel(r));
     $("reportOutcome").className = r.outcome === "fault" ? "log-danger" : r.outcome === "stopped" ? "log-warning" : "sensor-ok";
     put("reportReason", r.reason);
     put("reportMessage", r.saved ? "Ultimo report salvato sull'ESP, disponibile anche dopo un riavvio. Un nuovo ciclo lo sostituirà solo quando termina." : "Report disponibile solo in RAM: scaricalo prima di riavviare l'ESP.");
@@ -861,6 +889,7 @@ async function loadReport(expectedKey = latest?.reportKey) {
       section.append(heading,grid);$('reportSummary').append(section);
     }
     $("reportSteps").replaceChildren();
+    $("reportStepsSection").hidden = r.operation === 'manual';
     for (const values of reportStepRows(r)) {
       const row = document.createElement("tr");
       for (const value of values) { const cell = document.createElement("td"); cell.textContent = value; row.append(cell); }
@@ -945,13 +974,10 @@ function validateRecipes(list) {
     ids.add(recipe.id);
     if (typeof recipe.name !== "string" || !recipe.name.trim() || new TextEncoder().encode(recipe.name).length > 48) throw Error("Nome programma richiesto, massimo 48 byte.");
     if (!Array.isArray(recipe.steps) || recipe.steps.length < 1 || recipe.steps.length > 12) throw Error("Servono 1–12 step per programma.");
-    let previous = null;
     for (const step of recipe.steps) {
       if (!step || !["ramp", "hold", "cooldown"].includes(step.type) || !Number.isFinite(step.target) || step.target < 0 || step.target > 400) throw Error("Tipo step o target non valido (0–400 °C).");
       if (step.type === "hold") { if (!Number.isInteger(step.duration) || step.duration < 1 || step.duration > 360) throw Error("Hold: 1–360 minuti interi."); }
       else if (!Number.isFinite(step.rate) || step.rate < 0.1) throw Error("Rate minimo 0,1 °C/min.");
-      if (previous !== null && ((step.type === "ramp" && step.target <= previous) || (step.type === "cooldown" && step.target >= previous) || (step.type === "hold" && Math.abs(step.target - previous) > 0.1))) throw Error("Sequenza incoerente: ramp sale, cooldown scende, hold mantiene il target precedente.");
-      previous = step.target;
     }
   }
 }

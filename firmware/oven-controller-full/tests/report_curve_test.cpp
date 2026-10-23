@@ -25,5 +25,8 @@ int main() {
   assert(count==2 && partial && out[0].seq==2 && out[1].seq==3);
   count=reports::copyCurve(wrap,0,0,0,0,10,out,5,partial);
   assert(count==0 && partial);
+  Sample sameMs[]={{1,100,3},{2,100,0x13},{3,200,3}};
+  count=reports::copyCurve(sameMs,3,0,3,100,200,out,5,partial);
+  assert(count==2 && !partial && out[0].seq==2);
   std::cout << "OK: report curve isolation, ring order, missing probes, partial history, capacity and timer wrap\n";
 }

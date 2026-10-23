@@ -65,5 +65,37 @@ int main() {
   assert(rollover.firstRemoved == 0);
   assert(logs::stringEntries(0) == 2 && logs::stringEntries(31) == 2 &&
          logs::stringEntries(32) == 3);
+  // A write can fail despite a reassuring aggregate free-entry count.
+  Store fragmented; fragmented.settingsEntries = 100;
+  for (unsigned i = 0; i < 4; ++i) fragmented.slots[i] = 1;
+  size_t attempts = 0;
+  auto result = logs::writeWithRecovery(fragmented, 3, 4, true, [&] {
+    ++attempts;
+    return fragmented.slots.size() > 1 ? logs::WriteStatus::NoSpace : logs::WriteStatus::Saved;
+  });
+  assert(result.saved && result.reclaimed == 3 && attempts == 4);
+  assert(fragmented.firstRemoved == 0 && fragmented.has(3) && fragmented.settingsEntries == 100);
+  // No log eviction on success, non-space errors, or while a control is active.
+  Store live; live.slots[0] = 10;
+  result = logs::writeWithRecovery(live, 3, 4, false, [] {return logs::WriteStatus::NoSpace;});
+  assert(!result.saved && live.removals == 0);
+  result = logs::writeWithRecovery(live, 3, 4, true, [] {return logs::WriteStatus::Error;});
+  assert(!result.saved && live.removals == 0);
+  result = logs::writeWithRecovery(live, 3, 4, true, [] {return logs::WriteStatus::Saved;});
+  assert(result.saved && live.removals == 0);
+  // Missing slots and sequence overflow cannot prevent visiting every owned key.
+  Store sparseWrite; sparseWrite.slots[38] = 3; sparseWrite.slots[39] = 3;
+  attempts = 0;
+  result = logs::writeWithRecovery(sparseWrite, UINT32_MAX - 1, 40, true, [&] {
+    ++attempts; return sparseWrite.slots.empty() ? logs::WriteStatus::Saved : logs::WriteStatus::NoSpace;
+  });
+  assert(result.saved && result.reclaimed == 2 && attempts == 3);
+  Store persistent; for (unsigned i=0;i<40;++i) persistent.slots[i] = 1;
+  attempts = 0;
+  result = logs::writeWithRecovery(persistent, 15, 40, true, [&] {++attempts; return logs::WriteStatus::NoSpace;});
+  assert(!result.saved && result.reclaimed == 40 && attempts == 41);
+  Store failedErase; failedErase.slots[0] = 1; failedErase.removalAllowed = false;
+  result = logs::writeWithRecovery(failedErase, 3, 4, true, [] {return logs::WriteStatus::NoSpace;});
+  assert(!result.saved && result.cleanupFailed && failedErase.has(0));
   puts("OK: shared NVS recovery, oldest-log eviction, settings preserved, sparse ring, failures, sequence wrap");
 }

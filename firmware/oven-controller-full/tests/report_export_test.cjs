@@ -81,6 +81,13 @@ if (require.main === module) (async()=>{
   const longReport={...report,recipeName:'Ricetta di collaudo prolungata con carico completo',reason:'PT100/MAX31865 in errore: uscita spenta · PT100 #2 Fault 0x4, RAW 8303 · #2: Sovra/sottotensione sugli ingressi RTD;',
     stepCount:12,steps:Array.from({length:12},(_,i)=>({...report.steps[i%3],index:i}))};
   generate(longReport,points);
+  const manualStart=measurements.length;
+  const manual={...report,operation:'manual',recipeId:'manual:session',recipeName:'Controllo manuale',outcome:'stopped',stepCount:0,completedSteps:0,steps:[]};
+  const manualPdf=generate(manual,points.map(p=>({...p,step:255,operation:'manual'})));
+  assert.equal(Buffer.from(manualPdf).subarray(0,4).toString(),'%PDF');
+  assert(measurements.slice(manualStart).some(m=>m.value==='CONTROLLO MANUALE FERMATO'));
+  assert(measurements.slice(manualStart).some(m=>m.value.includes('senza step automatici')));
+  assert(!measurements.slice(manualStart).some(m=>m.value==='0 / 0' || m.value==='Banda mantenimento'));
   generate({...report,startUtc:null,endUtc:null},[]);
   assert(measurements.every(m=>m.bottom<=289 && m.y>=10 && m.right<=195),JSON.stringify(measurements.filter(m=>m.bottom>289 || m.y<10 || m.right>195)));
   assert(measurements.some(m=>m.value.includes('max-min')));

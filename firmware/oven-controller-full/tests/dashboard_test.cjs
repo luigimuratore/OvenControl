@@ -15,7 +15,7 @@ function element() {
       toggle(name, force) { const on = force === undefined ? !classes.has(name) : force;
         if (on) classes.add(name); else classes.delete(name); return on; }},
     addEventListener(name, handler) { this.listeners[name] = handler; },
-    append(...nodes) { this.textContent += nodes.map(node => typeof node === 'string' ? node : node.textContent).join(''); }, replaceChildren() {},
+    append(...nodes) { this.textContent += nodes.map(node => typeof node === 'string' ? node : node.textContent).join(''); }, replaceChildren() { this.textContent = ''; },
     getBoundingClientRect: () => ({left: 100, top: 100, width: 600, height: 210}),
     width: 1200, height: 420, clientWidth: 1200, clientHeight: 420,
     getContext() { return new Proxy({}, {get(target, key) {
@@ -59,6 +59,26 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
 
 (async () => {
   await flush(); await flush();
+  for (const first of ['ramp','hold','cooldown']) for (const second of ['ramp','hold','cooldown']) {
+    for (const target of [50,100,150]) {
+      const program=[{id:'independent',name:'Target indipendenti',steps:[
+        {type:first,target:100,rate:1,duration:10},{type:second,target,rate:1,duration:10}]}];
+      assert.doesNotThrow(()=>run(`validateRecipes(${JSON.stringify(program)})`));
+    }
+  }
+  for (const step of [{type:'hold',target:401,duration:10},{type:'hold',target:80,duration:0},
+      {type:'ramp',target:80,rate:0},{type:'unknown',target:80,rate:1}]) {
+    assert.throws(()=>run(`validateRecipes(${JSON.stringify([{id:'invalid',name:'Valori errati',steps:[step]}])})`));
+  }
+  run('display({...latest,storage:{ready:true,dedicated:true,migrationRequired:false}})');
+  assert.equal(elements.get('storageInfo').textContent,'Dedicata · attiva');
+  assert(elements.get('storageNotice').hidden);
+  run('display({...latest,storage:{ready:true,dedicated:false,migrationRequired:true}})');
+  assert(!elements.get('storageNotice').hidden && elements.get('storageNotice').textContent.includes('USB'));
+  run('display({...latest,ready:false,storage:{ready:false,dedicated:false,migrationError:"ESP_ERR_INVALID_CRC"}})');
+  assert(!elements.get('storageNotice').hidden && elements.get('storageNotice').textContent.includes('ESP_ERR_INVALID_CRC'));
+  assert(elements.get('startBtn').disabled);
+  run('display({...latest,storage:undefined})');
   // Live/history clocks continue through millis() rollover, including reload
   // after rollover with a 64-bit uptime, and reset cleanly on a real reboot.
   run('display({...latest,bootCount:1,uptimeMs:4294967000,sampleAtMs:4294967000,uptimeTotalMs:4294967000})');
@@ -455,6 +475,56 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   assert(safetyPosts.some(([url,action])=>url === '/api/command' && action === 'emergency'));
   assert(safetyPosts.some(([url,action])=>url === '/api/command' && action === 'stop'));
   assert.equal(run('latest.emergency'), true);
+
+  // A rejected NVS write preserves drafts but never advertises them as applied.
+  const appliedPrograms=[{id:'prova-50',name:'Test carbonio',steps:[{type:'ramp',target:80,rate:1.375},{type:'hold',target:80,duration:100}]}];
+  let recipeWrites=0, savedPrograms=structuredClone(appliedPrograms), failSave=true, finishSave;
+  fetchImpl=async(url,opts)=>{
+    if(url==='/api/recipes') {
+      if(opts.method!=='POST')return response({recipes:savedPrograms});
+      ++recipeWrites;
+      if(failSave)return {ok:false,status:507,json:async()=>({error:'NVS: ESP_ERR_NVS_NOT_ENOUGH_SPACE'})};
+      return new Promise(resolve=>{finishSave=()=>{
+        savedPrograms=JSON.parse(opts.body).recipes;resolve(response({recipes:savedPrograms}));
+      };});
+    }
+    return response(url==='/api/status'?{...status,phase:'idle',ready:true,emergency:false,manual:{active:false}}:{events:[],samples:[]});
+  };
+  run('recipesDirty=false; recipeLoadBusy=false; connected=true; display({...latest,phase:"idle",ready:true,emergency:false,manual:{active:false}})');
+  await run('loadRecipes()');
+  elements.get('hardwareReady').checked=true;
+  run('recipes[0].steps.forEach(s=>s.target=90); markDirty()');
+  assert(elements.get('recipePreview').textContent.includes('80 °C'));
+  assert(!elements.get('recipePreview').textContent.includes('90 °C'));
+  await run('saveRecipes()'); await flush();
+  assert.equal(run('recipes[0].steps[0].target'),90);
+  assert.equal(run('appliedRecipes[0].steps[0].target'),80);
+  assert(elements.get('recipeMessage').textContent.includes('ESP_ERR_NVS_NOT_ENOUGH_SPACE'));
+  assert(elements.get('startBtn').disabled);
+  const requestsBeforeStart=requestCount; await run("command('start')");
+  assert.equal(requestCount,requestsBeforeStart);
+  failSave=false;
+  const saving=run('saveRecipes()'); await flush();
+  assert(run('recipeSaveBusy') && elements.get('startBtn').disabled);
+  await run('saveRecipes()'); assert.equal(recipeWrites,2); // No duplicate POST.
+  run('recipes[0].steps.forEach(s=>s.target=100); markDirty()');
+  finishSave(); await saving;
+  assert.equal(run('appliedRecipes[0].steps[0].target'),90);
+  assert.equal(run('recipes[0].steps[0].target'),100);
+  assert(run('recipesDirty')); // An edit during the request is never overwritten.
+  const savingAgain=run('saveRecipes()'); await flush(); finishSave(); await savingAgain;
+  assert.equal(run('appliedRecipes[0].steps[0].target'),100);
+  assert(!run('recipesDirty'));
+  assert(!elements.get('startBtn').disabled);
+  run('recipes[0].steps[0].target=110'); // Deep copies keep editor and applied state separate.
+  assert.equal(run('appliedRecipes[0].steps[0].target'),100);
+  let finishOldRead;
+  fetchImpl=(url,opts)=>opts.method==='POST'?Promise.resolve(response({recipes:savedPrograms})):
+    new Promise(resolve=>{finishOldRead=()=>resolve(response({recipes:appliedPrograms}));});
+  const oldRead=run('loadRecipes()'); await flush();
+  run('recipes[0].steps[1].target=110; markDirty()');
+  await run('saveRecipes()'); finishOldRead(); await oldRead;
+  assert.equal(run('appliedRecipes[0].steps[0].target'),100); // Late GET cannot replace a newer POST result.
 
   // Reads are serialized, status jumps ahead of history, and STOP bypasses reads.
   await flush();

@@ -37,4 +37,22 @@ int main(){
   char utf8[5];copyUserText(utf8,sizeof(utf8),"èèè");assert(std::string(utf8)=="èè");
   char small[4];copyUserText(small,sizeof(small),"🔥");assert(!small[0]);
   assert(modeIndex("essenziale")==0&&modeIndex("sintetica")==1&&modeIndex("dettagliata")==2&&modeIndex("bad")==-1);
+  Users compact; compact.begin(42,Mode::Essential);
+  assert(storedUsersBytes(compact)==104 && sizeof(Users)==776);
+  assert(decodeUsers(&compact,storedUsersBytes(compact),42,restored) && restored.count()==1);
+  assert(decodeUsers(&compact,sizeof(compact),42,restored)); // Previous full-size records remain readable.
+  guest.chat=77;guest.mode=uint8_t(Mode::Detailed);assert(compact.add(guest));
+  assert(storedUsersBytes(compact)==200);
+  assert(decodeUsers(&compact,storedUsersBytes(compact),42,restored));
+  assert(restored.find(77)==1 && restored.entries[1].mode==uint8_t(Mode::Detailed));
+  const auto before=restored;
+  for(size_t n:{size_t(0),size_t(8),size_t(103),size_t(199),sizeof(Users)+1}) {
+    assert(!decodeUsers(&compact,n,42,restored) && !memcmp(&before,&restored,sizeof(before)));
+  }
+  assert(!decodeUsers(&compact,storedUsersBytes(compact),43,restored));
+  compact.entries[7]=compact.entries[1];compact.entries[7].chat=88;
+  assert(storedUsersBytes(compact)==sizeof(Users));
+  assert(decodeUsers(&compact,storedUsersBytes(compact),42,restored) && restored.find(88)==7);
+  assert(compact.remove(88) && compact.remove(77) && storedUsersBytes(compact)==104);
+  assert(decodeUsers(&compact,storedUsersBytes(compact),42,restored) && restored.find(88)<0 && restored.find(77)<0);
 }

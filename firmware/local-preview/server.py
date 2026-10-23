@@ -51,7 +51,6 @@ def validate_recipes(recipes):
         require(isinstance(name, str) and bool(name.strip()) and len(name.encode("utf-8")) <= 48, "Nome programma non valido")
         require(isinstance(steps, list) and 1 <= len(steps) <= 12, "Servono 1–12 step")
         ids.add(ident)
-        previous = None
         for s in steps:
             require(isinstance(s, dict), "Step non valido")
             kind, target = s.get("type"), s.get("target")
@@ -60,10 +59,6 @@ def validate_recipes(recipes):
                 require(type(s.get("duration")) is int and 1 <= s["duration"] <= 360, "Hold: 1–360 minuti interi")
             else:
                 require(number(s.get("rate"), .1, 1e30), "Rate minimo: 0,1 °C/min")
-            if previous is not None:
-                require((kind == "ramp" and target > previous) or (kind == "cooldown" and target < previous) or
-                        (kind == "hold" and abs(target - previous) <= .1), "Sequenza target non coerente")
-            previous = target
 
 
 class DemoDevice:
@@ -160,12 +155,14 @@ class DemoDevice:
             sensors=[dict(validSamples=0, startC=None, endC=None, minC=None, maxC=None) for _ in range(2)])
 
     def begin_report(self):
-        self.report_work = dict(version=3, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
-            key="", recipeId=self.active["id"], recipeName=self.active["name"], outcome="", reason="",
+        manual = self.operation == "manual"
+        steps = [] if manual else self.active["steps"]
+        self.report_work = dict(operation="manual" if manual else "program", version=3, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
+            key="", recipeId="manual:session" if manual else self.active["id"], recipeName="Controllo manuale" if manual else self.active["name"], outcome="", reason="",
             startUptimeMs=int(self.now * 1000), endUptimeMs=None, startUtc=None, endUtc=None,
-            durationMs=0, activeMs=0, pausedMs=0, pauseCount=0, completedSteps=0, stepCount=len(self.active["steps"]),
+            durationMs=0, activeMs=0, pausedMs=0, pauseCount=0, completedSteps=0, stepCount=len(steps),
             settings={**self.pid, **self.control}, stats=self.report_stats(), steps=[])
-        for index, step in enumerate(self.active["steps"]):
+        for index, step in enumerate(steps):
             self.report_work["steps"].append(dict(index=index, type=step["type"], target=step["target"],
                 rate=step.get("rate", 0), durationMin=step.get("duration", 0), started=index == 0,
                 completed=False, activeMs=0, pausedMs=0, holdInBandMs=0, stats=self.report_stats()))
@@ -178,14 +175,17 @@ class DemoDevice:
         ms = round(dt * 1000)
         self.report_work[key] += ms
         self.report_work["durationMs"] += ms
-        self.report_work["steps"][self.step_index][key] += ms
+        if self.report_work["steps"]:
+            self.report_work["steps"][self.step_index][key] += ms
 
     def observe_report(self):
         if not self.report_work:
             return
         a, b = self.sensors()
-        step = self.report_work["steps"][self.step_index]
-        for stats in (self.report_work["stats"], step["stats"]):
+        manual = self.report_work.get("operation") == "manual"
+        step = None if manual else self.report_work["steps"][self.step_index]
+        stats_list = [self.report_work["stats"]] + ([] if manual else [step["stats"]])
+        for stats in stats_list:
             stats["samples"] += 1
             stats["invalidPairs"] += int(not a["valid"] or not b["valid"])
             for sensor, value in zip(stats["sensors"], (a, b)):
@@ -200,7 +200,8 @@ class DemoDevice:
                 continue
             delta = abs(a["c"] - b["c"])
             stats["maxDeltaC"] = max(delta, stats["maxDeltaC"] or 0)
-            if self.phase != "running" or step["type"] == "cooldown" or self.target is None:
+            cooling = self.cooling_control() or self.manual_cooldown_complete if manual else step["type"] == "cooldown"
+            if self.phase != "running" or cooling or self.target is None:
                 continue
             mean = (a["c"] + b["c"]) / 2
             stats["trackingSamples"] += 1
@@ -216,6 +217,9 @@ class DemoDevice:
         if outcome == "fault":
             self.save_fault_resume()
         r = self.report_work
+        if r.get("operation") == "manual":
+            r["durationMs"] = max(0, round(self.now * 1000) - r["startUptimeMs"])
+            r["activeMs"] = max(0, r["durationMs"] - r["pausedMs"])
         if outcome == "fault":
             self.last_cycle_error = reason
         if self.step_index < len(r["steps"]):
@@ -312,19 +316,21 @@ class DemoDevice:
         self.step_at += waiting
         if self.operation == "manual":
             self.manual_blocked_time += waiting
-        elif self.report_work:
+        if self.report_work:
             self.report_work["pausedMs"] += round(waiting*1000)
             self.report_work["durationMs"] += round(waiting*1000)
             self.report_work["pauseCount"] += int(not saved["paused"])
-            self.report_work["steps"][self.step_index]["pausedMs"] += round(waiting*1000)
+            if self.report_work["steps"]:
+                self.report_work["steps"][self.step_index]["pausedMs"] += round(waiting*1000)
         self.phase,self.fault,self.fault_resume = "running","",None
         self.was_in_band = False
         self.duty,self.relay = 0.0,False
         self.record()
 
     def end_manual(self, phase="idle", record=True):
-        if phase == "fault":
-            self.save_fault_resume()
+        self.observe_report()
+        self.finish_report("fault" if phase == "fault" else "stopped",
+                           self.fault if phase == "fault" else "Controllo manuale fermato dall'operatore")
         self.manual_ended = self.now
         self.manual_mode, self.manual_cooling = "idle", False
         self.phase, self.target, self.duty, self.relay = phase, None, 0.0, False
@@ -376,6 +382,8 @@ class DemoDevice:
         self.manual_cooldown_complete = False
         self.manual_cooling = self.temperature + .2 > target + 1 or self.target > target + 1
         self.duty, self.relay = 0.0, False
+        if action == "start":
+            self.begin_report()
         self.record(marker=16 if action == "start" else 0)
         self.log("MANUALE", ("Manuale avviato: target " if action == "start" else "Target manuale modificato: ") + str(target) + " °C · rate " + str(rate) + " °C/min")
         return self.status()
@@ -408,6 +416,7 @@ class DemoDevice:
 
     def advance_full(self, dt):
         if self.manual_mode != "idle":
+            self.account_report(dt)
             self.duty, self.relay = 0.0, False
             movement = self.manual_rate * dt / 60
             self.target = min(self.manual_target, self.target + movement) if self.target < self.manual_target else max(self.manual_target, self.target - movement)
@@ -427,6 +436,7 @@ class DemoDevice:
                 self.end_manual("fault")
                 self.log("ALLARME", self.fault)
                 return
+            self.observe_report()
             self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
             return
         if self.phase in ("running", "paused"):
@@ -641,6 +651,7 @@ class DemoDevice:
             require(type(body.get("missing")) is bool, "Stato sonda non valido")
             self.missing = body["missing"]
             if self.mode == "full" and self.missing and self.phase in ("running", "paused"):
+                self.fault = "Fault PT100 simulato"
                 if self.operation == "manual":
                     self.end_manual("fault", record=False)
                 self.observe_report()

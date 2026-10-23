@@ -79,6 +79,9 @@ int main() {
   assert(!rampDone(ramp175, NAN, endOfRamp, 173.759f, 174.7651f, &hold175));
   const Step differentHold{Type::Hold, 180, 0, 60};
   assert(!rampToHold(ramp175, &differentHold));
+  assert(rampDone(ramp175, 25, endOfRamp, 174, 175, &differentHold));
+  assert(setpoint(differentHold, 175, 0) == 180); // Hold uses its own independent target.
+  assert(!inBand(174, 175, differentHold.target)); // Its timer waits for both probes.
   assert(!rampToHold(ramp175, &cool));
   assert(!rampDone(ramp175, 25, endOfRamp, 173.759f, 174.7651f, &differentHold));
   // Entry starts a new timer: the entire preceding ramp is excluded.

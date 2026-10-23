@@ -89,7 +89,9 @@ class FaultResumePreviewTest(unittest.TestCase):
         self.assertEqual((s['manual']['targetC'],s['manual']['rateCMin']),(175,2))
         self.assertEqual(s['manual']['elapsedSec'],10)
         self.assertEqual(d.target,reference)
-        self.assertIsNone(d.last_report)
+        self.assertEqual(d.last_report['outcome'],'fault')
+        self.assertEqual(d.last_report['operation'],'manual')
+        self.assertEqual(d.report_work['pausedMs'],60000)
         d.advance(1);self.assertEqual(d.status()['manual']['elapsedSec'],11)
 
     def test_paused_program_resumes_and_changed_settings_invalidate_checkpoint(self):

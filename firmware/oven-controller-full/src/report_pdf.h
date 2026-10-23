@@ -25,6 +25,10 @@ inline const char *outcome(reports::Outcome value) {
   return value == reports::Outcome::Completed ? "CICLO COMPLETATO" :
          value == reports::Outcome::Fault ? "CICLO IN ALLARME" : "CICLO FERMATO";
 }
+inline const char *outcome(const reports::Snapshot &report) {
+  return reports::isManual(report) ? (report.outcome == reports::Outcome::Fault ?
+    "CONTROLLO MANUALE IN ALLARME" : "CONTROLLO MANUALE FERMATO") : outcome(report.outcome);
+}
 inline void duration(uint32_t ms, char *out, size_t size) {
   const unsigned seconds = ms / 1000;
   snprintf(out, size, "%02u:%02u:%02u", seconds / 3600, seconds / 60 % 60, seconds % 60);
@@ -155,11 +159,11 @@ public:
     object(streamId); put("<< /Length "); lengthAt = used; put("0000000000 >>\nstream\n"); contentAt = used;
     put("0.957 0.969 0.980 rg 0 0 595 842 re f\n1 1 1 rg 0 732 595 110 re f\n");
     line(0,2,595,2,"0.22 0.48 0.66",4);
-    text(44, 38, "OVEN CONTROLLER / REPORT DI CICLO", 9, true);
+    text(44, 38, reports::isManual(r) ? "OVEN CONTROLLER / REPORT MANUALE" : "OVEN CONTROLLER / REPORT DI CICLO", 9, true);
     wrap(44, 76, title, 48, 18, false);
     line(44, 109, 551, 109);
-    char footer[150]; snprintf(footer, sizeof(footer), "Ciclo %u-%u-%u  |  Telegram  |  %u / %u",
-      unsigned(r.boot), unsigned(r.startMs), unsigned(r.endMs), pages, total);
+    char footer[150]; snprintf(footer, sizeof(footer), "%s %u-%u-%u  |  Telegram  |  %u / %u",
+      reports::isManual(r) ? "Sessione" : "Ciclo", unsigned(r.boot), unsigned(r.startMs), unsigned(r.endMs), pages, total);
     line(44, 798, 551, 798); text(44, 815, footer, 8);
   }
   void endPage() {
@@ -273,18 +277,20 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
   w.panel(34, 194, 527, 89, "0.925 0.957 0.992");
   w.panel(34, 296, 527, 417);
   w.panel(34, 721, 527, 61, "0.941 0.953 0.969");
-  w.text(44, 141, outcome(r.outcome), 12, true);
+  const bool manual = reports::isManual(r);
+  w.text(44, 141, outcome(r), 12, true);
   w.wrap(44, 162, r.reason, 96, 9);
   date(r.startUtc, a, sizeof(a)); w.pair(44, 205, "Inizio / ora italiana", a);
   date(r.endUtc, a, sizeof(a)); w.pair(308, 205, "Fine / ora italiana", a);
   duration(uint32_t(r.endMs - r.startMs), a, sizeof(a)); w.pair(44, 248, "Durata totale, incluse pause", a);
-  snprintf(a, sizeof(a), "%u / %u", r.completedSteps, r.stepCount); w.pair(308, 248, "Fasi completate", a);
-  w.text(44, 310, "ANDAMENTO COMPLETO DEL CICLO", 11, true);
+  snprintf(a, sizeof(a), "%u / %u", r.completedSteps, r.stepCount);
+  w.pair(308, 248, manual ? "Tipo di controllo" : "Fasi completate", manual ? "Manuale / target variabile" : a);
+  w.text(44, 310, manual ? "ANDAMENTO DELLA SESSIONE MANUALE" : "ANDAMENTO COMPLETO DEL CICLO", 11, true);
   chart(w, points, count, r.startMs, uint32_t(r.endMs - r.startMs), 353, 609, true, a, sizeof(a), yield);
-  snprintf(a, sizeof(a), "%u campioni. %s", unsigned(count), partial ? "Curva parziale: alcuni campioni non disponibili." : "Curva acquisita durante ciclo e pause.");
+  snprintf(a, sizeof(a), "%u campioni. %s", unsigned(count), partial ? "Curva parziale: alcuni campioni non disponibili." : manual ? "Curva acquisita durante la sessione." : "Curva acquisita durante ciclo e pause.");
   w.wrap(44, 684, a, 96, 9);
-  w.wrap(44, 741, "Le pagine seguenti separano tempi, regolazione, temperature e precisione. Ogni fase ha una pagina con il proprio grafico e scala adattata ai suoi dati.", 96, 9);
-  w.page("Riepilogo / dati del ciclo", r, pages);
+  w.wrap(44, 741, manual ? "La curva include i cambi di target e il cooldown. Il riepilogo seguente mostra tempi, regolazione, temperature e precisione della sessione; non sono previsti step automatici." : "Le pagine seguenti separano tempi, regolazione, temperature e precisione. Ogni fase ha una pagina con il proprio grafico e scala adattata ai suoi dati.", 96, 9);
+  w.page(manual ? "Riepilogo / controllo manuale" : "Riepilogo / dati del ciclo", r, pages);
   w.panel(34, 125, 527, 113, "0.925 0.957 0.992");
   w.panel(34, 247, 527, 147, "0.925 0.976 0.957");
   w.panel(34, 402, 527, 149, "0.941 0.953 0.984");
@@ -298,10 +304,12 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
   statsPairs(w, r.stats, 282, r.version >= 3);
   w.text(44, 420, "PRECISIONE DELLA MEDIA E COMANDO PID", 10, true);
   w.text(44, 580, "COME LEGGERE I DATI", 10, true);
-  w.wrap(44, 604, r.version >= 3 ?
+  w.wrap(44, 604, manual ?
+    "Errore, superamento e ritardo confrontano la media PT100 con il setpoint istantaneo. Questi indici e il PID medio usano solo campioni validi di regolazione attiva, escluse discesa, cooldown e attesa dopo allarme." : r.version >= 3 ?
     "Errore medio: distanza media dal target. Superamento: massimo della media PT100 sopra il target. Ritardo: massimo della media sotto il target. Questi indici e il PID medio usano solo rampa e mantenimento attivi, escluse pause e cooldown." :
     "Report precedente: il superamento usa la sonda più calda. Errore e ritardo usano la media. Gli indici e il comando medio escludono pause e cooldown.", 96, 9);
-  snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C. Temperature e differenza sonde comprendono le pause. Campioni non validi interrompono la curva; il comando non misura potenza o energia elettrica.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
+  if (manual) snprintf(a, sizeof(a), "Temperature e differenza sonde comprendono tutta la sessione acquisita. Target e durata sono decisi dall'operatore, senza conteggio hold. L'attesa dopo un allarme è conteggiata come pausa. Il comando non misura potenza o energia elettrica.");
+  else snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C. Temperature e differenza sonde comprendono le pause. Campioni non validi interrompono la curva; il comando non misura potenza o energia elettrica.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
   w.wrap(44, 680, a, 96, 9);
   for (unsigned i = 0; i < r.stepCount; ++i) {
     const auto &s = r.steps[i]; const auto range = stepRange(r, i);

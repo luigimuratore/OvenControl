@@ -1,5 +1,6 @@
 """Exercise manual workflows through the preview API, without physical outputs."""
 import unittest
+from unittest.mock import patch
 from test_telegram_tool import preview, tool
 
 
@@ -79,14 +80,24 @@ class ManualPreviewTest(unittest.TestCase):
         self.device.advance_full(1)
         self.assertGreater(self.device.duty, 0)
 
-    def test_manual_stop_preserves_previous_program_report(self):
+    def test_manual_stop_creates_report_and_preserves_previous_until_session_ends(self):
         previous = {"key": "previous", "durationMs": 12300}
         self.device.last_report = previous
         self.start()
+        self.assertIs(self.device.last_report, previous)
+        self.device.advance(10)
         self.command("stop")
         self.assertFalse(self.device.status()["manual"]["active"])
         self.assertFalse(self.device.relay)
-        self.assertIs(self.device.last_report, previous)
+        report = self.device.last_report
+        self.assertEqual(report['operation'], 'manual')
+        self.assertEqual(report['recipeName'], 'Controllo manuale')
+        self.assertEqual(report['outcome'], 'stopped')
+        self.assertEqual(report['activeMs'], 10000)
+        self.assertEqual(report['steps'], [])
+        self.assertGreater(report['stats']['samples'], 0)
+        self.command('stop')
+        self.assertIs(self.device.last_report, report)
         self.assertIsNone(self.device.report_work)
 
     def test_program_test_and_settings_cannot_overlap_manual(self):
@@ -103,7 +114,7 @@ class ManualPreviewTest(unittest.TestCase):
         with self.assertRaises(preview.ApiError):
             self.start()
 
-    def test_fault_and_emergency_stop_manual_without_report_or_auto_resume(self):
+    def test_fault_and_emergency_stop_manual_with_report_without_auto_resume(self):
         for event in ("emergency", "probe", "overtemperature"):
             self.setUp()
             self.start()
@@ -117,10 +128,38 @@ class ManualPreviewTest(unittest.TestCase):
             self.assertEqual(self.device.phase, "fault")
             self.assertFalse(self.device.status()["manual"]["active"])
             self.assertFalse(self.device.relay)
-            self.assertIsNone(self.device.last_report)
+            self.assertEqual(self.device.last_report['operation'], 'manual')
+            self.assertEqual(self.device.last_report['outcome'], 'fault')
+            self.assertTrue(self.device.last_report['reason'])
             with self.assertRaises(preview.ApiError):
                 self.manual("target", targetC=50)
         self.assertFalse(preview.DemoDevice("full").status()["manual"]["active"])
+
+    def test_manual_pdf_is_captured_once_with_target_changes_and_cooldown(self):
+        watcher = tool.PreviewReports(self.device.status())
+        self.start(50)
+        self.device.advance(10)
+        self.manual('target', targetC=70)
+        self.device.advance(10)
+        self.manual('cooldown', targetC=20)
+        self.device.advance(10)
+        self.manual('stop')
+        report = self.device.last_report
+        self.assertEqual((report['durationMs'], report['stepCount']), (30000, 0))
+        def local(base, endpoint):
+            from urllib.parse import urlsplit, parse_qs
+            url = urlsplit(endpoint)
+            return self.device.request('GET', url.path, parse_qs(url.query))
+        with patch.object(tool, 'local_json', side_effect=local), patch.object(tool, 'preview_pdf', return_value=b'%PDF-manual') as pdf:
+            key, document = watcher.capture('unused', self.device.status())
+            self.assertTrue(document['filename'].startswith('Stopped_Controllo_manuale_'))
+            self.assertIn('controllo manuale', document['caption'])
+            self.assertEqual(pdf.call_args.args[0]['operation'], 'manual')
+            self.assertTrue(all(p['step'] == 255 for p in pdf.call_args.args[1]))
+            watcher.last = key
+            self.command('stop')
+            self.assertIsNone(watcher.capture('unused', self.device.status()))
+            pdf.assert_called_once()
 
     def test_invalid_targets_and_missing_hardware_confirmation_do_not_start(self):
         for target in (-1, 401, True, None, "100", float("nan"), float("inf")):

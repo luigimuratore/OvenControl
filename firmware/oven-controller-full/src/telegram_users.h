@@ -1,5 +1,6 @@
 #pragma once
 #include "telegram_policy.h"
+#include <cstddef>
 #include <cstdio>
 
 namespace telegram {
@@ -54,6 +55,20 @@ struct Users {
     const int i=find(chat);if(i<0||!validMode(mode))return false;entries[i].mode=uint8_t(mode);return true;
   }
 };
+// Preserve the existing layout, but stop reserving flash for unused trailing
+// slots. Holes stay in place; the owner's slot and per-user modes never move.
+inline size_t storedUsersBytes(const Users &users) {
+  size_t slots = kMaxUsers;
+  while (slots > 1 && !users.entries[slots - 1].chat) --slots;
+  return offsetof(Users, entries) + slots * sizeof(User);
+}
+inline bool decodeUsers(const void *blob, size_t length, int64_t owner, Users &out) {
+  constexpr size_t start = offsetof(Users, entries);
+  if (!blob || length < start + sizeof(User) || length > sizeof(Users) || (length - start) % sizeof(User)) return false;
+  Users candidate{}; memcpy(&candidate, blob, length);
+  if (!candidate.valid(owner)) return false;
+  out = candidate; return true;
+}
 struct Join { User user; uint32_t created=0; };
 template<class Save>
 bool commitUsers(Users &current,const Users &proposed,Save save){

@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include "profile.h"
 
 namespace reports {
@@ -56,6 +57,9 @@ struct Snapshot {
   Stats stats;
   StepResult steps[kMaxSteps];
 };
+// ':' is rejected in program IDs: manual sessions cannot collide with a program.
+constexpr const char *kManualId = "manual:session";
+inline bool isManual(const Snapshot &report) { return std::strcmp(report.recipeId, kManualId) == 0; }
 // Main-loop only. Time accounting is independent of sample rate and ring history.
 class Recorder {
  public:
@@ -68,6 +72,11 @@ class Recorder {
     for (size_t i = 0; i < data.stepCount; ++i) data.steps[i].requested = steps[i];
     if (active) data.steps[0].started = true;
   }
+  void beginManual(uint32_t now) {
+    begin(now, nullptr, 0); active = true;
+    std::strcpy(data.recipeId, kManualId);
+    std::strcpy(data.recipeName, "Controllo manuale");
+  }
   void account(uint32_t now) {
     if (!active) return;
     const uint32_t dt = uint32_t(now - previousAt); previousAt = now;
@@ -79,12 +88,13 @@ class Recorder {
     account(now); if (value) ++data.pauseCount; paused = value;
   }
   void observe(uint32_t now, float first, float second, bool validFirst, bool validSecond,
-               float reference, float duty) {
-    if (!active || step >= data.stepCount) return;
+               float reference, float duty, bool descending = false) {
+    const bool manual = isManual(data);
+    if (!active || (!manual && step >= data.stepCount)) return;
     account(now);
-    const bool tracking = !paused && data.steps[step].requested.type != profile::Type::Cooldown;
+    const bool tracking = !paused && (manual ? !descending : data.steps[step].requested.type != profile::Type::Cooldown);
     data.stats.observe(first, second, validFirst, validSecond, tracking, reference, duty, data.maxPower);
-    data.steps[step].stats.observe(first, second, validFirst, validSecond, tracking, reference, duty, data.maxPower);
+    if (!manual) data.steps[step].stats.observe(first, second, validFirst, validSecond, tracking, reference, duty, data.maxPower);
   }
   void advance(uint32_t now, uint32_t holdInBandMs) {
     if (!active || step >= data.stepCount) return;
@@ -99,7 +109,7 @@ class Recorder {
     data.endMs = now; data.outcome = outcome; active = false;
     return true;
   }
-  bool canContinue() const { return !active && data.outcome == Outcome::Fault && step < data.stepCount; }
+  bool canContinue() const { return !active && data.outcome == Outcome::Fault && (isManual(data) || step < data.stepCount); }
   bool continueAfterFault(uint32_t now) {
     if (!canContinue()) return false;
     // Keep the complete report and phase timing coherent: the blocked interval

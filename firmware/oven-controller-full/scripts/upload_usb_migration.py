@@ -126,11 +126,37 @@ def verify(before, recipes, authorized, after, applied, restored):
         raise RuntimeError("Programmi/utenti diversi dal backup: non avviare il forno.")
 
 
+def verify_backup(directory, ip):
+    """Finish a timed-out verification without USB, reboot or flash writes."""
+    directory = Path(directory)
+    manifest = json.loads((directory / "manifest.json").read_text())
+    backup = directory / "flash-originale-16MB.bin"
+    if manifest.get("version") != VERSION or backup.stat().st_size != FLASH_BYTES or sha(backup) != manifest.get("backupSha256"):
+        raise RuntimeError("Backup incompleto, versione diversa o hash non valido.")
+    snapshot = json.loads((directory / "configurazione-prima.json").read_text())
+    before = snapshot["status"]
+    after = get(ip, "/api/status")
+    expected_mac = before.get("stationMac", "").lower()
+    if not expected_mac or expected_mac != after.get("stationMac", "").lower():
+        raise RuntimeError("L'ESP raggiunto non corrisponde al backup.")
+    verify(before, snapshot["programs"], snapshot["telegram"], after,
+           get(ip, "/api/recipes"), get(ip, "/api/telegram/users"))
+    print(f"Verificato: {VERSION}, NVS dedicata attiva, Programmi/utenti/impostazioni conservati, uscita spenta.")
+    print(f"Programmi: {len(snapshot['programs']['recipes'])}; utenti: {len(users(snapshot['telegram']))}.")
+    storage = after["storage"]
+    print(f"NVS: {storage.get('freeEntries', '?')} entry libere su {storage.get('totalEntries', '?')}.")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--port", required=True, help="Porta USB dell'ESP oppure auto sul Mac con una sola scheda collegata")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--port", help="Porta USB dell'ESP oppure auto sul Mac con una sola scheda collegata")
+    action.add_argument("--verify-backup", type=Path, help="Solo verifica HTTP rispetto a un backup esistente; nessun upload o reset")
     parser.add_argument("--ip", default="192.168.1.190")
     args = parser.parse_args(argv)
+    if args.verify_backup is not None:
+        return verify_backup(args.verify_backup, args.ip)
     args.port = usb_port(args.port)
     files = artifacts()
     hashes = {name: sha(path) for name, path in files.items()}
@@ -192,7 +218,9 @@ def main(argv=None):
         except (OSError, ValueError) as error:
             last_error = str(error)
         time.sleep(2)
-    raise RuntimeError(f"Verifica finale non conclusa: {last_error}. Backup disponibile in {directory}.")
+    raise RuntimeError(f"Firmware scritto e verificato; controllo via rete non concluso: {last_error}. "
+                       f"Backup disponibile in {directory}. Non ripetere l'upload: verifica Wi-Fi/IP e completa "
+                       "il controllo con --verify-backup e --ip, anche da 192.168.4.1 sulla rete diretta.")
 
 
 if __name__ == "__main__":

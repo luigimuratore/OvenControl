@@ -103,6 +103,16 @@ Solo sul vecchio layout viene inizializzata l'area che prima apparteneva alla co
 
 Dopo il riavvio aggiorna la dashboard con **⌘⇧R**: **Memoria salvataggi** deve indicare **Dedicata · attiva**. `/api/status.storage` deve mostrare `partition: "oven_nvs"`, `dedicated: true`, `migrationRequired: false`. Prova ad aggiungere un Programma e autorizzare un utente, poi riavvia a controllo fermo e verifica che siano conservati. Da quel momento si torna alla normale procedura OTA; la memoria dedicata resta persistente tra gli aggiornamenti.
 
+**Se compare «Hash of data verified» ma la verifica finale dà «Host is down»:** la scrittura USB è completata, mentre l'avvio e la conservazione dei dati non sono ancora confermati. Prima controlla la connessione del Mac al Wi-Fi del capannone e l'IP del forno. Puoi anche collegarti a `OvenController-Full` e aprire `http://192.168.4.1/`. Se il forno è ancora fermo e non compare nemmeno la rete diretta, premi una volta **RST/EN**, senza tenere premuto BOOT, e attendi circa 30 secondi. Su ESP32-S3 il reset tramite USB può lasciare la scheda in modalità di programmazione: è una possibilità documentata da [Espressif](https://docs.espressif.com/projects/esptool/en/release-v4/esp32s3/esptool/advanced-options.html#reset-after-operation), da distinguere da un IP cambiato o da un errore all'avvio.
+
+Appena la dashboard torna raggiungibile, completa **solo la verifica**, senza USB, reset o nuove scritture flash, usando la cartella del backup stampata durante l'installazione:
+
+```bash
+python3 scripts/upload_usb_migration.py --verify-backup "output/usb-backups/DATA-ORA" --ip 192.168.4.1
+```
+
+Sostituisci `DATA-ORA` con la cartella effettiva; sulla rete del capannone usa l'IP attuale dell'ESP al posto di `192.168.4.1`. Questo comando confronta versione, identità, NVS dedicata, Programmi, utenti e impostazioni con il backup. Se la rete diretta continua a non comparire, acquisisci il log seriale a 115200 baud per capire dove si arresta l'avvio; non ripetere l'upload o il ripristino prima della diagnosi.
+
 **Recupero solo se un'installazione USB si interrompe e la scheda non riparte:** il file `flash-originale-16MB.bin` permette di riportare firmware e dati esattamente al momento del backup. Il ripristino sostituisce anche le modifiche successive a quel backup, quindi non usarlo come normale aggiornamento. Con il controllo fermo e la porta USB corretta, verifica prima l'hash del file rispetto a `backupSha256` nel `manifest.json` della stessa cartella:
 
 ```bash

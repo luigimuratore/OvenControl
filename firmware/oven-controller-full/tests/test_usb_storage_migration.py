@@ -3,6 +3,7 @@ import copy
 import hashlib
 import importlib.util
 import io
+import json
 from pathlib import Path
 import struct
 import subprocess
@@ -140,6 +141,32 @@ class UsbStorageMigrationTest(unittest.TestCase):
             with self.assertRaises(RuntimeError): usb.verify(before, recipes, authorized, changed, recipes, authorized)
         with self.assertRaises(RuntimeError): usb.verify(before, recipes, authorized, after, dict(recipes=[]), authorized)
         with self.assertRaises(RuntimeError): usb.verify(before, recipes, authorized, after, recipes, dict(users=[]))
+
+    def test_verify_only_never_calls_usb_or_writes_flash(self):
+        with tempfile.TemporaryDirectory(prefix="oven-verify-only-") as directory:
+            directory = Path(directory)
+            image = directory / "flash-originale-16MB.bin"; image.write_bytes(b"\xff" * usb.FLASH_BYTES)
+            (directory / "manifest.json").write_text(json.dumps(dict(version=usb.VERSION, backupSha256=usb.sha(image))))
+            before = self.state()
+            recipes = dict(recipes=[dict(id="test", target=80)])
+            authorized = dict(users=[dict(chatId="42", mode="essenziale")])
+            (directory / "configurazione-prima.json").write_text(json.dumps(dict(status=before, programs=recipes, telegram=authorized)))
+            after = dict(before, firmware=usb.VERSION, storage=dict(dedicated=True, freeEntries=7900, totalEntries=8064))
+            def get(ip, path):
+                self.assertEqual(ip, "192.168.4.1")
+                return after if path == "/api/status" else recipes if path == "/api/recipes" else authorized
+            with patch.object(usb, "get", side_effect=get) as requests, \
+                 patch.object(usb.subprocess, "run", side_effect=AssertionError("USB vietato")), \
+                 patch.object(usb, "artifacts", side_effect=AssertionError("Nessuna compilazione necessaria")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(usb.main(["--verify-backup", str(directory), "--ip", "192.168.4.1"]), 0)
+                self.assertEqual(requests.call_count, 3)
+                after["stationMac"] = "00:00:00:00:00:00"
+                with self.assertRaises(RuntimeError): usb.main(["--verify-backup", str(directory), "--ip", "192.168.4.1"])
+                requests.reset_mock()
+                image.write_bytes(b"incompleto")
+                with self.assertRaises(RuntimeError): usb.main(["--verify-backup", str(directory)])
+                requests.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()

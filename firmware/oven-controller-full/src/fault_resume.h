@@ -29,8 +29,10 @@ struct FaultResume {
   }
   bool safePair(float first, bool firstValid, float second, bool secondValid,
                 const thermal::ProtectionSettings &settings = thermal::ProtectionSettings{}) const {
-    return available && thermal::healthyPair(first, firstValid, second, secondValid) &&
-      !thermal::probeDeltaExceeded(first,second,settings) && !thermal::meanOvershootExceeded(first, second, reference, settings, cooling);
+    const thermal::Readings values(first,firstValid,second,secondValid);
+    return available && values.healthy() &&
+      !(values.count == 2 && thermal::probeDeltaExceeded(first,second,settings)) &&
+      !thermal::meanOvershootExceeded(values.mean,values.mean,reference,settings,cooling);
   }
   bool restore(const profile::Step &requested, uint32_t now, float &startC,
                uint32_t &segmentStarted, uint32_t &elapsedBefore, profile::HoldTimer &timer) const {

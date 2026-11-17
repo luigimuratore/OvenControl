@@ -22,12 +22,12 @@ int main() {
   assert(d.activeMs == 6500 && d.pausedMs == 1500 && d.pauseCount == 1);
   assert(d.completedSteps == 3 && d.steps[0].activeMs == 2500 && d.steps[0].pausedMs == 1500);
   assert(d.steps[1].activeMs == 2000 && d.steps[1].holdInBandMs == 500);
-  assert(d.stats.samples == 6 && d.stats.invalidPairs == 1 && d.stats.trackingSamples == 3);
+  assert(d.stats.samples == 6 && d.stats.invalidPairs == 1 && d.stats.trackingSamples == 4);
   assert(d.stats.valid[0] == 6 && d.stats.valid[1] == 5);
   assert(d.stats.maxOvershoot == 2 && d.stats.maxLag == 4);
   assert(d.steps[0].stats.maxOvershoot == 2 && d.steps[1].stats.maxOvershoot == 0);
   assert(d.stats.maxDelta == 2 && d.stats.saturatedSamples == 1);
-  assert(d.stats.absoluteErrorSum == 6 && d.stats.dutySum == 60);
+  assert(std::fabs(d.stats.absoluteErrorSum - 6.4) < .0001 && d.stats.dutySum == 80);
   assert(d.stats.high[0] == 100 && d.steps[2].stats.trackingSamples == 0);
   assert(!r.finish(10000, reports::Outcome::Stopped, 0));
   r.observe(11000, 200, 200, true, true, 50, 100); assert(d.stats.samples == 6);
@@ -46,9 +46,9 @@ int main() {
   assert(r.data.activeMs == 200 && r.data.stats.maxOvershoot == 13 && r.data.completedSteps == 0);
   assert(!r.data.steps[1].started);
   reports::Recorder reboot; assert(!reboot.active && reboot.data.outcome == reports::Outcome::None);
-  assert(reports::kVersion == 3);
-  assert(!reports::supportedVersion(0) && !reports::supportedVersion(4));
-  for (unsigned version = 1; version <= 3; ++version) assert(reports::supportedVersion(version));
+  assert(reports::kVersion == 4);
+  assert(!reports::supportedVersion(0) && !reports::supportedVersion(5));
+  for (unsigned version = 1; version <= 4; ++version) assert(reports::supportedVersion(version));
   // A single hot probe must not inflate the overshoot of the regulated mean.
   reports::Stats asymmetric;
   asymmetric.observe(179.22f, 170.78f, true, true, true, 175, 20, 60);
@@ -56,6 +56,6 @@ int main() {
   asymmetric.observe(179.22f, 174.78f, true, true, true, 175, 20, 60);
   assert(asymmetric.maxOvershoot == 2);
   asymmetric.observe(190, NAN, true, false, true, 175, 20, 60);
-  assert(asymmetric.maxOvershoot == 2 && asymmetric.invalidPairs == 1);
+  assert(asymmetric.maxOvershoot == 15 && asymmetric.invalidPairs == 1);
   std::cout << "OK: cycle/step times, pauses, hold, invalid probes, PID metrics, cooldown exclusion, STOP/fault, wrap, reset\n";
 }

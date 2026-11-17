@@ -16,8 +16,10 @@ class FaultResumePreviewTest(unittest.TestCase):
         return d
 
     def fault(self,d):
-        d.request('POST','preview-sensor',body=dict(missing=True))
-        d.request('POST','preview-sensor',body=dict(missing=False))
+        d.request('POST','preview-sensor',body=dict(missing=True,both=True))
+        d.now += 20
+        d.advance_full(20)
+        d.request('POST','preview-sensor',body=dict(missing=False,both=True))
         self.assertEqual(d.phase,'fault')
         self.assertFalse(d.relay)
 
@@ -42,7 +44,7 @@ class FaultResumePreviewTest(unittest.TestCase):
         d.temperature=175
         self.command(d,'resetContinue')
         self.assertEqual(d.hold,held)
-        self.assertEqual(d.report_work['activeMs'],active)
+        self.assertEqual(d.report_work['activeMs'],active+20000)
         d.advance(1);self.assertEqual(d.hold,held)
         d.advance(1);self.assertEqual(d.hold,held+1)
         # Finish the remaining hold, then reach the final cooldown endpoint.
@@ -71,12 +73,12 @@ class FaultResumePreviewTest(unittest.TestCase):
         for condition in ('missing','relative','absolute'):
             with self.subTest(condition=condition):
                 d=self.start();self.fault(d)
-                if condition=='missing':d.missing=True
+                if condition=='missing':d.missing=d.missing_first=True
                 else:d.temperature=190 if condition=='relative' else 415
                 with self.assertRaises(preview.ApiError):self.command(d,'resetContinue')
                 self.assertEqual(d.phase,'fault');self.assertIsNotNone(d.fault_resume)
                 self.assertEqual(d.duty,0);self.assertFalse(d.relay)
-                d.missing=False;d.temperature=175
+                d.missing=d.missing_first=False;d.temperature=175
                 self.command(d,'resetContinue');self.assertEqual(d.phase,'running')
 
     def test_manual_retains_target_rate_and_active_duration(self):
@@ -87,12 +89,12 @@ class FaultResumePreviewTest(unittest.TestCase):
         self.command(d,'resetContinue')
         s=d.status()
         self.assertEqual((s['manual']['targetC'],s['manual']['rateCMin']),(175,2))
-        self.assertEqual(s['manual']['elapsedSec'],10)
+        self.assertEqual(s['manual']['elapsedSec'],30)
         self.assertEqual(d.target,reference)
         self.assertEqual(d.last_report['outcome'],'fault')
         self.assertEqual(d.last_report['operation'],'manual')
         self.assertEqual(d.report_work['pausedMs'],60000)
-        d.advance(1);self.assertEqual(d.status()['manual']['elapsedSec'],11)
+        d.advance(1);self.assertEqual(d.status()['manual']['elapsedSec'],31)
 
     def test_paused_program_resumes_and_changed_settings_invalidate_checkpoint(self):
         d=self.start();d.advance(5);self.command(d,'pause');self.fault(d);d.advance(10)

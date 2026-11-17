@@ -685,7 +685,7 @@ public:
     if (count && !job->points) { releaseReport(job); ++reportsDropped; return false; }
     job->count = count;
     for (size_t i = 0; i < count; ++i) job->points[i] = {curve[i].ms,
-      (curve[i].flags & 3) == 3 ? (curve[i].t1 + curve[i].t2) * 0.5f : NAN,
+      (curve[i].flags & 3) == 3 ? (curve[i].t1+curve[i].t2)*.5f : curve[i].flags & 1 ? curve[i].t1 : curve[i].flags & 2 ? curve[i].t2 : NAN,
       curve[i].flags & 8 ? curve[i].setpoint : NAN, curve[i].step, curve[i].flags};
     ++reportsPending;
     if (xQueueSend(documents, &job, 0) != pdTRUE) { --reportsPending; releaseReport(job); ++reportsDropped; return false; }

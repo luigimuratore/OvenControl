@@ -391,8 +391,9 @@ class PreviewTest(unittest.TestCase):
         self.assertIn("EMERGENZA SIMULATA ATTIVA", text)
         self.assertIn("Comando GPIO simulato: OFF", text)
         self.command("reset"); self.consume(); self.command("start"); self.consume()
-        self.device.request("POST", "preview-sensor", body={"missing": True})
-        self.device.advance(1)
+        self.device.request("POST", "preview-sensor", body={"missing": True,"both":True})
+        self.device.now += 20
+        self.device.advance_full(20)
         self.assertEqual(self.consume()[0][:2], ("ALLARME", True))
         self.assertIn("PT100 #2: NON VALIDA", tool.format_status(self.device.status()))
 

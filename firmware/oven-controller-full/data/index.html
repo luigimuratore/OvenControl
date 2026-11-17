@@ -28,12 +28,13 @@
     <section class="panel dashboard-panel">
       <div class="panel-title-row"><div><h2 id="ovenTitle">Forno</h2><p id="cycleInfo">In attesa del controllore</p></div><div class="clock-box"><span>ESP acceso da</span><strong id="uptime">—</strong></div></div>
       <div class="hero-grid">
-        <article class="metric hero"><span>Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
+        <article class="metric hero"><span id="avgLabel">Media PT100</span><strong><span id="avgTemp">—</span><small> °C</small></strong></article>
         <article class="metric hero target"><span id="targetLabel">Setpoint di rampa</span><strong><span id="targetTemp">—</span><small> °C</small></strong></article>
         <article class="metric"><span>Comando uscita · GPIO4</span><strong id="relayState">SPENTO</strong><small id="pidInfo">PID 0%</small></article>
         <article class="metric target-delta-card"><span>ΔT media PT100 − target</span><strong><span id="targetDeltaTemp">—</span><small> °C</small></strong><small>− sotto target · + sopra target</small></article>
       </div>
       <div class="sensor-grid probes-row"><article class="sensor-card"><span>PT100 #1 · CS GPIO14</span><strong id="t1">—</strong><small id="fault1">—</small></article><article class="sensor-card"><span>PT100 #2 · CS GPIO10</span><strong id="t2">—</strong><small id="fault2">—</small></article><article id="deltaCard" class="metric probe-delta"><span>ΔT sonde</span><strong><span id="deltaTemp">—</span><small> °C</small></strong></article></div>
+      <p id="sensorStatusNotice" class="notice" hidden></p>
       <div class="chart-card"><div class="chart-head"><div><h3>Temperature nel tempo</h3></div><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span><span><i class="legend-line start-marker-line"></i>Nuovo ciclo / manuale</span><span><i class="legend-line end-marker-line"></i>STOP / fine / allarme</span></div><label class="chart-scale">Asse Y<select id="chartYStep"><option value="1" selected>Ogni 1 °C</option><option value="5">Ogni 5 °C</option><option value="10">Ogni 10 °C</option></select></label><button id="exportSamples" class="ghost">Scarica CSV + grafico</button></div>
         <div class="chart-plot"><canvas id="tempChart" width="1200" height="420" aria-label="Grafico temperature"></canvas><div id="chartCursor" class="chart-cursor" hidden></div><div id="chartTooltip" class="chart-tooltip" hidden></div></div>
         <div class="chart-navigation"><button id="chartBack">← Indietro</button><input id="chartPosition" type="range" min="0" max="0" value="0" aria-label="Posizione grafico"><button id="chartForward">Avanti →</button><button id="chartNow">Adesso</button><select id="chartSpan"><option value="900000">15 min</option><option value="1800000" selected>30 min</option><option value="3600000">1 ora</option><option value="all">Tutto</option></select></div>
@@ -77,7 +78,7 @@
     <div class="program-editor-section"><label class="field"><span>Nome</span><input id="recipeName" maxlength="48"></label>
     <p class="hint">Target selezionabile da 0 a 400 °C. Arresto per temperatura assoluta a 415 °C sulla sonda più calda.</p>
     <div id="stepsEditor" class="steps-editor"></div><div class="buttons recipe-buttons"><button id="addStep">Aggiungi step</button><button id="deleteRecipe" class="danger">Elimina programma</button><button id="saveRecipes" class="primary">Salva sull'ESP</button></div>
-    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con entrambe le sonde entro ±5 °C. Cooldown: il PID frena il raffreddamento sotto il setpoint; sopra la curva raffredda naturalmente. Non può raffreddare più velocemente del forno.</p><div id="recipeMessage" class="notice hidden"></div>
+    <p class="hint">Rate minimo 0,1 °C/min, senza massimo software. Ramp: salita del setpoint in °C/min. Hold: minuti effettivi con le sonde disponibili entro ±5 °C. Cooldown: il PID frena il raffreddamento sotto il setpoint; sopra la curva raffredda naturalmente. Non può raffreddare più velocemente del forno.</p><div id="recipeMessage" class="notice hidden"></div>
     </div>
 
   </section>
@@ -105,6 +106,14 @@
       <p id="appliedProtections" class="protection-applied" role="status">In attesa delle impostazioni applicate sull'ESP.</p>
       <button id="saveProtections" class="ghost full" disabled>Salva blocchi sull'ESP</button>
       <p class="hint">Le modifiche si applicano dopo il salvataggio e restano memorizzate al riavvio. Le letture valide e fresche, l'emergenza e il limite assoluto individuale di 415 °C restano attivi. TEST mantiene la sua diagnostica separata.</p>
+    </section>
+    <section class="control-settings-section" aria-labelledby="probeRecoveryTitle">
+      <h2 id="probeRecoveryTitle">Recupero fault PT100</h2>
+      <p>Se una PT100 resta valida, il controllo usa quella. L’allarme scatta solo quando entrambe restano senza dati per il tempo impostato. Vale per Programmi, Manuale e TEST.</p>
+      <label class="field"><span>Entrambe le PT100 senza dati · attesa allarme in secondi</span><input id="bothFaultTimeoutSec" type="number" min="1" max="300" step="1" value="20"></label>
+      <p class="hint">Da 1 a 300 secondi, valore iniziale 20. Con entrambe senza dati le uscite si spengono subito; il recupero di almeno una PT100 valida azzera l’attesa. Le protezioni usano solo le letture valide; il ΔT sonde è disponibile solo con entrambe valide.</p>
+      <p id="appliedProbeRecovery" class="protection-applied" role="status">In attesa del valore applicato sull'ESP.</p>
+      <button id="saveProbeRecovery" class="ghost full" disabled>Salva recupero sonde sull'ESP</button>
     </section>
     <div id="parametersMessage" class="notice hidden" role="status"></div>
   </section>
@@ -196,7 +205,7 @@
       <div id="reportSummary" class="recipe-summary report-summary"></div>
       <div class="chart-card report-chart"><div class="chart-head"><h3>Curva del ciclo</h3><div class="legend"><span><i class="legend-line target-line"></i>Setpoint</span><span><i class="legend-line actual-line"></i>Media PT100</span></div></div><div id="reportPlot" role="img" aria-label="Setpoint e media PT100 durante il ciclo"></div><p id="reportCurveMessage" class="hint" role="status"></p></div>
       <section id="reportStepsSection"><h3>Dettaglio degli step</h3><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Step</th><th>Target</th><th>Esito</th><th>Tempo attivo</th><th>Pause</th><th>Hold in banda / richiesto</th><th>Errore medio assoluto</th><th id="reportOvershootHeader">Superamento max media</th><th>Ritardo max</th><th>PID medio / al limite</th><th>Escursione PT100 durante hold</th></tr></thead><tbody id="reportSteps"></tbody></table></div></section>
-      <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la media delle PT100 e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. Il tempo in banda richiede entrambe le PT100 entro ±5 °C con letture consecutive fresche. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
+      <p id="reportDefinitions" class="hint">Temperature: campioni durante ciclo e pause. Errori e comando PID: soli campioni validi di rampa e hold attivi, esclusi pausa e cooldown. Il superamento usa la media delle PT100 e il setpoint istantaneo; il ritardo e l'errore medio usano la media delle sonde. La temperatura di controllo è la media delle PT100 valide; se ne resta una viene usata quella. Il tempo in banda richiede tutte le PT100 disponibili entro ±5 °C con letture consecutive fresche. Il ΔT sonde si calcola solo con entrambe valide. Comando e saturazione sono statistiche dei campioni, senza misura della potenza elettrica. L'escursione hold è max−min di ciascuna sonda sui campioni dello step, incluse le sue pause.</p>
     </div>
   </section>
   <footer id="firmwareInfo" class="firmware-footer">Firmware: in attesa del controllore</footer>

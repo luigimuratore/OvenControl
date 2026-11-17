@@ -121,7 +121,9 @@ class ManualPreviewTest(unittest.TestCase):
             if event == "emergency":
                 self.command("emergency")
             elif event == "probe":
-                self.device.request("POST", "preview-sensor", body=dict(missing=True))
+                self.device.request("POST", "preview-sensor", body=dict(missing=True,both=True))
+                self.device.now += 20
+                self.device.advance_full(20)
             else:
                 self.device.temperature = 415
                 self.device.advance_full(0)

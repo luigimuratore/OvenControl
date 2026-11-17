@@ -6,7 +6,7 @@
 #include "profile.h"
 
 namespace reports {
-constexpr uint32_t kVersion = 3; // Same layout: v3 overshoot uses mean PT100; v2 used hottest, v1 hold band was ±1 °C.
+constexpr uint32_t kVersion = 4; // Same layout: v4 uses available PT100s; v3 required both; v2 overshoot used hottest.
 constexpr bool supportedVersion(uint32_t version) { return version >= 1 && version <= kVersion; }
 constexpr size_t kMaxSteps = 12;
 enum class Outcome : uint8_t { None, Completed, Stopped, Fault };
@@ -26,12 +26,14 @@ struct Stats {
       if (!valid[i]++) start[i] = low[i] = high[i] = values[i];
       end[i] = values[i]; low[i] = fminf(low[i], values[i]); high[i] = fmaxf(high[i], values[i]);
     }
-    if (!good[0] || !good[1]) return;
-    const float delta = fabsf(first - second);
-    maxDelta = std::isfinite(maxDelta) ? fmaxf(maxDelta, delta) : delta;
+    if (!good[0] && !good[1]) return;
+    if (good[0] && good[1]) {
+      const float delta = fabsf(first - second);
+      maxDelta = std::isfinite(maxDelta) ? fmaxf(maxDelta, delta) : delta;
+    }
     if (!track || !std::isfinite(reference) || !std::isfinite(duty)) return;
     ++trackingSamples;
-    const float mean = (first + second) * 0.5f;
+    const float mean = good[0] && good[1] ? (first + second) * 0.5f : good[0] ? first : second;
     absoluteErrorSum += fabsf(mean - reference); dutySum += duty;
     maxOvershoot = fmaxf(maxOvershoot, mean - reference);
     maxLag = fmaxf(maxLag, reference - mean);

@@ -19,7 +19,7 @@ from urllib.request import ProxyHandler, build_opener
 ROOT = Path(__file__).resolve().parents[1]
 FLASH_BYTES = 0x1000000
 NVS_OFFSET, NVS_BYTES = 0x610000, 0x40000
-VERSION = "full-1.29"
+VERSION = "full-1.31"
 LEGACY = [
     ("nvs", 1, 2, 0x9000, 0x5000, 0),
     ("otadata", 1, 0, 0xE000, 0x2000, 0),
@@ -122,6 +122,9 @@ def verify(before, recipes, authorized, after, applied, restored):
     for key in ("pid", "actuator", "windowSec", "maxPower", "protections"):
         if before.get(key) != after.get(key):
             raise RuntimeError(f"Configurazione {key} diversa dopo la migrazione: non avviare il forno.")
+    previous_timeout = before.get("sensorRecovery", {}).get("bothFaultTimeoutSec")
+    if previous_timeout is not None and previous_timeout != after.get("sensorRecovery", {}).get("bothFaultTimeoutSec"):
+        raise RuntimeError("Attesa allarme sonde diversa dopo la migrazione: verifica le impostazioni.")
     if recipes["recipes"] != applied["recipes"] or users(authorized) != users(restored):
         raise RuntimeError("Programmi/utenti diversi dal backup: non avviare il forno.")
 

@@ -59,6 +59,19 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
 
 (async () => {
   await flush(); await flush();
+  for (const good of [0,1]) {
+    const pair=[{...status.sensors[0],valid:false,c:999},{...status.sensors[1],valid:false,c:999}];
+    pair[good]={...pair[good],valid:true,c:50};
+    run(`display({...latest,sensors:${JSON.stringify(pair)},target:55,ready:true})`);
+    assert.equal(elements.get('avgTemp').textContent,'50.0');
+    assert(elements.get('avgLabel').textContent.includes(`#${good+1}`));
+    assert(elements.get('sensorStatusNotice').textContent.includes(`sola PT100 #${good+1}`));
+    assert.equal(elements.get('deltaTemp').textContent,'—');
+  }
+  assert.equal(run('historyPoint([1,1000,null,50,55,0,10,0]).actual'),50);
+  assert.equal(run('historyPoint([1,1000,50,null,55,0,9,0]).actual'),50);
+  assert(Number.isNaN(run('historyPoint([1,1000,null,null,55,0,8,0]).actual')));
+  run(`display(${JSON.stringify(status)})`);
   for (const first of ['ramp','hold','cooldown']) for (const second of ['ramp','hold','cooldown']) {
     for (const target of [50,100,150]) {
       const program=[{id:'independent',name:'Target indipendenti',steps:[
@@ -157,6 +170,43 @@ const flushFrames = () => { while (frames.length) frames.shift()(); };
   await run("$('saveProtections').onclick()");
   assert.deepEqual(savedLimits,{probeDeltaEnabled:false,maxProbeDeltaC:40,meanOvershootEnabled:true,maxMeanOvershootC:12});
   assert(elements.get('appliedProtections').textContent.includes('blocco disabilitato'));
+  fetchImpl=previousFetch;
+  run("display({...latest,phase:'idle',sensorRecovery:{bothFaultTimeoutSec:20,minAllowed:1,maxAllowed:300}})");
+  assert.equal(Number(elements.get('bothFaultTimeoutSec').value),20);
+  assert(!elements.get('saveProbeRecovery').disabled);
+  let recoveryPosts=0, finishRecovery;
+  fetchImpl=(url,options)=>{
+    if(url!=='/api/sensor-recovery')return previousFetch(url,options);
+    ++recoveryPosts;
+    assert.deepEqual(JSON.parse(options.body),{bothFaultTimeoutSec:3});
+    return new Promise(resolve=>{finishRecovery=()=>resolve(response({...status,phase:'idle',sensorRecovery:{bothFaultTimeoutSec:3,minAllowed:1,maxAllowed:300}}));});
+  };
+  for (const value of ['', '0', '-1', '301', '1.5', 'abc']) {
+    elements.get('bothFaultTimeoutSec').value=value;
+    await run("$('saveProbeRecovery').onclick()");
+    assert.equal(recoveryPosts,0);
+  }
+  elements.get('bothFaultTimeoutSec').value='3';
+  const savingRecovery=run("$('saveProbeRecovery').onclick()"); await flush();
+  assert(elements.get('saveProbeRecovery').disabled && elements.get('bothFaultTimeoutSec').disabled);
+  await run("$('saveProbeRecovery').onclick()"); assert.equal(recoveryPosts,1);
+  finishRecovery(); await savingRecovery;
+  assert(elements.get('appliedProbeRecovery').textContent.includes('dopo 3 '));
+  fetchImpl=async(url,options)=>url==='/api/sensor-recovery'?
+    {ok:false,status:507,json:async()=>({error:'NVS non disponibile'})}:previousFetch(url,options);
+  elements.get('bothFaultTimeoutSec').value='8';
+  await run("$('saveProbeRecovery').onclick()");
+  assert.equal(run('latest.sensorRecovery.bothFaultTimeoutSec'),3);
+  assert(elements.get('parametersMessage').textContent.includes('NVS non disponibile'));
+  run('display(latest)');
+  assert.equal(elements.get('bothFaultTimeoutSec').value,'8'); // Polling preserves the unsaved draft.
+  assert(elements.get('appliedProbeRecovery').textContent.includes('dopo 3 '));
+  for (const patch of [{phase:'running'},{phase:'paused'},{test:{enabled:true}},{otaUpdating:true}]) {
+    run(`display({...latest,phase:'idle',test:{enabled:false},otaUpdating:false,...${JSON.stringify(patch)}})`);
+    assert(elements.get('saveProbeRecovery').disabled && elements.get('bothFaultTimeoutSec').disabled);
+  }
+  run('display({...latest,phase:"idle",test:{enabled:false},otaUpdating:false,sensorRecovery:undefined})');
+  assert(elements.get('saveProbeRecovery').disabled);
   fetchImpl=previousFetch;
   run("display({...latest,phase:'running'});show('Dashboard')");
   assert(elements.get('saveProtections').disabled && elements.get('probeDeltaEnabled').disabled && elements.get('kp').disabled);

@@ -102,12 +102,13 @@ char lastStorageKey[16]{};
 uint32_t reclaimedLogRecords = 0;
 bool storageCleanupPaused = false, storageCleanupFailed = false;
 
-struct Sensor { float c = NAN, ohms = NAN; uint16_t raw = 0; uint8_t fault = 0; bool valid = false, recoveryFailed = false; };
+struct Sensor { float c = NAN, ohms = NAN; uint16_t raw = 0; uint8_t fault = 0; bool valid = false; };
 struct PidGains { float kp, ki, kd; };
 // Default for initial low-temperature commissioning; select the actual actuator explicitly.
 struct ControlSettings { uint32_t windowMs = 60000; float maxPower = 30; bool ssr = false; };
 ControlSettings controlSettings;
 thermal::ProtectionSettings protectionSettings;
+probes::RecoverySettings probeRecoverySettings;
 OutputSupervisor outputs;
 uint32_t ownerToken = 0;
 bool testActiveSaved = false, testInterrupted = false, otaEnabled = false;
@@ -124,7 +125,7 @@ constexpr uint8_t HISTORY_START = 0x10, HISTORY_STOP = 0x20;
 constexpr uint8_t HISTORY_COMPLETE = 0x40, HISTORY_FAULT = 0x80;
 
 Sensor sensors[2];
-probes::PairRecovery sensorRecovery;
+probes::Availability sensorAvailability;
 Recipe recipes[MAX_RECIPES], activeRecipe;
 size_t recipeCount = 0;
 Phase phase = Phase::Idle;
@@ -463,49 +464,19 @@ void drainHeaterNotices() {
 }
 String sensorMessage(const Sensor &sensor);
 struct SensorRead {
-  bool previousValid = false, previousRecoveryFailed = false, done = false, checking = false, rawFault = false;
-  uint8_t previousFault = 0, initialFault = 0;
-  uint16_t initialRaw = 0;
-  probes::RecoveryResult result = probes::RecoveryResult::NotAttempted;
+  bool previousValid = false, done = false;
+  uint8_t previousFault = 0;
 };
 SensorRead sensorReads[2];
-bool sensorBatchActive = false, sensorBatchChecking = false;
+bool sensorBatchActive = false;
 void startSensorPair() {
-  sensorBatchActive = true; sensorBatchChecking = false;
-  sensorRecovery = probes::PairRecovery{};
+  sensorBatchActive = true;
   for (size_t i = 0; i < 2; ++i) {
     sensorReads[i] = SensorRead{};
-    sensorReads[i].previousValid = sensors[i].valid; sensorReads[i].previousFault = sensors[i].fault;
-    sensorReads[i].previousRecoveryFailed = sensors[i].recoveryFailed;
-    sensors[i].recoveryFailed = false;
+    sensorReads[i].previousValid = sensors[i].valid;
+    sensorReads[i].previousFault = sensors[i].fault;
   }
   rtd1.start(millis()); rtd2.start(millis());
-}
-void finishSensorRead(size_t index) {
-  auto &sensor = sensors[index]; const auto &read = sensorReads[index];
-  sensor.recoveryFailed = read.result == probes::RecoveryResult::Failed;
-  if (sensor.recoveryFailed) sensor.valid = false;
-  if (sensor.recoveryFailed && diagnosticMode()) {
-    stopTests("Fault PT100 persistente/non sicuro: TEST fermato", true);
-    trip("TEST · PT100 #" + String(index + 1) + ": " + sensorMessage(sensor));
-  }
-  // A disconnected probe is still checked, but the same failed verification
-  // at rest must not fill the log or write NVS every second.
-  if (read.checking && (read.result == probes::RecoveryResult::Confirmed ||
-      !read.previousRecoveryFailed || sensor.fault != read.previousFault))
-    logEvent("SONDA", "PT100 #" + String(index + 1) + ": Fault 0x" + String(read.initialFault, HEX) +
-      " · RAW " + String(read.initialRaw) +
-      (read.result == probes::RecoveryResult::Confirmed ?
-       " · transitorio recuperato con una nuova coppia valida; uscita spenta durante verifica" :
-       " · verifica non confermata; arresto e allarme"));
-  if (read.result == probes::RecoveryResult::Confirmed)
-    telegramBot.notifyEvent("⚠️ AVVISO SONDA · PT100 #" + String(index + 1) +
-      "\nLettura anomala recuperata · Fault 0x" + String(read.initialFault, HEX) + " · RAW " + String(read.initialRaw) +
-      ". Nuova coppia valida; uscite spente durante la verifica.\nEvento a uptime " +
-      String(millis() / 1000) + " s.", false, telegram::EventScope::DetailedOnly);
-  if (sensor.valid != read.previousValid || sensor.fault != read.previousFault)
-    logEvent(sensor.valid ? "PT100" : "SONDA", "PT100 #" + String(index + 1) + ": " + sensorMessage(sensor) +
-      " · Fault 0x" + String(sensor.fault, HEX) + " · RAW " + String(sensor.raw) + " · " + String(sensor.ohms, 2) + " ohm");
 }
 bool pollSensorPair() {
   if (!sensorBatchActive) return false;
@@ -514,62 +485,31 @@ bool pollSensorPair() {
     auto &read = sensorReads[i]; auto &device = *devices[i]; auto &sensor = sensors[i];
     if (read.done || !device.tick(millis())) continue;
     sensor.raw = device.conversion.raw; sensor.fault = device.conversion.fault;
-    read.rawFault = device.conversion.rawFault;
     const float reference = i == 0 ? RREF_1 : RREF_2;
     sensor.ohms = sensor.raw * reference / 32768.0f;
     sensor.c = device.calculateTemperature(sensor.raw, RNOMINAL, reference);
-    sensor.valid = !read.rawFault && sensor.fault == 0 && sensor.raw > 0 && sensor.raw < 32767 && thermal::validReading(sensor.c, diagnosticMode());
-    if (!sensor.valid && !read.checking) {
-      read.initialFault = sensor.fault; read.initialRaw = sensor.raw;
-      read.checking = true;
-      if (!sensorBatchChecking) {
-        sensorBatchChecking = true;
-        portENTER_CRITICAL(&heaterMux); outputs.beginSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
-        holdTimer.update(millis(), false, false);
-      }
-    }
+    sensor.valid = probes::confirmation(sensor.fault,sensor.raw,sensor.c,diagnosticMode(),device.conversion.rawFault) != probes::Confirmation::Invalid;
     read.done = true;
   }
   if (!sensorReads[0].done || !sensorReads[1].done) return false;
-  if (sensorBatchChecking) {
-    const auto result = sensorRecovery.observe(
-      probes::confirmation(sensors[0].fault, sensors[0].raw, sensors[0].c, diagnosticMode(), sensorReads[0].rawFault),
-      probes::confirmation(sensors[1].fault, sensors[1].raw, sensors[1].c, diagnosticMode(), sensorReads[1].rawFault));
-    if (result == probes::RecoveryResult::Pending) {
-      // Reacquire BOTH probes in every round; do not retain a stale healthy sibling.
-      for (size_t i = 0; i < 2; ++i) { sensorReads[i].done = false; devices[i]->start(millis()); }
-      return false;
-    }
-    for (size_t i = 0; i < 2; ++i)
-      if (sensorReads[i].checking || sensorRecovery.probe[i].failure != probes::RecoveryFailure::None)
-        sensorReads[i].result = result;
-  }
-  // Keep verification inhibition through fault handling/logging. No new output
-  // is published until both probes and relative protections have been checked.
-  for (size_t i = 0; i < 2; ++i) finishSensorRead(i);
-  if (sensorBatchChecking) {
-    portENTER_CRITICAL(&heaterMux); outputs.endSensorCheck(); writeOutputs(); portEXIT_CRITICAL(&heaterMux);
-  }
+  const bool anyValid = sensors[0].valid || sensors[1].valid;
+  sensorAvailability.observe(millis(), anyValid);
+  portENTER_CRITICAL(&heaterMux);
+  if (anyValid) outputs.endSensorCheck(); else outputs.beginSensorCheck();
+  writeOutputs(); portEXIT_CRITICAL(&heaterMux);
+  for (size_t i = 0; i < 2; ++i) if (sensors[i].valid != sensorReads[i].previousValid || sensors[i].fault != sensorReads[i].previousFault)
+    logEvent(sensors[i].valid ? "PT100" : "SONDA", "PT100 #" + String(i+1) + ": " + sensorMessage(sensors[i]) +
+      " · Fault 0x" + String(sensors[i].fault,HEX) + " · RAW " + String(sensors[i].raw));
   sensorBatchActive = false; sampleAtMs = millis(); return true;
 }
 void readSensorPair() {
-  // Explicit START/RESUME/RESET still require a fresh completed pair. This
-  // bounded wait is used only by operator commands, never for periodic sampling.
-  // The network and independent GPIO supervisor continue on their own tasks.
+  // Operator commands require one new complete conversion, without retry loops.
   if (!sensorBatchActive) startSensorPair();
   while (!pollSensorPair()) delay(1);
 }
 String sensorMessage(const Sensor &sensor) {
   if (sensor.valid) return "Lettura valida";
   String text;
-  if (sensor.recoveryFailed) {
-    const auto failure = sensorRecovery.probe[&sensor == &sensors[0] ? 0 : 1].failure;
-    if (failure == probes::RecoveryFailure::ConsecutiveFaults)
-      text += String(probes::Recovery::kMaxConsecutiveFaults) + " letture non valide consecutive: recupero fallito; ";
-    else if (failure == probes::RecoveryFailure::Unstable)
-      text += "Letture instabili: nessuna coppia valida ottenuta entro la verifica limitata; ";
-    else text += "Conferma non valida o fuori dai limiti di sicurezza: recupero interrotto; ";
-  }
   if (sensor.fault & MAX31865_FAULT_HIGHTHRESH) text += "RTD oltre soglia alta; ";
   if (sensor.fault & MAX31865_FAULT_LOWTHRESH) text += "RTD sotto soglia bassa; ";
   if (sensor.fault & MAX31865_FAULT_REFINLOW) text += "REFIN- > 85% VBIAS; ";
@@ -578,15 +518,23 @@ String sensorMessage(const Sensor &sensor) {
   if (sensor.fault & MAX31865_FAULT_OVUV) text += "Sovra/sottotensione sugli ingressi RTD; ";
   return text.length() ? text : "Lettura fuori intervallo o SPI/sonda assente";
 }
-float meanC() { return (sensors[0].c + sensors[1].c) * 0.5f; }
-float hottestC() { return fmaxf(sensors[0].c, sensors[1].c); }
+thermal::Readings sensorValues() { return {sensors[0].c,sensors[0].valid,sensors[1].c,sensors[1].valid}; }
+float meanC() { return sensorValues().mean; }
+float hottestC() { return sensorValues().hottest; }
+void checkSensorLoss() {
+  if (sensorAvailability.expired(millis(),probeRecoverySettings.bothFaultTimeoutSec) &&
+      ((phase != Phase::Fault && phase != Phase::Interrupted) || diagnosticMode())) {
+    if (diagnosticMode()) stopTests("Entrambe le PT100 senza dati: TEST fermato",true);
+    trip("Entrambe le PT100 senza dati validi da " + String(probeRecoverySettings.bothFaultTimeoutSec) + " s: uscita spenta");
+  }
+}
 String protectionProblem(float reference, bool cooling = false) {
-  if (thermal::probeDeltaExceeded(sensors[0].c,sensors[1].c,protectionSettings))
+  if (sensorValues().count == 2 && thermal::probeDeltaExceeded(sensors[0].c,sensors[1].c,protectionSettings))
     return "Differenza PT100: " + String(fabsf(sensors[0].c-sensors[1].c),2) + " °C (limite >" +
       String(protectionSettings.maxProbeDeltaC,1) + " °C): uscita spenta";
-  if (thermal::meanOvershootExceeded(sensors[0].c,sensors[1].c,reference,protectionSettings,cooling))
-    return "Sovratemperatura media PT100: " + String((sensors[0].c+sensors[1].c)*.5f,2) +
-      " °C; setpoint " + String(reference,2) + " °C; scostamento +" + String((sensors[0].c+sensors[1].c)*.5f-reference,2) +
+  if (thermal::meanOvershootExceeded(meanC(),meanC(),reference,protectionSettings,cooling))
+    return "Sovratemperatura media PT100: " + String(meanC(),2) +
+      " °C; setpoint " + String(reference,2) + " °C; scostamento +" + String(meanC()-reference,2) +
       " °C (limite >" + String(protectionSettings.maxMeanOvershootC,1) + " °C): uscita spenta";
   return "";
 }
@@ -596,7 +544,7 @@ bool checkProtections(float reference, bool cooling = false) {
   trip(problem); return false;
 }
 bool sensorsHealthy() {
-  return thermal::healthyPair(sensors[0].c, sensors[0].valid, sensors[1].c, sensors[1].valid);
+  return sensorValues().healthy();
 }
 const char *faultResumeProblem() {
   const auto output = outputSnapshot();
@@ -610,7 +558,7 @@ const char *faultResumeProblem() {
   if (!cycleReport.canContinue() || (!faultResume.manual && faultResume.step >= activeRecipe.count))
     return "Stato del programma non disponibile: usa RESET & BLOCK.";
   if (!sensorsHealthy() || uint32_t(millis()-sampleAtMs) >= heater::Guard::kStaleMs)
-    return "Ripristina entrambe le sonde e attendi letture valide e fresche sotto 415 °C.";
+    return "Serve almeno una PT100 con dati validi e freschi sotto 415 °C.";
   if (!faultResume.safePair(sensors[0].c, sensors[0].valid, sensors[1].c, sensors[1].valid,protectionSettings))
     return "Attendi il rientro delle temperature nelle soglie abilitate in Parameters.";
   return "";
@@ -697,8 +645,8 @@ String telegramStatus(int64_t recipient) {
       const auto elapsed = phase == Phase::Paused ? 0 : uint32_t(now - stepStarted);
       const float origin = phase == Phase::Paused ? pauseHold.targetC : stepStartC;
       const float remaining = profile::remainingSec(step, origin, elapsed, holdInBandMs,
-        sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
-        sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
+        sensorValues().coldest,
+        hottestC(), followingStep());
       if (std::isfinite(remaining)) remainingText = telegramTime(uint32_t(remaining));
       estimated = step.type != profile::Type::Hold;
     }
@@ -714,6 +662,7 @@ String telegramStatus(int64_t recipient) {
     else text += "NON VALIDA · fault 0x" + String(sensors[i].fault, HEX) + " · RAW " + String(sensors[i].raw);
     text += "\n";
   }
+  if (sensorValues().count == 1) text += "Controllo sulla sola PT100 #" + String(sensors[0].valid ? 1 : 2) + ": " + String(meanC(),2) + " °C\n";
   if (sensors[0].valid && sensors[1].valid)
     text += "Media: " + String(meanC(), 2) + " °C\nDifferenza sonde: " + String(fabsf(sensors[0].c - sensors[1].c), 2) + " °C\n";
   text += "Età letture: " + String(uint32_t(now - sampleAtMs)) + " ms" +
@@ -724,7 +673,8 @@ String telegramStatus(int64_t recipient) {
   text += "PID: Kp " + String(kp, 3) + " · Ki " + String(ki, 4) + " · Kd " + String(kd, 2) + "\n";
   text += "\n🛡 BLOCCHI TERMICI\nDelta sonde: " + String(protectionSettings.probeDeltaEnabled ? "ON >" : "OFF · soglia ") +
     String(protectionSettings.maxProbeDeltaC,1) + " °C\nMedia − target: " + (protectionSettings.meanOvershootEnabled ? "ON >" : "OFF · soglia ") +
-    String(protectionSettings.maxMeanOvershootC,1) + " °C\n";
+    String(protectionSettings.maxMeanOvershootC,1) + " °C\nAssenza dati: allarme dopo " +
+    String(probeRecoverySettings.bothFaultTimeoutSec) + " s senza dati validi da entrambe le PT100\n";
   if ((lastCycleError.length() && lastCycleError != faultText) || interruptionRecorded)
     text += "\n⚠️ ERRORI REGISTRATI\n";
   if (lastCycleError.length() && lastCycleError != faultText) text += "Ultimo errore di ciclo: " + lastCycleError.substring(0, 240) + "\n";
@@ -835,25 +785,17 @@ void sampleAndControl(bool fresh = true) {
       profile::setpoint(activeRecipe.steps[stepIndex], stepStartC, uint32_t(now - stepStarted)) : setpointC;
     cycleReport.observe(now, sensors[0].c, sensors[1].c, sensors[0].valid, sensors[1].valid, reference, duty);
   }
-  if (!sensors[0].valid || !sensors[1].valid) {
-    if (!sensorFaultLogged) { logEvent("ATTENZIONE", "Una o entrambe le PT100 non sono leggibili"); sensorFaultLogged = true; }
-    if (phase == Phase::Running || phase == Phase::Paused) {
-      // Keep the failing sample in the alarm/report, even if the next sample recovers.
-      String reason = "PT100/MAX31865 in errore: uscita spenta";
-      for (size_t i = 0; i < 2; ++i) if (!sensors[i].valid)
-        reason += " · PT100 #" + String(i + 1) + " Fault 0x" + String(sensors[i].fault, HEX) + ", RAW " + String(sensors[i].raw);
-      for (size_t i = 0; i < 2; ++i) if (!sensors[i].valid)
-        reason += " · #" + String(i + 1) + ": " + sensorMessage(sensors[i]);
-      trip(reason);
-    }
-    else inhibitHeater();
-    return;
+  if (!sensorValues().count) {
+    if (!sensorFaultLogged) { logEvent("ATTENZIONE", "Entrambe le PT100 senza dati validi: uscite spente, attesa del recupero"); sensorFaultLogged = true; }
+    holdTimer.update(now,false,false); duty = 0; inhibitHeater();
+    checkSensorLoss(); return;
   }
-  if (sensorFaultLogged) { logEvent("INFO", "Entrambe le PT100 leggibili"); sensorFaultLogged = false; }
-  if (diagnosticMode()) { holdTimer.update(now, false, false); return; }
+  if (sensorFaultLogged) { logEvent("INFO", "Dati PT100 ripristinati: almeno una sonda valida"); sensorFaultLogged = false; }
   if (!thermal::belowHardLimit(hottestC())) {
+    if (diagnosticMode()) stopTests("Temperatura oltre limite assoluto: TEST fermato",true);
     trip("Temperatura >= " + String(thermal::kHardLimit, 0) + " °C: uscita spenta"); return;
   }
+  if (diagnosticMode()) { holdTimer.update(now,false,false); return; }
   if (phase == Phase::Paused) {
     holdTimer.update(now, false, false);
     if (!pauseHold.active || !thermal::validTarget(pauseHold.targetC)) {
@@ -882,7 +824,7 @@ void sampleAndControl(bool fresh = true) {
   }
   controlPid(actual, now);
   if (step.type == profile::Type::Ramp) {
-    if (profile::rampDone(step, stepStartC, elapsed, fminf(sensors[0].c, sensors[1].c), hottestC(), followingStep())) {
+    if (profile::rampDone(step, stepStartC, elapsed, sensorValues().coldest, hottestC(), followingStep())) {
       advanceStep(); return;
     }
     if (setpointC - actual > 5 && uint32_t(now - lastLagLog) > 300000) {
@@ -890,7 +832,7 @@ void sampleAndControl(bool fresh = true) {
       logEvent("ATTENZIONE", "Il forno segue la rampa con oltre 5 °C di ritardo");
     }
   } else {
-    holdTimer.update(now, profile::inBand(sensors[0].c, sensors[1].c, step.target));
+    holdTimer.update(now, sensorValues().inBand(step.target, profile::kHoldBand));
     holdInBandMs = holdTimer.elapsedMs;
     if (holdInBandMs >= uint32_t(step.minutes) * 60000UL) advanceStep();
   }
@@ -1226,6 +1168,13 @@ void statusApi(uint32_t testToken = 0) {
   protections["maxProbeDeltaC"] = protectionSettings.maxProbeDeltaC;
   protections["meanOvershootEnabled"] = protectionSettings.meanOvershootEnabled;
   protections["maxMeanOvershootC"] = protectionSettings.maxMeanOvershootC;
+  auto recoverySettings = doc["sensorRecovery"].to<JsonObject>();
+  recoverySettings["bothFaultTimeoutSec"] = probeRecoverySettings.bothFaultTimeoutSec;
+  recoverySettings["waiting"] = sensorAvailability.waiting();
+  recoverySettings["missingForMs"] = sensorAvailability.elapsedMs(millis());
+  recoverySettings["validProbes"] = sensorValues().count;
+  recoverySettings["minAllowed"] = probes::kMinTimeoutSec;
+  recoverySettings["maxAllowed"] = probes::kMaxTimeoutSec;
   doc["cycleElapsedSec"] = !manualOperation && cycleActive() ? uint32_t(millis() - cycleStarted) / 1000 :
     activeRecipe.count && reportAvailable && lastReport.startMs == cycleStarted && lastReport.boot == bootCount ?
       uint32_t(lastReport.endMs - lastReport.startMs) / 1000 : 0;
@@ -1265,15 +1214,15 @@ void statusApi(uint32_t testToken = 0) {
       const uint32_t elapsed = phase == Phase::Paused ? 0 : uint32_t(millis() - stepStarted);
       const float origin = phase == Phase::Paused ? pauseHold.targetC : stepStartC;
       const float remaining = profile::remainingSec(step, origin, elapsed, holdInBandMs,
-        sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
-        sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
+        sensorValues().coldest,
+        hottestC(), followingStep());
       if (std::isfinite(remaining)) doc["stepRemainingSec"] = remaining;
       doc["stepRemainingEstimated"] = step.type != profile::Type::Hold;
       doc["stepWaitingForTemperature"] = step.type == profile::Type::Ramp &&
         profile::setpoint(step, origin, elapsed) >= step.target - 0.001f &&
         !profile::rampDone(step, origin, elapsed,
-          sensors[0].valid && sensors[1].valid ? fminf(sensors[0].c, sensors[1].c) : NAN,
-          sensors[0].valid && sensors[1].valid ? hottestC() : NAN, followingStep());
+          sensorValues().coldest,
+          hottestC(), followingStep());
     }
   }
   doc["fault"] = faultText; doc["bootCount"] = bootCount;
@@ -1398,6 +1347,24 @@ void protectionsApi() {
   logEvent("PARAMETERS", String("Blocco delta sonde ") + (proposed.probeDeltaEnabled ? "ON >" : "OFF; soglia ") +
     String(proposed.maxProbeDeltaC,1) + " °C; blocco media-target " + (proposed.meanOvershootEnabled ? "ON >" : "OFF; soglia ") +
     String(proposed.maxMeanOvershootC,1) + " °C");
+  statusApi();
+}
+void sensorRecoveryApi() {
+  if (cycleActive() || diagnosticMode() || outputSnapshot().updating) {
+    error(409, "Ferma Programmi/Manuale ed esci da TEST prima di modificare il recupero sonde"); return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, server.arg("plain"))) { error(400, "JSON non valido"); return; }
+  if (!doc["bothFaultTimeoutSec"].is<uint32_t>() || doc["bothFaultTimeoutSec"].as<uint32_t>() < probes::kMinTimeoutSec || doc["bothFaultTimeoutSec"].as<uint32_t>() > probes::kMaxTimeoutSec) {
+    error(400, "Assenza dati da entrambe le sonde: inserisci secondi interi da 1 a 300"); return;
+  }
+  probes::RecoverySettings proposed;
+  proposed.bothFaultTimeoutSec = doc["bothFaultTimeoutSec"].as<uint32_t>();
+  if (!saveSettingsBlob("probeRecovery", &proposed, sizeof(proposed))) {
+    error(507, storageFailure("Salvataggio recupero sonde fallito: resta applicato il valore precedente")); return;
+  }
+  probeRecoverySettings = proposed;
+  logEvent("PARAMETERS", "Allarme dopo " + String(proposed.bothFaultTimeoutSec) + " s senza dati validi da entrambe le PT100");
   statusApi();
 }
 void commandApi() {
@@ -1540,7 +1507,7 @@ void commandApi() {
     // Read again here: a stale status must never authorize a heat command.
     readSensorPair();
     sampleAtMs = millis();
-    if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
+    if (!sensorsHealthy()) { error(409, "Serve almeno una PT100 valida e nessuna sonda valida oltre il limite termico assoluto"); return; }
     const char *id = doc["recipeId"] | "";
     int selected = -1;
     for (size_t i = 0; i < recipeCount; ++i) if (recipes[i].id == id) { selected = int(i); break; }
@@ -1628,7 +1595,7 @@ void manualApi() {
     error(400, "Conferma CHECK HARDWARE/AMBIENTE EFFETTUATO"); return;
   }
   readSensorPair(); sampleAtMs = millis();
-  if (!sensorsHealthy()) { error(409, "Entrambe le PT100 devono essere valide e sotto il limite termico assoluto"); return; }
+  if (!sensorsHealthy()) { error(409, "Serve almeno una PT100 valida e nessuna sonda valida oltre il limite termico assoluto"); return; }
   const float requested = doc["targetC"].as<float>();
   const float rate = doc["rateCMin"].as<float>();
   const uint32_t now = millis();
@@ -2137,6 +2104,13 @@ void setup() {
       protectionSettings = saved;
     else logEvent("ATTENZIONE", "Blocchi termici salvati non validi: attivati delta sonde >30 °C e media-target >10 °C");
   }
+  if (prefs.isKey("probeRecovery")) {
+    probes::RecoverySettings saved;
+    if (prefs.getBytesLength("probeRecovery") == sizeof(saved) &&
+        prefs.getBytes("probeRecovery", &saved, sizeof(saved)) == sizeof(saved) && probes::validSettings(saved))
+      probeRecoverySettings = saved;
+    else logEvent("ATTENZIONE", "Attesa sonde precedente o non valida: applicato il valore iniziale di 20 secondi senza entrambe le PT100");
+  }
   PidGains storedGains{};
   if (prefs.isKey("pid") && prefs.getBytesLength("pid") == sizeof(storedGains) &&
       prefs.getBytes("pid", &storedGains, sizeof(storedGains)) == sizeof(storedGains)) {
@@ -2200,6 +2174,7 @@ void setup() {
   server.on("/api/pid", ovenhttp::Method::Post, pidApi);
   server.on("/api/control", ovenhttp::Method::Post, controlSettingsApi);
   server.on("/api/protections", ovenhttp::Method::Post, protectionsApi);
+  server.on("/api/sensor-recovery", ovenhttp::Method::Post, sensorRecoveryApi);
   server.on("/api/logs", ovenhttp::Method::Get, logsApi);
   server.on("/api/history", ovenhttp::Method::Get, historyApi);
   server.onNotFound([] { error(404, "Percorso non trovato"); });
@@ -2241,6 +2216,7 @@ void loop() {
   uint32_t now = millis();
   if ((phase == Phase::Running || phase == Phase::Paused) && uint32_t(now - sampleAtMs) >= heater::Guard::kStaleMs)
     trip("Lettura sonde troppo vecchia: uscita spenta");
+  checkSensorLoss();
   if (uint32_t(now - lastSampleAt) >= SAMPLE_MS) {
     lastSampleAt = now;
     if (!sensorBatchActive) startSensorPair();

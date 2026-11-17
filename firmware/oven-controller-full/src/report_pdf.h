@@ -304,12 +304,13 @@ inline size_t generate(char *buffer, size_t capacity, const reports::Snapshot &r
   statsPairs(w, r.stats, 282, r.version >= 3);
   w.text(44, 420, "PRECISIONE DELLA MEDIA E COMANDO PID", 10, true);
   w.text(44, 580, "COME LEGGERE I DATI", 10, true);
-  w.wrap(44, 604, manual ?
+  w.wrap(44, 604, r.version >= 4 ?
+    "La temperatura di controllo e' la media delle PT100 valide; con una sola sonda valida si usa quella. Errori, superamento, ritardo e PID medio usano la regolazione attiva; pause e cooldown sono esclusi. Il delta sonde richiede entrambe valide." : manual ?
     "Errore, superamento e ritardo confrontano la media PT100 con il setpoint istantaneo. Questi indici e il PID medio usano solo campioni validi di regolazione attiva, escluse discesa, cooldown e attesa dopo allarme." : r.version >= 3 ?
     "Errore medio: distanza media dal target. Superamento: massimo della media PT100 sopra il target. Ritardo: massimo della media sotto il target. Questi indici e il PID medio usano solo rampa e mantenimento attivi, escluse pause e cooldown." :
     "Report precedente: il superamento usa la sonda più calda. Errore e ritardo usano la media. Gli indici e il comando medio escludono pause e cooldown.", 96, 9);
   if (manual) snprintf(a, sizeof(a), "Temperature e differenza sonde comprendono tutta la sessione acquisita. Target e durata sono decisi dall'operatore, senza conteggio hold. L'attesa dopo un allarme è conteggiata come pausa. Il comando non misura potenza o energia elettrica.");
-  else snprintf(a, sizeof(a), "Il mantenimento conta entrambe le PT100 entro +/-%.0f °C. Temperature e differenza sonde comprendono le pause. Campioni non validi interrompono la curva; il comando non misura potenza o energia elettrica.", r.version == 1 ? 1.0 : double(profile::kHoldBand));
+  else snprintf(a, sizeof(a), "Il mantenimento conta %s entro +/-%.0f °C. Temperature e differenza sonde comprendono le pause. La curva si interrompe senza dati validi; il comando non misura potenza o energia elettrica.", r.version >= 4 ? "le PT100 disponibili" : "entrambe le PT100", r.version == 1 ? 1.0 : double(profile::kHoldBand));
   w.wrap(44, 680, a, 96, 9);
   for (unsigned i = 0; i < r.stepCount; ++i) {
     const auto &s = r.steps[i]; const auto range = stepRange(r, i);

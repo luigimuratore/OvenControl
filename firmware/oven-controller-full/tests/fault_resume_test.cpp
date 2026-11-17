@@ -18,8 +18,8 @@ int main() {
   assert(before + uint32_t(1201000-at) == 390000);
   assert(checkpoint.safePair(119,true,121,true)); // Mean exactly +10 is permitted.
   assert(!checkpoint.safePair(120.01f,true,120.01f,true));
-  assert(!checkpoint.safePair(100,true,100,false));
-  assert(!checkpoint.safePair(NAN,true,100,true));
+  assert(checkpoint.safePair(100,true,100,false));
+  assert(checkpoint.safePair(NAN,true,100,true));
   assert(!checkpoint.safePair(415,true,-20,true)); // Individual hard limit.
   assert(checkpoint.safePair(90,true,100,true)); // Door opened: cold readings can recover.
   thermal::ProtectionSettings protections;

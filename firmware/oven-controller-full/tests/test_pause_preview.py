@@ -87,7 +87,9 @@ class PausePreviewTest(unittest.TestCase):
         for event in ("stop", "emergency", "probe"):
             self.setUp(); self.start(); self.post("pause")
             if event == "probe":
-                self.device.request("POST", "preview-sensor", body=dict(missing=True))
+                self.device.request("POST", "preview-sensor", body=dict(missing=True,both=True))
+                self.device.now += 20
+                self.device.advance_full(20)
             else:
                 self.post(event)
             self.assertFalse(self.device.relay)

@@ -72,7 +72,9 @@ class DemoTests(unittest.TestCase):
 
     def test_fault_requires_restore_and_acknowledgment(self):
         self.start()
-        self.post(self.full, "preview-sensor", missing=True)
+        self.post(self.full, "preview-sensor", missing=True, both=True)
+        self.full.now += 20
+        self.full.advance_full(20)
         self.assertEqual(self.full.phase, "fault")
         self.assertFalse(self.full.relay)
         self.assertIsNone(self.full.status()["sensors"][1]["c"])
@@ -80,7 +82,7 @@ class DemoTests(unittest.TestCase):
             self.post(self.full, action="reset")
         self.post(self.full, action="stop")
         self.assertEqual(self.full.phase, "fault")
-        self.post(self.full, "preview-sensor", missing=False)
+        self.post(self.full, "preview-sensor", missing=False, both=True)
         with self.assertRaises(preview.ApiError):
             self.start()
         self.post(self.full, action="reset")
@@ -152,7 +154,9 @@ class DemoTests(unittest.TestCase):
         self.start()
         self.assertEqual(self.full.request("GET", "report")["key"], key)
         self.full.advance(1)
-        self.post(self.full, "preview-sensor", missing=True)
+        self.post(self.full, "preview-sensor", missing=True, both=True)
+        self.full.now += 20
+        self.full.advance_full(20)
         fault = self.full.request("GET", "report")
         self.assertEqual(fault["outcome"], "fault")
         self.assertGreater(fault["stats"]["invalidPairs"], 0)
@@ -204,7 +208,7 @@ class DemoTests(unittest.TestCase):
         self.assertTrue(self.full.status()["test"]["enabled"])
         self.assertFalse(self.full.status()["test"]["running"])
         self.post(self.full, "test/command", action="exit")
-        self.post(self.full, "preview-sensor", missing=False)
+        self.post(self.full, "preview-sensor", missing=False, both=True)
         self.assertEqual(self.start()["phase"], "running")
         # A late test-only STOP from a hidden page must not cancel a recipe.
         self.post(self.full, "test/command", action="stop")

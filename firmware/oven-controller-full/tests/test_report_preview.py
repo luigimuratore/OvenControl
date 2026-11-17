@@ -12,7 +12,7 @@ class ReportPreviewTest(unittest.TestCase):
             return [dict(c=a, valid=True), dict(c=b, valid=True)]
         with patch.object(d, "sensors", return_value=probes(179.22, 170.78)):
             d.begin_report()  # Isolate these observations from the initial startup sample.
-        self.assertEqual(d.report_work["version"], 3)
+        self.assertEqual(d.report_work["version"], 4)
         self.assertEqual(d.report_work["stats"]["maxOvershootC"], 0)
         with patch.object(d, "sensors", return_value=probes(179.22, 174.78)):
             d.observe_report()

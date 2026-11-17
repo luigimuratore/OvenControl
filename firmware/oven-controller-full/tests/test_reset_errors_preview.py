@@ -22,13 +22,13 @@ class ResetErrorsPreviewTest(unittest.TestCase):
     def test_reset_leaves_test_even_if_probe_is_still_invalid(self):
         d = self.device()
         d.request("POST", "test/command", body=dict(action="relayPulse", durationMs=1000))
-        d.phase, d.missing = "fault", True
+        d.phase, d.missing, d.missing_first = "fault", True, True
         with self.assertRaises(preview.ApiError):
             d.request("POST", "command", body=dict(action="reset"))
         self.assertTrue(d.status()["resetRequired"])
         self.assertFalse(d.test_enabled)
         self.assertFalse(d.status()["relay"])
-        d.missing = False
+        d.missing = d.missing_first = False
         d.request("POST", "command", body=dict(action="reset"))
         self.assertFalse(d.status()["resetRequired"])
         self.assertFalse(d.status()["relay"])

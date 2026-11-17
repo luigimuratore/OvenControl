@@ -121,7 +121,9 @@ class CooldownPreviewTest(unittest.TestCase):
                     d = self.device(manual)
                     d.advance(20)
                     if event == "probe":
-                        d.request("POST", "preview-sensor", body=dict(missing=True))
+                        d.request("POST", "preview-sensor", body=dict(missing=True,both=True))
+                        d.now += 20
+                        d.advance_full(20)
                     elif event == "temperature":
                         d.temperature = 415
                         d.advance_full(0)

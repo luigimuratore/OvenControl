@@ -75,6 +75,9 @@ class DemoDevice:
         self.control = {"actuator": "relay", "windowSec": 60, "maxPower": 30}
         self.pid = {"kp": 12, "ki": .015, "kd": 50}
         self.protections = dict(probeDeltaEnabled=True,maxProbeDeltaC=30.0,meanOvershootEnabled=True,maxMeanOvershootC=10.0)
+        self.both_fault_timeout_sec = 20
+        self.probe_missing_since = None
+        self.missing_first = False
         self.emergency, self.last_cycle_error = False, ""
         self.recipes = json.loads((ROOT / "oven-controller-full/examples/recipes.json").read_text())
         self.report_work, self.last_report = None, None
@@ -110,7 +113,7 @@ class DemoDevice:
         at = self.now if at is None else at
         result = []
         for i, c in enumerate([self.temperature + .08 * math.sin(at / 13), self.temperature + .2]):
-            bad = self.missing and i == 1
+            bad = self.missing_first if i == 0 else self.missing
             ohms = 100 * (1 + 3.9083e-3 * c - 5.775e-7 * c * c)
             result.append(dict(c=None if bad else round(c, 3), valid=not bad, ohms=470 if bad else round(ohms, 3),
                                raw=32767 if bad else round(ohms / 470 * 32768), faultCode=144 if bad else 0, rref=470,
@@ -118,6 +121,7 @@ class DemoDevice:
         return result
 
     def outputs(self):
+        if self.mode == "full" and not self.available_temperatures(): return False, False, False
         elapsed = self.now - self.test_at
         relay = self.action == "relayPulse" or self.action == "relaySequence" and elapsed % 3 < 1
         red = relay or self.action in ("ledRed", "ledBoth") or self.action == "ledSequence" and int(elapsed // 2) in (2, 3)
@@ -157,7 +161,7 @@ class DemoDevice:
     def begin_report(self):
         manual = self.operation == "manual"
         steps = [] if manual else self.active["steps"]
-        self.report_work = dict(operation="manual" if manual else "program", version=3, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
+        self.report_work = dict(operation="manual" if manual else "program", version=4, holdBandC=5, firmware="LOCAL-PREVIEW", saved=False, bootCount=1,
             key="", recipeId="manual:session" if manual else self.active["id"], recipeName="Controllo manuale" if manual else self.active["name"], outcome="", reason="",
             startUptimeMs=int(self.now * 1000), endUptimeMs=None, startUtc=None, endUtc=None,
             durationMs=0, activeMs=0, pausedMs=0, pauseCount=0, completedSteps=0, stepCount=len(steps),
@@ -196,14 +200,15 @@ class DemoDevice:
                     sensor.update(startC=c, minC=c, maxC=c)
                 sensor["validSamples"] += 1
                 sensor.update(endC=c, minC=min(c, sensor["minC"]), maxC=max(c, sensor["maxC"]))
-            if not a["valid"] or not b["valid"]:
-                continue
-            delta = abs(a["c"] - b["c"])
-            stats["maxDeltaC"] = max(delta, stats["maxDeltaC"] or 0)
+            values = [value["c"] for value in (a,b) if value["valid"] and value["c"] is not None]
+            if not values: continue
+            if len(values) == 2:
+                delta = abs(a["c"] - b["c"])
+                stats["maxDeltaC"] = max(delta, stats["maxDeltaC"] or 0)
             cooling = self.cooling_control() or self.manual_cooldown_complete if manual else step["type"] == "cooldown"
             if self.phase != "running" or cooling or self.target is None:
                 continue
-            mean = (a["c"] + b["c"]) / 2
+            mean = sum(values)/len(values)
             stats["trackingSamples"] += 1
             stats["_error"] += abs(mean - self.target)
             stats["_duty"] += self.duty
@@ -260,6 +265,7 @@ class DemoDevice:
                     self.stop_field()
                     self.log("TEST", "Prova simulata terminata.")
             elif self.test_enabled:
+                self.check_probe_loss()
                 if self.action and self.now - self.heartbeat_at >= 2.5:
                     self.stop_field()
                     self.log("STOP", "Heartbeat assente da 2,5 s: test simulato fermato")
@@ -290,7 +296,7 @@ class DemoDevice:
     def fault_resume_status(self):
         saved = self.fault_resume
         pair = self.sensors()
-        healthy = all(sensor["valid"] and sensor["c"] is not None and math.isfinite(sensor["c"]) and sensor["c"] < 415 for sensor in pair)
+        healthy = bool(self.available_temperatures()) and max(self.available_temperatures()) < 415
         available = bool(saved) and self.phase == "fault" and not self.emergency
         reference = saved["values"]["target"] if saved else None
         if self.emergency or self.phase == "interrupted":
@@ -298,7 +304,7 @@ class DemoDevice:
         elif not available:
             reason = "Nessun punto di ripresa in RAM: usa RESET & BLOCK."
         elif not healthy:
-            reason = "Ripristina entrambe le sonde e attendi letture valide sotto 415 °C."
+            reason = "Serve almeno una PT100 valida e nessuna temperatura valida sopra 415 °C."
         elif reference is None or self.protection_problem(reference, self.cooling_control(saved["values"])):
             reason = "Attendi il rientro delle temperature nelle soglie abilitate in Parameters."
         else:
@@ -362,7 +368,7 @@ class DemoDevice:
             self.record()
             self.log("MANUALE", "Cooldown manuale: discesa regolata dal PID")
             return self.status()
-        require(not self.missing and self.temperature + .2 < 415, "Sonde non pronte", 409)
+        require(bool(self.available_temperatures()) and self.temperature + .2 < 415, "Sonde non pronte", 409)
         if action == "start":
             require(self.phase not in ("running", "paused"), "Ferma prima il programma/manuale", 409)
             require(body.get("hardwareReady") is True, "CHECK HARDWARE/AMBIENTE richiesto")
@@ -397,13 +403,13 @@ class DemoDevice:
 
     def protection_problem(self, reference, cooling=False):
         pair = self.sensors()
-        if not all(sensor["valid"] for sensor in pair):
-            return None
-        first,second = (sensor["c"] for sensor in pair)
+        values = [sensor["c"] for sensor in pair if sensor["valid"] and sensor["c"] is not None]
+        if not values: return None
+        first,second = min(values),max(values)
         if max(first,second) >= 415:
             return "Temperatura >= 415 °C: uscita spenta (simulata)"
         cfg = self.protections
-        if cfg["probeDeltaEnabled"] and abs(first-second) > cfg["maxProbeDeltaC"]:
+        if len(values) == 2 and cfg["probeDeltaEnabled"] and abs(first-second) > cfg["maxProbeDeltaC"]:
             return f'Differenza PT100: {abs(first-second):.2f} °C (limite >{cfg["maxProbeDeltaC"]:g} °C): uscita spenta (simulata)'
         mean = (first+second)/2
         if not cooling and cfg["meanOvershootEnabled"] and reference is not None and mean > reference+cfg["maxMeanOvershootC"]:
@@ -414,7 +420,33 @@ class DemoDevice:
     def overtemperature(self):
         return self.protection_problem(self.target, self.phase == "running" and self.cooling_control())
 
+    def available_temperatures(self):
+        return [sensor["c"] for sensor in self.sensors() if sensor["valid"] and sensor["c"] is not None]
+
+    def check_probe_loss(self):
+        if self.available_temperatures():
+            self.probe_missing_since = None
+            return False
+        if self.probe_missing_since is None:
+            self.probe_missing_since = self.now
+        self.duty, self.relay, self.was_in_band = 0.0, False, False
+        if self.now-self.probe_missing_since >= self.both_fault_timeout_sec and (self.phase not in ("fault","interrupted") or self.test_enabled):
+            reason = f"Entrambe le PT100 senza dati validi da {self.both_fault_timeout_sec} s: uscita spenta (simulata)"
+            self.observe_report()
+            self.finish_report("fault",reason)
+            if self.manual_mode != "idle": self.manual_ended = self.now
+            self.phase, self.fault, self.target, self.manual_mode = "fault", reason, None, "idle"
+            self.action, self.test_enabled = "", False
+            self.record(marker=128)
+            self.log("ALLARME",reason)
+        return True
+
     def advance_full(self, dt):
+        if not self.available_temperatures():
+            if self.phase in ("running","paused"): self.account_report(dt)
+            self.check_probe_loss()
+            return
+        self.check_probe_loss()
         if self.manual_mode != "idle":
             self.account_report(dt)
             self.duty, self.relay = 0.0, False
@@ -427,7 +459,7 @@ class DemoDevice:
             descending = self.manual_mode == "cooldown" or self.manual_cooling
             if not self.manual_cooldown_complete:
                 pair = self.sensors()
-                actual = (pair[0]["c"] + pair[1]["c"]) / 2 if descending else self.temperature
+                actual = sum(self.available_temperatures()) / len(self.available_temperatures())
                 self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
                 self.relay = self.duty > 0 and (self.now - self.manual_started) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
             fault = self.overtemperature()
@@ -450,7 +482,7 @@ class DemoDevice:
                 self.record(marker=128)
                 self.log("ALLARME", self.fault)
                 return
-            self.duty = min(self.control["maxPower"], max(0, (self.target - self.temperature) * self.pid["kp"]))
+            self.duty = min(self.control["maxPower"], max(0, (self.target - sum(self.available_temperatures())/len(self.available_temperatures())) * self.pid["kp"]))
             self.relay = self.duty > 0 and (self.now - self.cycle_at) % self.control["windowSec"] < self.control["windowSec"] * self.duty / 100
             self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
             self.observe_report()
@@ -466,7 +498,7 @@ class DemoDevice:
             self.target = max(step["target"], self.target - step["rate"] * dt / 60)
         # Illustrative response: the ESP's actual PID is tested separately.
         pair = self.sensors()
-        actual = (pair[0]["c"] + pair[1]["c"]) / 2 if step["type"] == "cooldown" else self.temperature
+        actual = sum(self.available_temperatures()) / len(self.available_temperatures())
         cooldown_finished = step["type"] == "cooldown" and self.target <= step["target"] and self.temperature + .2 <= step["target"] + 1
         if not cooldown_finished:
             self.duty = min(self.control["maxPower"], max(0, (self.target - actual) * self.pid["kp"]))
@@ -481,7 +513,7 @@ class DemoDevice:
             return
         self.temperature += (self.duty * .014 - (self.temperature - 24) / 1800) * dt
         self.observe_report()
-        in_band = abs(self.temperature - step["target"]) <= 5 and abs(self.temperature + .2 - step["target"]) <= 5
+        in_band = bool(self.available_temperatures()) and all(abs(value-step["target"]) <= 5 for value in self.available_temperatures())
         if step["type"] == "hold" and in_band and self.was_in_band:
             self.hold += dt
         self.was_in_band = in_band
@@ -526,14 +558,17 @@ class DemoDevice:
                     ramp = step.get("type") == "ramp"
                     reference = step["target"] - self.target if ramp else self.target - step["target"]
                     a, b = self.sensors()
-                    if a["valid"] and b["valid"]:
-                        distance = step["target"] - 1 - min(a["c"], b["c"]) if ramp else max(a["c"], b["c"]) - step["target"] - 1
+                    values = self.available_temperatures()
+                    if values:
+                        distance = step["target"] - 1 - min(values) if ramp else max(values) - step["target"] - 1
                         remaining = math.ceil(max(0, reference, distance) * 60 / step["rate"])
             base.update(cooldownRegulated=True, pauseMaintainsTemperature=self.phase == "paused", pauseTargetC=self.pause_target if self.phase == "paused" else None,
                         stepRemainingSec=remaining, stepRemainingEstimated=step.get("type") != "hold",
                         emergency=self.emergency, lastCycleError=self.last_cycle_error,
                         resetRequired=self.emergency or self.phase in ("fault", "interrupted"), supervisorFault=0,
-                        faultResume=self.fault_resume_status(),protections=copy.deepcopy(self.protections))
+                        faultResume=self.fault_resume_status(),protections=copy.deepcopy(self.protections),
+                        sensorRecovery=dict(bothFaultTimeoutSec=self.both_fault_timeout_sec,minAllowed=1,maxAllowed=300,validProbes=len(self.available_temperatures()),waiting=not bool(self.available_temperatures()),missingForMs=int((self.now-self.probe_missing_since)*1000) if self.probe_missing_since is not None else 0),
+                        sensorChecking=not bool(self.available_temperatures()))
             base.update(self.control)
             manual_active = self.manual_mode != "idle" and self.phase == "running"
             base.update(operation=self.operation, manual=dict(active=manual_active, mode=self.manual_mode,
@@ -541,7 +576,7 @@ class DemoDevice:
                 elapsedSec=max(0, int((self.now if manual_active else self.manual_ended) - self.manual_started - self.manual_blocked_time)),
                 startedAtMs=int(self.manual_started * 1000)))
             base.update(mode="FULL", phase=self.phase, fault=self.fault, relay=self.relay, duty=self.duty,
-                        ready=not self.missing and self.phase not in ("fault", "interrupted"), pid=dict(self.pid),
+                        ready=not self.test_enabled and bool(self.available_temperatures()) and self.phase not in ("fault", "interrupted"), pid=dict(self.pid),
                         cycleElapsedSec=0 if self.operation == "manual" else int(self.now - self.cycle_at) if active else int(self.last_report["durationMs"] / 1000) if self.last_report else 0, stepElapsedSec=int(self.step_elapsed) if active and self.operation != "manual" else 0,
                         cycleStartedAtMs=int(self.manual_started * 1000) if manual_active else int(self.cycle_at * 1000) if self.active else None,
                         target=self.target, stepIndex=self.step_index, stepCount=len(self.active["steps"]) if self.active else 0,
@@ -650,20 +685,22 @@ class DemoDevice:
         if endpoint == "preview-sensor":
             require(type(body.get("missing")) is bool, "Stato sonda non valido")
             self.missing = body["missing"]
-            if self.mode == "full" and self.missing and self.phase in ("running", "paused"):
-                self.fault = "Fault PT100 simulato"
-                if self.operation == "manual":
-                    self.end_manual("fault", record=False)
-                self.observe_report()
-                self.finish_report("fault", "Fault PT100 simulato")
-                self.phase, self.fault, self.duty, self.relay = "fault", "Fault PT100 simulato", 0.0, False
-                self.record(marker=128)
+            if body.get("both") is True: self.missing_first = self.missing
+            if self.mode == "full": self.check_probe_loss()
             self.log("SONDA", "Sonda #2 scollegata nella simulazione" if self.missing else "Sonda #2 ripristinata nella simulazione")
             return self.status()
         if self.mode == "field-test":
             return self.field_command(endpoint, body)
         if endpoint in ("test/command", "test/heartbeat"):
             return self.full_test_command(endpoint, body)
+        if endpoint == "sensor-recovery":
+            require(self.phase not in ("running", "paused") and not self.test_enabled and not self.status().get("otaUpdating"),
+                    "Ferma Programmi/Manuale ed esci da TEST prima di modificare il recupero sonde", 409)
+            value = body.get("bothFaultTimeoutSec")
+            require(type(value) is int and 1 <= value <= 300, "Assenza dati da entrambe le sonde: secondi interi da 1 a 300")
+            self.both_fault_timeout_sec = value
+            self.log("PARAMETERS", f"Recupero PT100: allarme dopo {value} s senza dati validi da entrambe le PT100 (anteprima)")
+            return self.status()
         if endpoint == "protections":
             require(self.phase not in ("running","paused") and not self.test_enabled,"Ferma il controllo ed esci da TEST prima di modificare i blocchi",409)
             require(all(type(body.get(key)) is bool for key in ("probeDeltaEnabled","meanOvershootEnabled")),"Abilitazioni booleane richieste")
@@ -721,14 +758,14 @@ class DemoDevice:
             require(self.phase not in ("running", "paused"), "Ferma il controllo prima di RESET ERRORI", 409)
             self.stop_field()
             self.test_enabled = False
-            require(not self.missing, "Ferma il ciclo e ripristina le sonde", 409)
-            require(all(sensor["valid"] and sensor["c"] is not None and sensor["c"] < 415 for sensor in self.sensors()), "Sonde o temperature fuori limite",409)
+            require(bool(self.available_temperatures()), "Ferma il ciclo e ripristina le sonde", 409)
+            require(bool(self.available_temperatures()) and max(self.available_temperatures()) < 415, "Sonde o temperature fuori limite",409)
             self.fault_resume = None
             self.phase, self.fault, self.target = "idle", "", None
             self.emergency = False
         elif action == "start":
             require(not self.test_enabled, "Esci da TEST prima di avviare un programma", 409)
-            require(self.phase not in ("running", "paused", "fault", "interrupted") and not self.missing, "Ciclo o sonde non pronti", 409)
+            require(self.phase not in ("running", "paused", "fault", "interrupted") and bool(self.available_temperatures()), "Ciclo o sonde non pronti", 409)
             require(body.get("hardwareReady") is True, "Conferma richiesta (solo nella simulazione)")
             recipe = next((r for r in self.recipes if r["id"] == body.get("recipeId")), None)
             require(recipe is not None, "Programma non trovato", 404)
@@ -746,7 +783,7 @@ class DemoDevice:
         elif action == "pause":
             require(self.manual_mode == "idle", "Nel manuale usa COOLDOWN o STOP", 409)
             require(self.phase == "running", "Nessun ciclo in corso", 409)
-            require(not self.missing and self.temperature + .2 < 415, "Sonde non pronte", 409)
+            require(bool(self.available_temperatures()) and self.temperature + .2 < 415, "Sonde non pronte", 409)
             pair = self.sensors()
             self.pause_target = min(400, max(0, (pair[0]["c"] + pair[1]["c"]) / 2))
             self.target = self.pause_target
@@ -754,7 +791,7 @@ class DemoDevice:
                 self.report_work["pauseCount"] += 1
             self.phase, self.duty, self.relay, self.was_in_band = "paused", 0.0, False, False
         elif action == "resume":
-            require(self.phase == "paused" and not self.missing, "Nessun ciclo in pausa o sonda non valida", 409)
+            require(self.phase == "paused" and bool(self.available_temperatures()), "Nessun ciclo in pausa o sonda non valida", 409)
             step = self.active["steps"][self.step_index]
             reference = step["target"] if step["type"] == "hold" else min(step["target"], self.pause_target) if step["type"] == "ramp" else max(step["target"], self.pause_target)
             problem = self.protection_problem(reference, step["type"] == "cooldown")

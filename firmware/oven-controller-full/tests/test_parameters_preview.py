@@ -50,7 +50,10 @@ class ParametersPreviewTest(unittest.TestCase):
         for kind in ('absolute','probe'):
             d=self.device(settings=dict(probeDeltaEnabled=False,meanOvershootEnabled=False))
             if kind=='absolute':self.sample(d,415,100)
-            else:d.request('POST','preview-sensor',body=dict(missing=True))
+            else:
+                d.request('POST','preview-sensor',body=dict(missing=True,both=True))
+                d.now += 20
+                d.advance_full(20)
             self.assertEqual(d.phase,'fault');self.assertFalse(d.relay)
 
     def test_cannot_save_during_active_program_manual_pause_or_test(self):

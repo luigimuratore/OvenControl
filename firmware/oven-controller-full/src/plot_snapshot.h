@@ -12,7 +12,7 @@ size_t snapshot(const Sample *curve, size_t capacity, size_t head, size_t count,
     if (uint32_t(current.ms - curve[(head + capacity - count + i) % capacity].ms) <= windowMs) ++recent;
   size_t skip = recent > pointCapacity - 1 ? recent - (pointCapacity - 1) : 0, used = 0;
   const auto copy = [](const Sample &s) {
-    return reportpdf::Point{s.ms, (s.flags & 3) == 3 ? (s.t1 + s.t2) * .5f : NAN,
+    return reportpdf::Point{s.ms, (s.flags & 3) == 3 ? (s.t1 + s.t2) * .5f : s.flags & 1 ? s.t1 : s.flags & 2 ? s.t2 : NAN,
       s.flags & 8 ? s.setpoint : NAN, s.step, s.flags};
   };
   for (size_t i = 0; i < count; ++i) {

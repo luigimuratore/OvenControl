@@ -10,7 +10,7 @@ int main() {
   size_t n=plotpng::snapshot(ring,4,0,4,live,points,4);
   assert(n==4 && points[0].ms==20000 && points[3].mean==105);
   assert(points[0].flags==27 && points[0].step==1);
-  assert(!std::isfinite(points[1].mean) && points[1].target==107);
+  assert(points[1].mean==102 && points[1].target==107);
   // Ring rotation remains chronological; live duplicate replaces stale values.
   ring[0]={50000,104,106,109,2,11}; live={50000,110,112,110,2,11};
   n=plotpng::snapshot(ring,4,1,4,live,points,4);

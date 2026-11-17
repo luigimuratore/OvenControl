@@ -9,6 +9,7 @@ let pidLoaded = false;
 let telegramUsersBusy=false, telegramUsersData=null, telegramRenderedKey='';
 const telegramModeDrafts=new Map();
 let protectionsLoaded = false;
+let probeRecoveryLoaded = false, probeRecoveryBusy = false;
 let manualTargetDirty = false;
 let selectedView = 'Dashboard';
 let settingsLoaded = false, recipesLoaded = false, recipesDirty = false, commandBusy = false, commandGeneration = 0, exportBusy = false;
@@ -197,7 +198,7 @@ function display(s) {
     history = []; live = []; hasOlder = false; chartAtEnd = true; chartStart = 0; eventKey = "";
     cycleAnchor = cycleKey = null;
     timelineUptime = null;
-    pidLoaded = settingsLoaded = protectionsLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
+    pidLoaded = settingsLoaded = protectionsLoaded = probeRecoveryLoaded = false; $("hardwareReady").checked = $("manualHardwareReady").checked = false;
     if (!recipesDirty) { recipesLoaded = false; loadRecipes().catch(() => {}); }
   }
   boot = s.bootCount; latest = s; connected = true; lastResponseAt = performance.now(); renderFailed = false;
@@ -209,8 +210,12 @@ function display(s) {
   timeOffset = (s.utcSec ? s.utcSec * 1000 : Date.now()) - timelineUptime;
   const t1 = s.sensors[0].valid ? Number(s.sensors[0].c) : NaN;
   const t2 = s.sensors[1].valid ? Number(s.sensors[1].c) : NaN;
-  const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1 + t2) / 2 : NaN;
+  const avg = Number.isFinite(t1) && Number.isFinite(t2) ? (t1+t2)/2 : Number.isFinite(t1) ? t1 : t2;
   const target = s.target === null ? NaN : Number(s.target);
+  put('avgLabel',Number.isFinite(t1) && Number.isFinite(t2) ? 'Media PT100' : Number.isFinite(t1) ? 'PT100 #1 · controllo' : Number.isFinite(t2) ? 'PT100 #2 · controllo' : 'Temperatura controllo');
+  $('sensorStatusNotice').hidden = Number.isFinite(t1) && Number.isFinite(t2);
+  put('sensorStatusNotice',Number.isFinite(avg) ? `Controllo sulla sola PT100 #${Number.isFinite(t1)?1:2}. L'altra lettura è esclusa dai calcoli.` :
+    `Entrambe le PT100 senza dati validi: uscite spente. Allarme dopo ${s.sensorRecovery?.bothFaultTimeoutSec ?? 20} s${s.sensorRecovery?.missingForMs ? ` · attesa ${Math.floor(s.sensorRecovery.missingForMs/1000)} s` : ''}.`);
   put("avgTemp", temp(avg)); put("targetTemp", temp(target));
   put('targetDeltaTemp', signedDelta(avg - target));
   const manual = s.manual || {}, manualActive = !!manual.active;
@@ -265,7 +270,7 @@ function display(s) {
   put("stepTimeHint", activeStep ? s.phase === 'paused' ? s.pauseMaintainsTemperature ?
     `Step sospeso; PID mantiene ${temp(s.pauseTargetC)} °C` : 'Conteggio sospeso durante la pausa' :
     s.stepType === 'ramp' && s.stepWaitingForTemperature ? s.stepTransitionToHold ?
-    `Riferimento al target: attendo entrambe le PT100 entro ±${s.stepCompletionBandC} °C per iniziare il mantenimento` :
+    `Riferimento al target: attendo le PT100 disponibili entro ±${s.stepCompletionBandC} °C per iniziare il mantenimento` :
     `Riferimento al target: attendo la sonda più fredda ad almeno ${temp(s.stepFinalTarget - (s.stepCompletionBandC || 1))} °C` :
     s.stepType === 'hold' ? 'Tempo ancora richiesto in banda ±5 °C' :
     remaining === null ? 'Stima non disponibile' : 'Stima al rate del programma' : '');
@@ -331,6 +336,15 @@ function display(s) {
     }
     put('appliedProtections', `Impostazioni applicate · ΔT sonde: ${cfg.probeDeltaEnabled ? `blocco oltre ${temp(cfg.maxProbeDeltaC)} °C` : 'blocco disabilitato'} · Media − target: ${cfg.meanOvershootEnabled ? `blocco oltre +${temp(cfg.maxMeanOvershootC)} °C` : 'blocco disabilitato'}`);
   } else put('appliedProtections','Configurazione dei blocchi non disponibile: aggiorna il firmware per usare Parameters.');
+  if (Number.isInteger(s.sensorRecovery?.bothFaultTimeoutSec)) {
+    if (!probeRecoveryLoaded) {
+      $('bothFaultTimeoutSec').value = s.sensorRecovery.bothFaultTimeoutSec;
+      $('bothFaultTimeoutSec').min = s.sensorRecovery.minAllowed;
+      $('bothFaultTimeoutSec').max = s.sensorRecovery.maxAllowed;
+      probeRecoveryLoaded = true;
+    }
+    put('appliedProbeRecovery', `Valore applicato · Allarme dopo ${s.sensorRecovery.bothFaultTimeoutSec} s senza dati validi da entrambe le PT100.`);
+  } else put('appliedProbeRecovery', 'Configurazione del recupero non disponibile: aggiorna il firmware.');
   updateControls();
   if (!pidLoaded && s.pid) {
     $("kp").value = Number(s.pid.kp).toFixed(2);
@@ -359,7 +373,7 @@ function updateErrorReset() {
   $('errorResetBar').classList.toggle('reset-required', required);
   $('resetBtn').classList.toggle('reset-required', required);
   put('errorResetTitle', required ? 'AVVIO BLOCCATO · RESET ERRORI RICHIESTO' : 'Nessun errore da resettare');
-  const invalid = s?.sensors?.some(sensor => !sensor.valid), active = ['running', 'paused'].includes(s?.phase);
+  const invalid = !s?.sensors?.some(sensor => sensor.valid && Number.isFinite(sensor.c)) || s?.sensors?.some(sensor => sensor.valid && sensor.c >= 415), active = ['running', 'paused'].includes(s?.phase);
   const reason = s?.fault || (s?.emergency ? 'Emergenza attiva.' : s?.lastInterruption?.pending || s?.phase === 'interrupted' ?
     'Interruzione/blackout registrato: ripartenza bloccata.' : 'Allarme o blocco del supervisore registrato.');
   const resume = s?.faultResume;
@@ -403,6 +417,7 @@ function updateControls() {
   const parametersBlocked = !connected || active || commandBusy || testCommandBusy || !!latest?.test?.enabled || !!latest?.otaUpdating;
   for (const id of ['kp','ki','kd','actuator','windowSec','maxPower','probeDeltaEnabled','maxProbeDeltaC','meanOvershootEnabled','maxMeanOvershootC','savePid','saveControl']) $(id).disabled = parametersBlocked;
   $('saveProtections').disabled = parametersBlocked || !latest?.protections;
+  $('saveProbeRecovery').disabled = $('bothFaultTimeoutSec').disabled = parametersBlocked || probeRecoveryBusy || !Number.isInteger(latest?.sensorRecovery?.bothFaultTimeoutSec);
   $("exportSamples").disabled = !connected || exportBusy;
   document.querySelectorAll('#recipesView input, #recipesView select, #recipesView button').forEach(el => {
     if (el.id !== "exportRecipes") el.disabled = active || !connected || recipeSaveBusy;
@@ -572,7 +587,7 @@ async function manualCommand(action) {
 function historyPoint(row) {
   const [seq, ms, t1, t2, target, duty, flags, step] = row;
   const a = t1 === null ? NaN : Number(t1), b = t2 === null ? NaN : Number(t2);
-  return { seq, ms, t1: a, t2: b, actual: Number.isFinite(a) && Number.isFinite(b) ? (a + b) / 2 : NaN,
+  return { seq, ms, t1: a, t2: b, actual: Number.isFinite(a) && Number.isFinite(b) ? (a+b)/2 : Number.isFinite(a) ? a : b,
            target: target === null ? NaN : Number(target), duty: Number(duty), relay: !!(flags & 4),
            marker: flags & 0xf0, step: step === 255 ? null : step, operation: step === 255 ? 'manual' : 'program' };
 }
@@ -802,8 +817,10 @@ function reportOvershootLabel(r) {
   return r.version >= 3 ? "Superamento massimo della media" : "Superamento massimo sonda più calda";
 }
 function reportDefinitions(r, definitions) {
+  if (r.version >= 4) return definitions + (r.operation === 'manual' ? ' Sessione manuale: esclusi dalla regolazione cooldown e discesa; nessuno step automatico.' : '');
   if (r.operation === 'manual') return 'Sessione manuale: il grafico comprende cambi di target e cooldown. Errori e comando PID usano solo coppie valide durante la regolazione attiva, escluse discesa, cooldown e attesa dopo allarme. Gli scarti sono riferiti alla media PT100 e al setpoint istantaneo. Temperature e differenza sonde comprendono tutti i campioni acquisiti. Non sono previsti step automatici o conteggio hold. Comando e saturazione non misurano potenza o energia elettrica.';
-  return definitions.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`)
+  const legacyDefinitions = definitions.replace('La temperatura di controllo è la media delle PT100 valide; se ne resta una viene usata quella. ', '').replace('tutte le PT100 disponibili','entrambe le PT100');
+  return legacyDefinitions.replace('±5 °C', `±${r.holdBandC ?? (r.version >= 2 ? 5 : 1)} °C`)
     .replace('Il superamento usa la media delle PT100', r.version >= 3 ? 'Il superamento usa la media delle PT100' : 'Il superamento usa la sonda più calda');
 }
 function reportNumber(value, unit = "", digits = 2) { return Number.isFinite(value) ? `${value.toFixed(digits)}${unit}` : "—"; }
@@ -1044,6 +1061,19 @@ $("saveControl").onclick = async () => {
     const result = await api("/api/control", {actuator: $("actuator").value, windowSec: Number($("windowSec").value), maxPower: Number($("maxPower").value)});
     display(result); note("parametersMessage", "Attuatore e limite comando salvati nella memoria dell'ESP.");
   } catch (e) { note("parametersMessage", e.message, true); }
+};
+$('saveProbeRecovery').onclick = async () => {
+  if (probeRecoveryBusy || $('saveProbeRecovery').disabled) return;
+  try {
+    const text = $('bothFaultTimeoutSec').value.trim(), value = text ? Number(text) : NaN;
+    if (!Number.isInteger(value) || value < Number($('bothFaultTimeoutSec').min) || value > Number($('bothFaultTimeoutSec').max))
+      throw Error('Inserisci secondi interi da 1 a 300 senza dati da entrambe le sonde.');
+    probeRecoveryBusy = true; updateControls();
+    const result = await api('/api/sensor-recovery', {bothFaultTimeoutSec:value});
+    probeRecoveryLoaded = false; display(result);
+    note('parametersMessage', 'Attesa allarme sonde salvata nella memoria dell’ESP.');
+  } catch (e) { note('parametersMessage', e.message, true); }
+  finally { probeRecoveryBusy = false; updateControls(); }
 };
 $('saveProtections').onclick = async () => {
   try {

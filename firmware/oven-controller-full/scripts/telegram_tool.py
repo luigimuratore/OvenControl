@@ -489,10 +489,11 @@ def preview_plot(base, minutes=30):
         raise ValueError('Paginazione grafico troppo grande.')
     for seq,ms,t1,t2,target,duty,flags,step in rows:
         if ((now-ms)&0xffffffff)>minutes*60000: continue
-        points.append(dict(ms=ms, actual=(t1+t2)/2 if flags&3==3 else None,
+        points.append(dict(ms=ms, actual=(t1+t2)/2 if flags&3==3 else t1 if flags&1 else t2 if flags&2 else None,
                            target=target if flags&8 else None,marker=flags&0xf0))
     sensors = status.get('sensors',[])
-    mean = sum(s['c'] for s in sensors)/2 if len(sensors)==2 and all(s['valid'] for s in sensors) else None
+    values = [s['c'] for s in sensors if s.get('valid') and s.get('c') is not None]
+    mean = sum(values)/len(values) if values else None
     current=dict(ms=now,actual=mean,target=status.get('target'))
     if points and points[-1]['ms']==now: points[-1]=current
     else: points.append(current)
@@ -550,7 +551,7 @@ class PreviewReports:
                         continue
                     first, second = t1 if flags & 1 else None, t2 if flags & 2 else None
                     points.append(dict(seq=seq, ms=ms, t1=first, t2=second,
-                        actual=(first + second) / 2 if first is not None and second is not None else None,
+                        actual=(first+second)/2 if first is not None and second is not None else first if first is not None else second,
                         target=target if flags & 8 else None, duty=duty, step=step, marker=flags & 0xf0,
                         operation="manual" if step == 255 else "program"))
                 if not page.get("more"):
@@ -601,7 +602,7 @@ def status_style(status):
     sensors = status.get("sensors", [])
     valid = [sensor.get("c") for sensor in sensors if sensor.get("valid")
              and isinstance(sensor.get("c"), (int, float)) and math.isfinite(sensor["c"])]
-    if len(valid) != 2 or max(valid) >= 415 or status.get("sampleAgeMs", 0) >= 3000:
+    if not valid or max(valid) >= 415 or status.get("sampleAgeMs", 0) >= 3000:
         return "⚠️", "SONDE NON PRONTE"
     if phase == "paused":
         return "⏸️", "CICLO IN PAUSA · MANTENIMENTO" if status.get("pauseMaintainsTemperature") else "CICLO IN PAUSA"
@@ -683,6 +684,8 @@ def format_status(status, mode="sintetica"):
         lines.append(f"PT100 #{i}: " + (temperature(sensor.get("c")) if sensor.get("valid") else f"NON VALIDA · fault 0x{sensor.get('faultCode', 0):x} · RAW {sensor.get('raw', 0)}"))
         if sensor.get("valid") and isinstance(sensor.get("c"), (float, int)) and math.isfinite(sensor["c"]):
             valid.append(sensor["c"])
+    if len(valid) == 1:
+        lines.append("Controllo sulla PT100 disponibile: " + temperature(valid[0]))
     if len(valid) == 2:
         lines += ["Media: " + temperature(sum(valid) / 2), f"Differenza sonde: {abs(valid[0] - valid[1]):.2f} °C"]
     age = status.get("sampleAgeMs", 0)
